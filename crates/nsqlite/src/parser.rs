@@ -180,9 +180,17 @@ pub enum JoinKind {
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
+    /// How this table joins to everything to its left. A comma-separated FROM
+    /// is a CROSS join, which the parser records as `Cross` so the executor does
+    /// not have to infer it from a missing operator.
     pub join: JoinKind,
-    /// The ON or USING constraint, if the join had one.
+    /// The ON constraint, if the join had one. A USING clause is not an ON
+    /// expression: it is a column list the resolver turns into equality tests,
+    /// and it changes what `*` expands to.
     pub on: Option<Expr>,
+    /// The columns a USING clause named, which must be equal across the join
+    /// and appear once in the output of a star.
+    pub using: Vec<String>,
     pub indexed_by: Option<String>,
 }
 
@@ -791,21 +799,101 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
+    /// Parses a FROM clause into the list of table references it holds.
+    ///
+    /// A comma is the lowest-precedence join operator, so the clause is read as
+    /// a flat list. Each item after the first carries the operator that attached
+    /// it to what came before, which is what the executor walks: it takes the
+    /// first item as the left side and folds the rest in from the left.
     fn from_clause(&mut self) -> Result<Vec<FromItem>> {
         let mut out = Vec::new();
         if !self.eat_keyword(Keyword::From)? {
             return Ok(out);
         }
+        out.push(self.from_item()?);
         loop {
-            let item = self.from_item()?;
-            out.push(item);
-            if !self.eat_punct(Punct::Comma)? {
-                break;
-            }
+            // A comma and a join operator are the two ways another table can
+            // follow. A comma has no constraint, so it is a cross join.
+            let (kind, constraint) = if self.eat_punct(Punct::Comma)? {
+                (JoinKind::Cross, (None, Vec::new()))
+            } else {
+                let Some(kind) = self.join_operator()? else {
+                    break;
+                };
+                let constraint = self.join_constraint()?;
+                (kind, constraint)
+            };
+            let mut next = self.from_item()?;
+            let (on, using) = constraint;
+            set_join(&mut next, kind, on, using)?;
+            out.push(next);
         }
         Ok(out)
     }
 
+    /// The join operator at the cursor, or `None` if the FROM clause ends here.
+    ///
+    /// `INNER`, `LEFT` and `CROSS` are all written as an optional modifier in
+    /// front of `JOIN`, and a bare `JOIN` is an inner join. `NATURAL` is a
+    /// modifier this engine does not execute, but it is recognised here so the
+    /// failure names the unsupported feature rather than a bare syntax error.
+    fn join_operator(&mut self) -> Result<Option<JoinKind>> {
+        if self.eat_keyword(Keyword::Natural)? {
+            return Err(Error::parse("NATURAL JOIN is not supported yet"));
+        }
+        let kind = if self.eat_keyword(Keyword::Left)? {
+            JoinKind::Left
+        } else if self.eat_keyword(Keyword::Cross)? {
+            JoinKind::Cross
+        } else {
+            self.eat_keyword(Keyword::Inner)?;
+            JoinKind::Inner
+        };
+        if !self.eat_keyword(Keyword::Join)? {
+            return Err(Error::parse(&format!(
+                "near \"{}\": syntax error",
+                self.peek_text()
+            )));
+        }
+        Ok(Some(kind))
+    }
+
+    /// The ON or USING constraint that closes a join.
+    fn join_constraint(&mut self) -> Result<(Option<Expr>, Vec<String>)> {
+        if self.eat_keyword(Keyword::On)? {
+            return Ok((Some(self.expr()?), Vec::new()));
+        }
+        if self.eat_keyword(Keyword::Using)? {
+            self.expect_punct(Punct::LParen, "after USING")?;
+            let mut cols = Vec::new();
+            loop {
+                cols.push(self.name("in a USING clause")?);
+                if !self.eat_punct(Punct::Comma)? {
+                    break;
+                }
+            }
+            self.expect_punct(Punct::RParen, "closing a USING clause")?;
+            return Ok((None, cols));
+        }
+        // A comma or another join operator may follow, and a clause keyword may
+        // follow, but a bare `JOIN b` with nothing between is a syntax error in
+        // SQLite, and so is one with a second constraint.
+        Err(Error::parse(&format!(
+            "near \"{}\": syntax error",
+            self.peek_text()
+        )))
+    }
+
+    /// The text of the token at the cursor, for a syntax-error message.
+    fn peek_text(&self) -> String {
+        match self.peek() {
+            Some(t) => t.text().to_string(),
+            None => String::new(),
+        }
+    }
+
+    /// Parses one table reference. The join operator and constraint belong to
+    /// the item that follows them, so they are set by [`set_join`] afterwards.
     fn from_item(&mut self) -> Result<FromItem> {
         if self.at_punct(Punct::LParen) {
             self.advance();
@@ -839,8 +927,9 @@ impl<'a> Parser<'a> {
         Ok(FromItem::Table(TableRef {
             name: full,
             alias,
-            join: JoinKind::Inner,
+            join: JoinKind::Cross,
             on: None,
+            using: Vec::new(),
             indexed_by,
         }))
     }
