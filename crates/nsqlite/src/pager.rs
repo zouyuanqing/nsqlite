@@ -296,22 +296,31 @@ impl Pager {
         Ok(n)
     }
 
-    /// Releases page `n` back to the freelist, zeroing it so a stale read
-    /// cannot resurrect its contents.
+    /// Releases page `n` back to the freelist.
+    ///
+    /// A freelist trunk page is an array of 32-bit page numbers filling the
+    /// usable space: the first is the next trunk page or zero, the second is the
+    /// number of leaf pages that follow, and the rest are those pages. A single
+    /// freed page therefore becomes a trunk with no successor and one leaf,
+    /// and the page itself is zeroed apart from that array so a stale read finds
+    /// no old contents.
     pub fn free(&mut self, n: u32) -> Result<()> {
         if n == 0 || n > self.header.db_size_pages {
             return Ok(());
         }
+        let trunk = self.header.freelist_trunk;
         {
             let page = self.page(n)?;
             for b in page.iter_mut() {
                 *b = 0;
             }
+            // With no existing trunk this page is the first of a chain, so its
+            // successor is zero. It carries one leaf, itself.
+            page[0..4].copy_from_slice(&trunk.to_be_bytes());
+            page[4..8].copy_from_slice(&1u32.to_be_bytes());
+            page[8..12].copy_from_slice(&n.to_be_bytes());
         }
         self.mark_dirty(n);
-        // Freelist bookkeeping: the trunk page links to the rest.
-        let trunk = self.header.freelist_trunk;
-        self.page(n)?[0..4].copy_from_slice(&(trunk + 1).to_be_bytes());
         self.header.freelist_trunk = n;
         self.header.freelist_count += 1;
         self.bump_change_counter();
@@ -546,10 +555,16 @@ mod tests {
 
         let mut p = Pager::open(&path).unwrap();
         let page = p.read_page(n).unwrap();
-        // A trunk page keeps the next trunk's page number in bytes 0..4; the
-        // rest of the page is cleared so a stale read finds no old contents.
-        assert_eq!(u32::from_be_bytes([page[0], page[1], page[2], page[3]]), 1);
-        assert_eq!(page[7], 0, "a freed page must not keep its old contents");
+        // A trunk page is an array: the next trunk (zero when there is none),
+        // the leaf count, then the leaves. Getting this wrong points the chain
+        // at page 1, which is the schema, and the file stops being readable.
+        let next = u32::from_be_bytes([page[0], page[1], page[2], page[3]]);
+        let leaves = u32::from_be_bytes([page[4], page[5], page[6], page[7]]);
+        let first_leaf = u32::from_be_bytes([page[8], page[9], page[10], page[11]]);
+        assert_eq!(next, 0, "a first trunk has no successor");
+        assert_eq!(leaves, 1, "one page was freed");
+        assert_eq!(first_leaf, n, "the freed page is its own first leaf");
+        assert_eq!(page[12], 0, "a freed page must not keep its old contents");
         drop(p);
         let _ = std::fs::remove_file(&path);
     }

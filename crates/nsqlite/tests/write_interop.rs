@@ -58,109 +58,50 @@ fn run_err(path: &std::path::Path, sql: &str) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
-/// Writes a cell whose payload spills, allocating a real overflow chain.
-///
-/// The cell image and the chain both come out of the same pager, but the cell
-/// write holds a borrow of one page while the chain is being built, so the chain
-/// is written first and the cell is written afterwards.
-fn write_spilling_leaf(
-    pager: &mut nsqlite::pager::Pager,
-    page: &nsqlite::btree_write::LeafPage,
-    usable: u32,
-) {
-    use nsqlite::page::overflow_capacity_for;
-    let cap = overflow_capacity_for(usable) as usize;
-    // Resolve every spill up front, since the page write borrows the pager.
-    let mut chains: Vec<u32> = Vec::new();
-    for cell in &page.cells {
-        let local = cell.local_len(usable) as usize;
-        if local == cell.payload.len() {
-            chains.push(0);
-            continue;
-        }
-        let spill = &cell.payload[local..];
-        let mut first = 0u32;
-        let mut prev = 0u32;
-        let mut written = 0usize;
-        loop {
-            let n = pager.allocate().expect("allocating an overflow page");
-            if first == 0 {
-                first = n;
-            } else {
-                let p = pager.page(prev).unwrap();
-                p[0..4].copy_from_slice(&n.to_be_bytes());
-                pager.mark_dirty(prev);
-            }
-            let take = spill.len().saturating_sub(written).min(cap);
-            let p = pager.page(n).unwrap();
-            p[4..4 + take].copy_from_slice(&spill[written..written + take]);
-            pager.mark_dirty(n);
-            written += take;
-            prev = n;
-            if written >= spill.len() {
-                break;
-            }
-        }
-        chains.push(first);
-    }
-    let page_no = page.page_no;
-    {
-        let dst = pager.page(page_no).unwrap();
-        let mut next = chains.into_iter();
-        page.write(dst, usable, |_| Ok(next.next().unwrap_or(0)))
-            .expect("writing the leaf");
-    }
-    pager.mark_dirty(page_no);
+/// Writes a leaf page, letting the library allocate any overflow chain it needs.
+fn write_leaf(pager: &mut nsqlite::pager::Pager, page: &nsqlite::btree_write::LeafPage) {
+    page.write_to(pager).expect("writing the leaf");
 }
 
 /// Rewrites the `rootpage` column of a table's row in `sqlite_schema`.
 ///
 /// The SQL layer refuses to modify `sqlite_schema`, and rightly so, but the
-/// engine has to keep it current when a root moves. This edits the record
-/// directly, which is what a real implementation does from inside the b-tree
-/// when a table is created. The rootpage column is an integer stored in a
-/// narrow serial type, so the value has to be re-encoded at the same width or
-/// the cell length changes and every later offset in the page shifts.
+/// engine has to keep it current when a root moves. A split that reaches the
+/// root allocates a new one, and a reopened connection finds the tree by
+/// reading this column, so a file written here would otherwise point at the
+/// page the tree grew out of.
 fn set_schema_root(pager: &mut nsqlite::pager::Pager, table: &str, root: u32) {
     use nsqlite::btree_write::LeafPage;
     use nsqlite::record;
 
     // sqlite_schema is always a table b-tree on page 1.
     let schema = LeafPage::read(pager, 1).expect("reading sqlite_schema");
-    let cell = schema
+    let at = schema
         .cells
         .iter()
-        .find(|c| {
+        .position(|c| {
             record::decode_record(&c.payload, pager.header().text_encoding)
                 .ok()
                 .and_then(|d| d.values.get(1).and_then(|v| v.as_str()).map(|s| s == table))
                 .unwrap_or(false)
         })
         .expect("the table must have a schema row");
-    let decoded = record::decode_record(&cell.payload, pager.header().text_encoding).unwrap();
+    let decoded = record::decode_record(&schema.cells[at].payload, pager.header().text_encoding)
+        .expect("decoding the schema row");
     assert_eq!(decoded.values.len(), 5, "sqlite_schema has five columns");
-    assert_eq!(decoded.values[0].as_str(), Some("table"));
 
-    // Re-encode with the new root. Column 3 is rootpage, and the columns are
-    // short enough that no cell grows, so the page layout is unchanged.
     let mut values = decoded.values.clone();
     values[3] = nsqlite::value::Value::Integer(root as i64);
     let new_payload = record::encode(&values).bytes;
     assert!(
-        new_payload.len() <= cell.payload.len(),
+        new_payload.len() <= schema.cells[at].payload.len(),
         "the re-encoded schema row must not be longer than the original"
     );
 
-    let usable = pager.usable_size();
     let mut cells = schema.cells.clone();
-    cells[schema
-        .cells
-        .iter()
-        .position(|c| c.rowid == cell.rowid)
-        .unwrap()]
-    .payload = new_payload;
+    cells[at].payload = new_payload;
     let page = LeafPage { cells, ..schema };
-    write_spilling_leaf(pager, &page, usable);
+    page.write_to(pager).expect("writing the schema page");
     // The schema cookie has to advance, or a reader keeps using its cached copy.
     let cc = pager.header().change_counter.wrapping_add(1);
     pager.header_mut().change_counter = cc;
@@ -207,6 +148,7 @@ fn write_db(name: &str, rows: &[(i64, String)], columns: usize) -> PathBuf {
             Cell {
                 rowid: *rowid,
                 payload: LeafPage::encode_payload(&values, None),
+                first_overflow: 0,
             }
         })
         .collect();
@@ -216,7 +158,7 @@ fn write_db(name: &str, rows: &[(i64, String)], columns: usize) -> PathBuf {
         cells,
         ..LeafPage::empty(root, 4096)
     };
-    write_spilling_leaf(&mut pager, &page, usable);
+    write_leaf(&mut pager, &page);
     // The page count is unchanged, so the change counter alone has to advance,
     // or sqlite3 will not re-read the page count from the header.
     let cc = pager.header().change_counter.wrapping_add(1);
@@ -272,6 +214,7 @@ fn sqlite3_reads_back_every_row() {
         .map(|i| Cell {
             rowid: i,
             payload: LeafPage::encode_payload(&[Value::Text(format!("row{i}"))], None),
+            first_overflow: 0,
         })
         .collect();
     let page = LeafPage {
@@ -279,7 +222,7 @@ fn sqlite3_reads_back_every_row() {
         cells,
         ..LeafPage::empty(root, 4096)
     };
-    write_spilling_leaf(&mut pager, &page, usable);
+    write_leaf(&mut pager, &page);
     // The page count did not change, so only the change counter needs bumping.
     pager.header_mut().change_counter = pager.header().change_counter.wrapping_add(1);
     pager.header_mut().version_valid_for = pager.header().change_counter;
@@ -353,11 +296,13 @@ fn a_full_page_stores_content_start_as_zero() {
     let mut cells = vec![Cell {
         rowid: 1,
         payload: LeafPage::encode_payload(&[Value::Text(big)], None),
+        first_overflow: 0,
     }];
     // Add a second cell only if it still fits, to push the page to the edge.
     let probe = Cell {
         rowid: 2,
         payload: LeafPage::encode_payload(&[Value::Text(String::new())], None),
+        first_overflow: 0,
     };
     let mut page = LeafPage {
         page_no: root,
@@ -368,7 +313,7 @@ fn a_full_page_stores_content_start_as_zero() {
         cells.push(probe);
     }
     page.cells = cells;
-    write_spilling_leaf(&mut pager, &page, usable);
+    write_leaf(&mut pager, &page);
     pager.flush().unwrap();
     drop(pager);
 
@@ -511,4 +456,125 @@ fn sqlite3_reads_a_tree_with_negative_rowids() {
         "ok",
         "the negative-rowid tree failed integrity_check"
     );
+}
+
+/// A row far larger than a page must get a real overflow chain, and the engine
+/// must reuse that chain when the page is rewritten rather than allocating a
+/// second one and stranding the first.
+///
+/// This is the path that was broken: the writer took a closure for the chain head
+/// and every production caller answered zero, so a spilling row produced a cell
+/// pointing at nothing. The file looked fine until something read the row back.
+#[test]
+fn sqlite3_reads_a_row_that_spills_into_an_overflow_chain() {
+    if !sqlite3_available() {
+        eprintln!("skipping: sqlite3 not on PATH");
+        return;
+    }
+    use nsqlite::table_tree::{Row, TableTree};
+    use nsqlite::value::Value;
+
+    let path = work_dir().join("overflow.db");
+    let _ = std::fs::remove_file(&path);
+    run(&path, "CREATE TABLE t(c0 TEXT);");
+    let root: u32 = run(&path, "SELECT rootpage FROM sqlite_schema WHERE name='t';")
+        .trim()
+        .parse()
+        .expect("root page");
+
+    // Several rows well past the 4061-byte local limit, so each needs a chain
+    // several pages long.
+    let body = "abcdefghij".repeat(2000); // 20000 bytes
+    {
+        let mut pager = nsqlite::pager::Pager::open(&path).unwrap();
+        let mut tree = TableTree::open(&mut pager, root).unwrap();
+        for i in 1..=5 {
+            tree.insert(
+                &mut pager,
+                &Row {
+                    rowid: i,
+                    values: vec![Value::Text(format!("{i:04}{body}"))],
+                },
+            )
+            .expect("inserting a spilling row");
+        }
+        let new_root = tree.root();
+        drop(tree);
+        set_schema_root(&mut pager, "t", new_root);
+    }
+
+    let count = run(&path, "SELECT count(*) FROM t;");
+    assert_eq!(count.trim(), "5");
+    let len = run(&path, "SELECT length(c0) FROM t WHERE rowid=3;");
+    assert_eq!(len.trim(), "20004", "the whole payload must come back");
+    let head = run(&path, "SELECT substr(c0, 1, 4) FROM t WHERE rowid=3;");
+    assert_eq!(head.trim(), "0003");
+    // substr is one-based and a negative start counts from the end, so these
+    // three together cover the head, the middle and the tail of the chain. The
+    // middle one only matches if the pages are in the right order, which is the
+    // property a chain gets wrong.
+    let tail = run(&path, "SELECT substr(c0, -4) FROM t WHERE rowid=3;");
+    assert_eq!(tail.trim(), "ghij", "the last bytes of the chain");
+    let middle = run(&path, "SELECT substr(c0, 10000, 10) FROM t WHERE rowid=3;");
+    assert_eq!(middle.trim(), "fghijabcde");
+    let integrity = run(&path, "PRAGMA integrity_check;");
+    assert_eq!(
+        integrity.trim(),
+        "ok",
+        "the spilled file failed integrity_check"
+    );
+}
+
+/// Rewriting a page that holds spilling rows must not allocate a second chain
+/// for the same row, which would leave the first unreachable and the file
+/// steadily growing.
+#[test]
+fn rewriting_a_page_reuses_the_existing_overflow_chain() {
+    use nsqlite::btree_write::LeafPage;
+    use nsqlite::pager::Pager;
+    use nsqlite::value::Value;
+
+    let path = work_dir().join("reuse.db");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut pager = Pager::open(&path).unwrap();
+        pager.allocate().unwrap();
+        let root = pager.allocate().unwrap();
+        let payload = LeafPage::encode_payload(&[Value::Text("q".repeat(20_000))], None);
+        let page = LeafPage {
+            page_no: root,
+            cells: vec![nsqlite::btree_write::Cell::new(1, payload)],
+            ..LeafPage::empty(root, 4096)
+        };
+        page.write_to(&mut pager).unwrap();
+        pager.flush().unwrap();
+
+        let after_first = pager.page_count();
+        let head_before = LeafPage::read(&mut pager, root).unwrap().cells[0].first_overflow;
+        assert!(head_before != 0, "a 20000-byte row must have a chain");
+
+        // Rewrite the same page with the same row. The chain belongs to the
+        // row, so it must be reused rather than a new one allocated. Reading the
+        // page back is how a real rewrite learns the chain head: the caller
+        // holds a page structure it built or read, and only a read one carries
+        // the head.
+        let page = LeafPage::read(&mut pager, root).unwrap();
+        page.write_to(&mut pager).unwrap();
+        pager.flush().unwrap();
+
+        assert_eq!(
+            pager.page_count(),
+            after_first,
+            "a rewrite must not allocate another chain for the same row"
+        );
+        let head_after = LeafPage::read(&mut pager, root).unwrap().cells[0].first_overflow;
+        assert_eq!(head_before, head_after, "the chain head moved");
+        // And the row still reads back whole.
+        let read = LeafPage::read(&mut pager, root).unwrap();
+        let decoded =
+            nsqlite::record::decode_record(&read.cells[0].payload, nsqlite::text::Encoding::Utf8)
+                .unwrap();
+        assert_eq!(decoded.values[0].as_str().map(|s| s.len()), Some(20_000));
+    }
+    drop(path);
 }

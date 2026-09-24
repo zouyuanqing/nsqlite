@@ -21,21 +21,37 @@
 //! bounded by the page size, which is small by construction.
 
 use super::error::{Error, Result};
-use super::page::{local_payload_size, page_type, PageHeader};
+use super::page::{local_payload_size, overflow_capacity_for, page_type, PageHeader};
 use super::pager::Pager;
 use super::record;
 use super::value::Value;
 use super::varint;
 
-/// A table leaf cell: a rowid and the full record payload.
+/// A table leaf cell: a rowid and the record payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     pub rowid: i64,
-    /// The complete payload, including whatever lives in the overflow chain.
+    /// The complete payload, reassembled from the leaf and any overflow chain.
     pub payload: Vec<u8>,
+    /// The first overflow page, when the payload is already stored in a chain.
+    ///
+    /// A rewrite has to know this. The chain belongs to the row, not to the leaf
+    /// page, so a cell that moves keeps its chain and a cell that is deleted
+    /// frees it; without this the only way to write a spilling cell is to
+    /// allocate a fresh chain and strand the old pages.
+    pub first_overflow: u32,
 }
 
 impl Cell {
+    /// A cell whose payload fits on the page, with no chain.
+    pub fn new(rowid: i64, payload: Vec<u8>) -> Cell {
+        Cell {
+            rowid,
+            payload,
+            first_overflow: 0,
+        }
+    }
+
     /// How many payload bytes stay on the leaf, given the usable page size.
     pub fn local_len(&self, usable: u32) -> u32 {
         local_payload_size(page_type::TABLE_LEAF, self.payload.len() as u32, usable)
@@ -71,6 +87,65 @@ impl Cell {
         }
         out
     }
+}
+
+/// Writes `spill` into a fresh overflow chain and returns its first page.
+///
+/// The first four bytes of each page hold the next page number, and the last one
+/// holds zero.
+pub fn write_overflow_chain(pager: &mut Pager, spill: &[u8]) -> Result<u32> {
+    let usable = pager.usable_size();
+    let cap = overflow_capacity_for(usable) as usize;
+    let mut first = 0u32;
+    let mut prev = 0u32;
+    let mut written = 0usize;
+    loop {
+        let n = pager.allocate()?;
+        if first == 0 {
+            first = n;
+        } else {
+            let p = pager.page(prev)?;
+            p[0..4].copy_from_slice(&n.to_be_bytes());
+            pager.mark_dirty(prev);
+        }
+        let take = spill.len().saturating_sub(written).min(cap);
+        {
+            let p = pager.page(n)?;
+            for b in p.iter_mut() {
+                *b = 0;
+            }
+            p[4..4 + take].copy_from_slice(&spill[written..written + take]);
+        }
+        pager.mark_dirty(n);
+        written += take;
+        prev = n;
+        if written >= spill.len() {
+            return Ok(first);
+        }
+    }
+}
+
+/// Frees a chain of overflow pages, returning each to the freelist.
+pub fn free_overflow_chain(pager: &mut Pager, first: u32) -> Result<()> {
+    if first == 0 {
+        return Ok(());
+    }
+    let limit = pager.page_count() as usize + 1;
+    let mut next = first;
+    let mut seen = 0usize;
+    while next != 0 {
+        seen += 1;
+        if seen > limit {
+            return Err(Error::corrupt("overflow chain is cyclic"));
+        }
+        let page = pager.read_page(next)?;
+        if page.len() < 4 {
+            return Err(Error::corrupt("overflow page is truncated"));
+        }
+        next = u32::from_be_bytes([page[0], page[1], page[2], page[3]]);
+        pager.free(next)?;
+    }
+    Ok(())
 }
 
 /// A table leaf page, as a set of cells plus the geometry needed to place them.
@@ -137,13 +212,16 @@ impl LeafPage {
                 return Err(Error::corrupt("cell is shorter than its local payload"));
             }
             payload.extend_from_slice(&body[body_at..body_at + local]);
-            if local < payload_len as usize {
+            // The head travels with the cell so a rewrite can keep the chain
+            // rather than allocate a second one and strand the first.
+            let first_overflow = if local < payload_len as usize {
                 let at = body_at + local;
                 if body.len() < at + 4 {
                     return Err(Error::corrupt("overflow pointer is truncated"));
                 }
-                let mut next =
+                let first =
                     u32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+                let mut next = first;
                 let cap = super::page::overflow_capacity_for(usable) as usize;
                 let mut guard = 0usize;
                 while payload.len() < payload_len as usize {
@@ -166,8 +244,15 @@ impl LeafPage {
                     payload.extend_from_slice(&opage[4..4 + want]);
                     next = following;
                 }
-            }
-            cells.push(Cell { rowid, payload });
+                first
+            } else {
+                0
+            };
+            cells.push(Cell {
+                rowid,
+                payload,
+                first_overflow,
+            });
         }
         cells.sort_by_key(|c| c.rowid);
         Ok(LeafPage {
@@ -274,34 +359,58 @@ impl LeafPage {
         Some(self.cells.remove(pos))
     }
 
-    /// Serialises the page into `page`, using `overflow` to resolve spill
-    /// chains.
+    /// Writes the page into the pager, allocating overflow chains as needed.
     ///
-    /// `overflow` is called for each cell whose payload does not fit locally and
-    /// must return the first overflow page of a freshly written chain, or 0 to
-    /// write the cell with a dangling pointer. The closure receives the spill
-    /// portion of the payload.
-    pub fn write<F>(&self, page: &mut [u8], usable: u32, mut overflow: F) -> Result<()>
-    where
-        F: FnMut(&[u8]) -> Result<u32>,
-    {
+    /// Chains are allocated here rather than by the caller, because a caller
+    /// that supplies the head page can get it wrong in a way nothing reports: a
+    /// cell whose payload spills and whose head is page zero reads back as a
+    /// chain that ended early, and the file is corrupt.
+    pub fn write_to(&self, pager: &mut Pager) -> Result<()> {
+        let usable = pager.usable_size();
+        let page_no = self.page_no;
+        // The chains are built first, because allocating a page takes the pager
+        // mutably and that cannot happen while a page borrow is held.
+        let heads = self.overflow_heads(pager, usable)?;
+        {
+            let page = pager.page(page_no)?;
+            self.write(page, usable, &heads)?;
+        }
+        pager.mark_dirty(page_no);
+        Ok(())
+    }
+
+    /// The overflow head for each cell, in cell order.
+    ///
+    /// A payload that does not fit needs a chain. A cell that arrived from a
+    /// read already has one and keeps it, since the chain belongs to the row
+    /// rather than to the leaf, and reallocating it would strand the old pages.
+    fn overflow_heads(&self, pager: &mut Pager, usable: u32) -> Result<Vec<u32>> {
+        let mut heads = Vec::with_capacity(self.cells.len());
+        for cell in &self.cells {
+            let local = cell.local_len(usable) as usize;
+            let head = if local == cell.payload.len() {
+                0
+            } else if cell.first_overflow != 0 {
+                cell.first_overflow
+            } else {
+                write_overflow_chain(pager, &cell.payload[local..])?
+            };
+            heads.push(head);
+        }
+        Ok(heads)
+    }
+
+    /// Serialises the page into `page`, with each cell's overflow head taken
+    /// from `heads`, which must have one entry per cell in the same order.
+    pub fn write(&self, page: &mut [u8], usable: u32, heads: &[u32]) -> Result<()> {
         for b in page.iter_mut() {
             *b = 0;
         }
         let layout = self.layout(&self.cells, usable)?;
 
-        // Cell bodies, in the order they appear in memory: highest address
-        // first. The overflow chains must be written before the page that
-        // points at them, so they are resolved first here.
         let mut bodies = Vec::with_capacity(self.cells.len());
-        for cell in &self.cells {
-            let local = cell.local_len(usable) as usize;
-            let first = if local == cell.payload.len() {
-                0
-            } else {
-                overflow(&cell.payload[local..])?
-            };
-            bodies.push(cell.encode(usable, first));
+        for (cell, head) in self.cells.iter().zip(heads) {
+            bodies.push(cell.encode(usable, *head));
         }
 
         for (i, body) in bodies.iter().enumerate() {
@@ -357,6 +466,7 @@ mod tests {
         Cell {
             rowid,
             payload: LeafPage::encode_payload(values, None),
+            first_overflow: 0,
         }
     }
 
@@ -374,20 +484,12 @@ mod tests {
         let root = pager.allocate().unwrap();
         let usable = pager.usable_size();
         let page = LeafPage::empty(root, 4096);
-        {
-            let dst = pager.page(root).unwrap();
-            page.write(dst, usable, |_| Ok(0)).unwrap();
-        }
         // The cells must actually be present, so rebuild the page from them.
         let page = LeafPage {
             cells: cells.to_vec(),
             ..page
         };
-        {
-            let dst = pager.page(root).unwrap();
-            page.write(dst, usable, |_| Ok(0)).unwrap();
-        }
-        pager.mark_dirty(root);
+        page.write_to(&mut pager).expect("writing the leaf");
         pager.flush().unwrap();
         drop(pager);
 
@@ -547,13 +649,12 @@ mod tests {
         };
         let cells: Vec<Cell> = (1..=3).map(|i| cell(i, &[Value::Integer(i)])).collect();
         let page = LeafPage { cells, ..page };
+        // write_to clears the whole page, so the file header has to be put
+        // back: page 1's first 100 bytes are not b-tree space.
+        let header = pager.header().to_bytes();
+        page.write_to(&mut pager).expect("writing the leaf");
         {
-            // Write the b-tree part, then restore the header bytes, which live
-            // in the same 4096 bytes the cell content area would otherwise
-            // claim.
-            let header = pager.header().to_bytes();
             let dst = pager.page(1).unwrap();
-            page.write(dst, usable, |_| Ok(0)).unwrap();
             dst[..100].copy_from_slice(&header);
         }
         pager.write_header().unwrap();

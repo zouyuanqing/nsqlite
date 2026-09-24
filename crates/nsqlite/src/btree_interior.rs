@@ -217,30 +217,42 @@ pub struct SplitLeaf {
 /// The split point is chosen so both halves fit with room to spare, and the
 /// returned separator is the largest key that ended up on the left. The original
 /// page is reused for the left half, so the caller only needs one new page.
-pub fn split_leaf(pager: &mut Pager, page: &LeafPage, usable: u32) -> Result<SplitLeaf> {
-    if page.cells.len() < 2 {
-        return Err(Error::corrupt(
-            "cannot split a leaf with fewer than two cells",
-        ));
-    }
+pub fn split_leaf(
+    pager: &mut Pager,
+    page: &LeafPage,
+    usable: u32,
+    pending: &Cell,
+) -> Result<SplitLeaf> {
+    // The cell that did not fit is part of what the page has to hold, so the
+    // split point is chosen over the existing cells plus it. Splitting the
+    // existing cells alone can leave both halves full and the insert still
+    // fails, which is what happens with rows that spill into overflow pages:
+    // those occupy most of a page each, so two of them never share one.
+    let mut all = page.cells.clone();
+    let pos = all
+        .binary_search_by_key(&pending.rowid, |c| c.rowid)
+        .unwrap_or_else(|p| p);
+    all.insert(pos, pending.clone());
+
     let right_no = pager.allocate()?;
 
     // Try each split point and keep the first that leaves both halves fitting.
     // SQLite aims for a roughly even split, so start in the middle and walk
     // outward only if needed.
-    let mid = page.cells.len() / 2;
-    for delta in 0..page.cells.len() {
+    let mid = all.len() / 2;
+    for delta in 0..all.len() {
         for left_len in [mid.saturating_sub(delta), mid + delta] {
-            if left_len == 0 || left_len >= page.cells.len() {
+            if left_len == 0 || left_len >= all.len() {
                 continue;
             }
-            let left_cells = &page.cells[..left_len];
-            let right_cells = &page.cells[left_len..];
+            let left_cells = &all[..left_len];
+            let right_cells = &all[left_len..];
             let left = LeafPage {
                 cells: left_cells.to_vec(),
                 ..page_ref(page)
             };
             let right = LeafPage {
+                page_no: right_no,
                 cells: right_cells.to_vec(),
                 ..page_ref(page)
             };
@@ -259,9 +271,11 @@ pub fn split_leaf(pager: &mut Pager, page: &LeafPage, usable: u32) -> Result<Spl
             }
         }
     }
-    Err(Error::corrupt(
-        "a leaf could not be split into two fitting halves",
-    ))
+    Err(Error::corrupt(format!(
+        "a leaf of {} cell(s) could not be split into two fitting halves;          largest cell occupies {} bytes of a {usable}-byte page",
+        page.cells.len(),
+        page.cells.iter().map(|c| c.on_page_size(usable)).max().unwrap_or(0),
+    )))
 }
 
 /// Clones the page's geometry without its cells.
@@ -274,14 +288,19 @@ fn page_ref(page: &LeafPage) -> LeafPage {
     }
 }
 
-/// Writes a leaf page image and marks it dirty.
-fn write_leaf(pager: &mut Pager, page_no: u32, leaf: &LeafPage, usable: u32) -> Result<()> {
-    {
-        let dst = pager.page(page_no)?;
-        leaf.write(dst, usable, |_| Ok(0))?;
-    }
-    pager.mark_dirty(page_no);
-    Ok(())
+/// Writes a leaf page image to `page_no` and marks it dirty.
+///
+/// The page number is passed separately rather than taken from the struct,
+/// because a split builds both halves from one page and only the left half
+/// carries the original number.
+fn write_leaf(pager: &mut Pager, page_no: u32, leaf: &LeafPage, _usable: u32) -> Result<()> {
+    let mut copy = LeafPage {
+        page_no,
+        cells: leaf.cells.clone(),
+        page_size: leaf.page_size,
+        header_offset: leaf.header_offset,
+    };
+    copy.write_to(pager)
 }
 
 #[cfg(test)]
@@ -292,6 +311,7 @@ mod tests {
         Cell {
             rowid,
             payload: LeafPage::encode_payload(&[crate::value::Value::Integer(rowid)], None),
+            first_overflow: 0,
         }
     }
 
@@ -429,6 +449,7 @@ mod tests {
                     &[crate::value::Value::Text("x".repeat(60))],
                     None,
                 ),
+                first_overflow: 0,
             };
             if !page.insert(c, usable).unwrap() {
                 break;
@@ -444,7 +465,16 @@ mod tests {
             "the page should have held a useful number of cells"
         );
 
-        let split = split_leaf(&mut pager, &page, usable).unwrap();
+        // The cell that did not fit is the trigger, and the split places it.
+        let pending = Cell {
+            rowid: n,
+            payload: LeafPage::encode_payload(
+                &[crate::value::Value::Text("y".repeat(60))],
+                None,
+            ),
+            first_overflow: 0,
+        };
+        let split = split_leaf(&mut pager, &page, usable, &pending).unwrap();
         assert_eq!(
             split.left, root,
             "the original page is reused for the left half"
@@ -459,7 +489,7 @@ mod tests {
         // Both halves must read back, and together cover every key.
         let left = LeafPage::read(&mut pager, split.left).unwrap();
         let right = LeafPage::read(&mut pager, split.right).unwrap();
-        assert_eq!(left.cells.len() + right.cells.len(), count);
+        assert_eq!(left.cells.len() + right.cells.len(), count + 1);
         assert_eq!(left.cells.last().unwrap().rowid, split.separator);
         assert_eq!(right.cells.first().unwrap().rowid, split.separator + 1);
         assert!(left.fits_cells(usable) && right.fits_cells(usable));
@@ -477,7 +507,7 @@ mod tests {
         let mut page = LeafPage::empty(root, 4096);
         page.insert(cell(1), usable).unwrap();
         page.insert(cell(2), usable).unwrap();
-        let split = split_leaf(&mut pager, &page, usable).unwrap();
+        let split = split_leaf(&mut pager, &page, usable, &cell(3)).unwrap();
         assert_eq!(split.separator, 1);
         drop(pager);
         let _ = std::fs::remove_file(&path);

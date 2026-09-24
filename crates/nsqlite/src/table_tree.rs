@@ -90,10 +90,7 @@ impl TableTree {
 
     /// Inserts a row, allocating and splitting pages as needed.
     pub fn insert(&mut self, pager: &mut Pager, row: &Row) -> Result<()> {
-        let cell = Cell {
-            rowid: row.rowid,
-            payload: self.payload_of(row),
-        };
+        let cell = Cell::new(row.rowid, self.payload_of(row));
         // Walk down, remembering the path so a split can propagate upward.
         let mut path: Vec<u32> = Vec::new();
         let mut page_no = self.root;
@@ -125,30 +122,16 @@ impl TableTree {
             write_leaf(pager, &leaf)?;
             return Ok(());
         }
-        // The leaf is full. Split it first, which writes both halves and leaves
-        // the new right child hanging off a parent that does not yet know about
-        // it, then insert into whichever half the key belongs to.
-        let split = split_leaf(pager, &leaf, self.usable)?;
-        let target = if cell.rowid <= split.separator {
-            split.left
-        } else {
-            split.right
-        };
-        let mut half = LeafPage::read(pager, target)?;
-        let inserted = half.insert(cell, self.usable)?;
-        if !inserted {
-            // Each half holds roughly half of a full page, so a freshly split
-            // half always has room. Treating a failure as corruption beats
-            // silently dropping the row.
-            return Err(Error::corrupt("a freshly split leaf half was already full"));
-        }
-        write_leaf(pager, &half)?;
+        // The leaf is full. The split takes the pending cell into account and
+        // writes both halves with it already placed, so there is nothing left to
+        // insert afterwards: doing so would duplicate the row.
+        //
+        // The new right child stays unreachable until the graft below, so the
+        // parent never points at a page that does not yet hold its rows.
+        let split = split_leaf(pager, &leaf, self.usable, &cell)?;
 
-        // Only now graft the new right child in, so the parent never points at a
-        // page that does not yet hold the rows it is supposed to.
-        // The parent gains a cell naming the left half, and its rightmost
-        // child becomes the new right half. Passing the right half as the
-        // rightmost is what keeps every key reachable.
+        // The parent gains a cell naming the left half, and its rightmost child
+        // becomes the new right half, which is what keeps every key reachable.
         self.graft(pager, path, split.left, split.right, split.separator)
     }
 
@@ -232,23 +215,33 @@ impl TableTree {
             return Ok(());
         }
 
-        // The parent is full. Split it in two. The left half keeps the lower
-        // keys and hands its old rightmost child to the right half, which also
-        // takes every key that moved.
+        // The parent is full. Split it in two.
         //
-        // The separator handed to the grandparent is the largest key now in the
-        // left half, which is the key of the cell just before the split point.
+        // The children in key order are cells[0].left_child through
+        // cells[n-1].left_child, then the old rightmost. Splitting at `mid`
+        // divides them as:
+        //
+        //   left half:  cells[0..mid],  rightmost = cells[mid].left_child
+        //   right half: cells[mid+1..],  rightmost = the old rightmost
+        //
+        // The cell at the split point is therefore consumed rather than
+        // duplicated: its child becomes the left half's rightmost, and its key
+        // is the separator the grandparent needs. Leaving that cell in both
+        // halves names one page twice, as the left half's rightmost and as the
+        // right half's first cell, and every row under it then reads back
+        // twice.
         let mid = interior.cells.len() / 2;
-        let parent_separator = interior.cells[mid - 1].key;
-        let overflow = interior.cells.split_off(mid);
+        let consumed = interior.cells[mid];
         let old_rightmost = interior.rightmost;
-        interior.rightmost = overflow[0].left_child;
+        let right_cells: Vec<InteriorCell> = interior.cells.drain(mid + 1..).collect();
+        interior.cells.truncate(mid);
+        interior.rightmost = consumed.left_child;
         write_interior(pager, &interior)?;
 
         let new_page = pager.allocate()?;
         let right = InteriorPage {
             page_no: new_page,
-            cells: overflow,
+            cells: right_cells,
             rightmost: old_rightmost,
             page_size: self.page_size,
             header_offset: 0,
@@ -262,7 +255,7 @@ impl TableTree {
             &path[..path.len() - 1],
             parent,
             new_page,
-            parent_separator,
+            consumed.key,
         )
     }
 
@@ -425,14 +418,9 @@ fn interior_ref(page: &InteriorPage) -> InteriorPage {
 }
 
 fn write_leaf(pager: &mut Pager, leaf: &LeafPage) -> Result<()> {
-    let usable = pager.usable_size();
-    let page_no = leaf.page_no;
-    {
-        let dst = pager.page(page_no)?;
-        leaf.write(dst, usable, |_| Ok(0))?;
-    }
-    pager.mark_dirty(page_no);
-    Ok(())
+    // write_to allocates any overflow chain the page needs, so a spilling row
+    // never ends up with a head of zero.
+    leaf.write_to(pager)
 }
 
 fn write_interior(pager: &mut Pager, interior: &InteriorPage) -> Result<()> {
