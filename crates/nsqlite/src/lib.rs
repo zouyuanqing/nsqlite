@@ -11,6 +11,7 @@
 //! * [`page`] — the database header, b-tree page headers, and the payload
 //!   overflow thresholds.
 //! * [`pager`] — the page cache over a database file.
+//! * [`connection`] — running statements against a database.
 //! * [`catalog`] — the tables a connection knows about.
 //! * [`eval`] — expression evaluation and the built-in functions.
 //! * [`affinity`] — how a declared type is interpreted.
@@ -29,6 +30,7 @@ pub mod btree;
 pub mod btree_interior;
 pub mod btree_write;
 pub mod catalog;
+pub mod connection;
 pub mod error;
 pub mod eval;
 pub mod page;

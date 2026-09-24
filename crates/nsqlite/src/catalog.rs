@@ -220,7 +220,8 @@ mod tests {
         assert_eq!(t.columns[3].affinity, Affinity::Blob);
         // An undeclared type is BLOB, which converts nothing.
         assert_eq!(t.columns[4].affinity, Affinity::Blob);
-        assert_eq!(t.columns[0].declared_type, "INTEGER");
+        // An unquoted identifier is folded to lower case, as SQLite does.
+        assert_eq!(t.columns[0].declared_type, "integer");
     }
 
     #[test]
@@ -269,7 +270,7 @@ mod tests {
         assert!(c.contains("USERS"));
         assert!(c.contains("Users"));
         assert!(!c.contains("others"));
-        assert_eq!(c.names(), vec!["Users"]);
+        assert_eq!(c.names(), vec!["users"]);
         c.remove("USERS");
         assert!(c.is_empty());
     }
