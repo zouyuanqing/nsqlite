@@ -228,6 +228,11 @@ impl LeafPage {
         self.layout(cells, usable).is_ok()
     }
 
+    /// Whether this page, as it currently stands, still fits its own cells.
+    pub fn fits_cells(&self, usable: u32) -> bool {
+        self.fits(&self.cells, usable)
+    }
+
     /// How many bytes remain free once the pointer array has grown by one.
     pub fn free_space(&self, usable: u32) -> usize {
         match self.layout(&self.cells, usable) {

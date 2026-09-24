@@ -13,6 +13,7 @@
 //! * [`pager`] — the page cache over a database file.
 //! * [`btree`] — reading table b-trees, including overflow chains.
 //! * [`btree_write`] — writing table leaf pages.
+//! * [`btree_interior`] — table interior pages and leaf splitting.
 //! * [`text`] — the text encodings a file can declare.
 //! * [`value`] / [`error`] — the runtime value and error types.
 //!
@@ -20,6 +21,7 @@
 //! of these and live in their own modules as they land.
 
 pub mod btree;
+pub mod btree_interior;
 pub mod btree_write;
 pub mod error;
 pub mod page;
