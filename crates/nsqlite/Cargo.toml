@@ -1,0 +1,13 @@
+[package]
+name = "nsqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A from-scratch, SQLite-file-format-compatible embedded database engine"
+
+[dependencies]
+
+[lib]
+name = "nsqlite"
+path = "src/lib.rs"
