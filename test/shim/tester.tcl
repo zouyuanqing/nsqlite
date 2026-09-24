@@ -278,7 +278,7 @@ proc nsqlite_run {name sql} {
   # message; the non-zero status then does not matter, because the failure is
   # already in the stream the parser sees.
   set cap [nsqlite_scratch_file]
-  set rc [catch {exec {*}$cmd > $@ $cap} err]
+  set rc [catch {exec {*}$cmd > $cap} err]
   set out ""
   catch {
     set fd [open $cap r]

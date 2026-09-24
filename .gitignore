@@ -14,3 +14,4 @@ test/interop/*.db
 **/zzprobe.rs
 parseprobe.log
 crates/nsqlite/parseprobe.log
+test/sqlite-run/

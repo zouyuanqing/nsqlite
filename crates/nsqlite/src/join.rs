@@ -97,6 +97,29 @@ impl From {
 /// column already claimed by an earlier source is skipped, which is what makes
 /// `a JOIN b USING (x)` expand to `x, a.y, b.y` rather than `x, a.y, x, b.y`.
 pub fn resolve(sources: Vec<Source>) -> Result<From> {
+    // A USING column has to exist on both sides of the join that names it. This
+    // is checked before anything runs, so a missing column is an error even
+    // when no row would have matched, which is where SQLite reports it.
+    for (i, s) in sources.iter().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        for name in &s.using {
+            let on_left = sources[..i]
+                .iter()
+                .rev()
+                .find(|p| has_column(p, name));
+            let on_right = has_column(s, name);
+            if on_left.is_none() || !on_right {
+                return Err(Error::new(
+                    ResultCode::Error,
+                    format!(
+                        "cannot join using column {name} - column not present in both tables"
+                    ),
+                ));
+            }
+        }
+    }
     let mut star = Vec::new();
     // The columns a USING clause has already claimed, in the order they were
     // first seen. A three-way chain naming the same column twice still claims it
@@ -115,6 +138,11 @@ pub fn resolve(sources: Vec<Source>) -> Result<From> {
         }
     }
     Ok(From { sources, star })
+}
+
+/// Whether a source has a column by that name.
+fn has_column(s: &Source, name: &str) -> bool {
+    s.table.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name))
 }
 
 /// Builds the sources for a FROM list, looking each table up by name.
@@ -157,6 +185,111 @@ fn display_table_name(tref: &TableRef) -> String {
         Some((_, table)) => table.to_string(),
         None => tref.name.clone(),
     }
+}
+
+/// A name in a statement, resolved to the place in the joined row it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ref {
+    /// A column of one source, by its index within that source.
+    Column { source: usize, column: usize },
+}
+
+/// A resolution failure, carrying SQLite's wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unresolved {
+    pub message: String,
+}
+
+impl Unresolved {
+    fn new(message: String) -> Unresolved {
+        Unresolved { message }
+    }
+}
+
+/// Resolves one name against the FROM clause.
+///
+/// A qualified name reads only the source it names, and only when that name is
+/// the one in scope: once a table has an alias, the original name no longer
+/// resolves and the qualified form fails like any other unknown name. An
+/// unqualified name reads every source that has it, and more than one is
+/// ambiguous.
+///
+/// A column named by USING resolves to the left-hand side's copy, which is the
+/// single one the star prints and the one a bare name has to mean for the query
+/// to be unambiguous.
+///
+/// `star` says the name came from expanding a `*` rather than from something
+/// the user wrote. It only changes the wording of an ambiguity: a star is
+/// resolved against the schema, so it names the table as `main.alias.column`,
+/// where a name the user wrote is echoed back exactly as written.
+pub fn resolve_ref(
+    from: &From,
+    table: Option<&str>,
+    name: &str,
+    star: bool,
+) -> Result<Ref, Unresolved> {
+    let matches: Vec<(usize, usize)> = from
+        .sources
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| match table {
+            Some(t) => s.name.eq_ignore_ascii_case(t),
+            None => true,
+        })
+        .filter_map(|(i, s)| {
+            s.table
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+                .map(|j| (i, j))
+        })
+        .collect();
+    // A USING column names two columns but stands for one, so the copies from
+    // the right side of the join are not candidates for a bare name.
+    let live: Vec<(usize, usize)> = matches
+        .iter()
+        .copied()
+        .filter(|(i, j)| {
+            let s = &from.sources[*i];
+            !s.using
+                .iter()
+                .any(|u| u.eq_ignore_ascii_case(&s.table.columns[*j].name))
+        })
+        .collect();
+    let candidates = if live.is_empty() { matches } else { live };
+
+    match candidates.len() {
+        1 => Ok(Ref::Column {
+            source: candidates[0].0,
+            column: candidates[0].1,
+        }),
+        0 => Err(Unresolved::new(match table {
+            Some(t) => format!("no such column: {t}.{name}"),
+            None => format!("no such column: {name}"),
+        })),
+        _ => {
+            // More than one source has the column. A star names the first
+            // candidate through the schema, the way SQLite resolves one against
+            // `sqlite_schema`; a name the user wrote is echoed as written.
+            let shown = if star {
+                let s = &from.sources[candidates[0].0];
+                format!("main.{}.{}", s.name, name)
+            } else {
+                match table {
+                    Some(t) => format!("{t}.{name}"),
+                    None => name.to_string(),
+                }
+            };
+            Err(Unresolved::new(format!(
+                "ambiguous column name: {shown}"
+            )))
+        }
+    }
+}
+
+/// A name that did not resolve, turned into the error the executor reports.
+pub fn unresolved_error(e: Unresolved) -> Error {
+    Error::new(ResultCode::Error, e.message)
 }
 
 /// One row of the join, as the values of every source's columns in order.
@@ -292,10 +425,9 @@ where
     if src.using.is_empty() {
         return Ok(true);
     }
-    // A USING column has to be on both sides. This is checked when the FROM is
+    // A USING column has to be on both sides. That is checked when the FROM is
     // resolved, where the error names the column, so reaching here means the
     // column exists on both sides and only the values are compared.
-    let left_width: usize = from.sources[..index].iter().map(|s| s.table.len()).sum();
     for name in &src.using {
         let lv = lookup_in(row, from, index - 1, name);
         let rv = lookup_in(row, from, index, name);
@@ -307,7 +439,6 @@ where
             return Ok(false);
         }
     }
-    let _ = left_width;
     Ok(true)
 }
 
