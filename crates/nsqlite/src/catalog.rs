@@ -223,6 +223,14 @@ impl Catalog {
         v
     }
 
+    /// Every table, sorted by name, for resolving a FROM clause that names more
+    /// than one.
+    pub fn all_tables(&self) -> Vec<Table> {
+        let mut v: Vec<Table> = self.tables.values().cloned().collect();
+        v.sort_by_key(|t| t.name.to_ascii_lowercase());
+        v
+    }
+
     /// Builds a table from a CREATE TABLE statement.
     ///
     /// The rowid alias is the single INTEGER PRIMARY KEY column of a rowid

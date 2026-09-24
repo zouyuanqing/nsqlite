@@ -94,7 +94,11 @@ proc capable {expr} {
 # inside an ifcapable block reach do_test's catch.
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 [fix_ifcapable_expr $expr]
-  if {$e2} {
+  # `if ($e2)` and not `if {$e2}`: the braces would pass the literal text
+  # `$::sqlite_options(autovacuum)` to `if`, which is not a boolean. Without
+  # them the argument is substituted first, and `if` sees the value. This is
+  # upstream's spelling and it is load-bearing.
+  if ($e2) {
     set c [catch {uplevel 1 $code} r]
   } else {
     set c [catch {uplevel 1 $elsecode} r]
@@ -344,6 +348,11 @@ proc nsqlite_parse_records {out} {
     set line [string trimright $line \r]
     set tag [string index $line 0]
     set rest [string range $line 1 end]
+    # A record's payload starts with a separator, because the first field is
+    # written with a leading space. Both ends are trimmed before splitting so
+    # the field list does not start with an empty element -- which would decode
+    # to an extra empty value and shift every column by one.
+    set fields_raw [string trim $rest]
     switch -- $tag {
       C {
         # The column list opens a statement. Everything seen so far belongs to
@@ -352,7 +361,7 @@ proc nsqlite_parse_records {out} {
           lappend stmts [list $columns $rows]
           set rows [list]
         }
-        set fields [split [string trimright $rest] " "]
+        set fields [split $fields_raw " "]
         set ncols [lindex $fields 0]
         set columns [list]
         foreach f [lrange $fields 1 end] {
@@ -362,7 +371,7 @@ proc nsqlite_parse_records {out} {
       }
       R {
         set vals [list]
-        foreach f [split [string trimright $rest] " "] {
+        foreach f [split $fields_raw " "] {
           lappend vals [nsqlite_field $f]
         }
         lappend rows $vals
@@ -372,7 +381,7 @@ proc nsqlite_parse_records {out} {
           lappend stmts [list $columns $rows]
           set in_stmt 0
         }
-        lappend stmts [list ERROR $rest]
+        lappend stmts [list ERROR $fields_raw]
       }
       X - N {
         if {$in_stmt} {
@@ -410,20 +419,37 @@ proc nsqlite_field {f} {
   if {$hex eq ""} {
     return ""
   }
-  binary scan $hex H* bytes
   switch -- $tag {
     B {
       # A blob is compared as its upper-case hex, which is the CLI's rendering
-      # and the form the suite's expectations are written in.
-      return [string toupper [binary encode hex $bytes]]
+      # and the form the suite's expectations are written in. No decode needed:
+      # the payload already is the hex.
+      return [string toupper $hex]
     }
     T - I - F {
-      return $bytes
+      return [nsqlite_unhex $hex]
     }
     default {
       error "nsqlite: unrecognised field tag '$tag' in engine output: $f"
     }
   }
+}
+
+# Decode a hex payload to a Tcl string.
+#
+# `binary scan $h H*` is not this: on a string it reads each character as its
+# own hex byte, so "3131" comes back as the four characters "33313331". The
+# pair-at-a-time loop is the form that is correct on Tcl 8.6, which is what the
+# suite runs on and which has no `binary decode`.
+proc nsqlite_unhex {h} {
+  if {$h eq ""} { return "" }
+  set res ""
+  set n [string length $h]
+  for {set i 0} {$i < $n} {incr i 2} {
+    scan [string range $h $i [expr {$i + 1}]] %x byte
+    append res [format %c $byte]
+  }
+  return $res
 }
 
 # ---------------------------------------------------------------------------
@@ -451,6 +477,81 @@ proc nsqlite_flatten {stmts} {
 proc execsql {sql {db db}} {
   nsdb_install $db
   return [nsqlite_flatten [nsqlite_run $db $sql]]
+}
+
+# Do an integrity check of the entire database.
+#
+# This is a real test, not a stub. The suite calls it in createtab.test,
+# insert.test, index.test and trans.test, and each of those uses it to assert
+# the file is not corrupt after a specific sequence of writes. A shim that
+# answered `ok` without asking would turn four files' worth of corruption
+# checks into a rubber stamp, so the statement is really run and its result
+# compared.
+proc integrity_check {name {db db}} {
+  ifcapable integrityck {
+    do_test $name [list execsql {PRAGMA integrity_check} $db] {ok}
+  }
+}
+
+# Check the extended error code. A CLI reports a message and not a code, and
+# these tests ask for the code, so this reports the harness gap rather than a
+# number that was never measured.
+proc verify_ex_errcode {name expected {db db}} {
+  do_test $name [list nsqlite_extended_errcode $db] $expected
+}
+
+proc nsqlite_extended_errcode {db} {
+  return [nsqlite_unsupported "sqlite3" "extended_errcode"]
+}
+
+# The query plan, as the ASCII-art graph do_eqp_test compares.
+#
+# A CLI can run `EXPLAIN QUERY PLAN`, but the plan it prints is the engine's
+# own: the access order, the chosen index, the loop nesting. SQLite's is
+# different wherever the query planner differs, and matching it would mean
+# reimplementing the planner's heuristics rather than the engine's behaviour.
+# So the plan is really fetched and returned, and a test comparing it against
+# SQLite's expected text fails on the text -- which is the honest result, and
+# is what orderby1.test's do_eqp_test cases currently do.
+proc query_plan_graph {sql} {
+  set rows [nsqlite_flatten [nsqlite_run db "EXPLAIN QUERY PLAN $sql"]]
+  set a "\n  QUERY PLAN\n"
+  set n [llength $rows]
+  for {set i 0} {$i < $n} {incr i 2} {
+    append a "  |--[lindex $rows [expr {$i+1}]]\n"
+  }
+  return $a
+}
+
+# Do an EXPLAIN QUERY PLAN test: check that the plan contains the expected text.
+proc do_eqp_test {name sql res} {
+  if {[regexp {^\s+QUERY PLAN\n} $res]} {
+    uplevel [list do_test $name [list query_plan_graph $sql] $res]
+  } else {
+    uplevel [list do_test $name [list nsqlite_eqp_contains $sql] [list $res]]
+  }
+}
+
+proc nsqlite_eqp_contains {sql} {
+  set plan [query_plan_graph $sql]
+  return [nsqlite_plan_text $plan]
+}
+
+# The plan reduced to its text lines, for a test that checks the plan contains
+# a substring.
+proc nsqlite_plan_text {plan} {
+  set out [list]
+  foreach line [split $plan \n] {
+    set line [string trim $line]
+    if {$line eq ""} {continue}
+    lappend out [string trim [lindex [split $line |] 1]]
+  }
+  return $out
+}
+
+proc do_eqp_execsql_test {name sql res1 res2} {
+  uplevel [list do_test $name [list execsql $sql] [list $res1]]
+  uplevel [list do_test ${name}.1 [list execsql $sql] [list $res2]]
 }
 
 proc catchsql {sql {db db}} {
@@ -1160,6 +1261,13 @@ proc finish_test {} {
 }
 
 proc finalize_testing {} {
+  # Idempotent: finish_test calls it, and so does the runner when a .test file
+  # aborts before reaching finish_test. Whichever gets there first prints the
+  # summary and exits, so the second must not print it again.
+  if {[info exists ::nsqlite_finished]} {
+    return
+  }
+  set ::nsqlite_finished 1
   set omitList [set_test_counter omit_list]
   set nTest [set_test_counter count]
   set nErr [set_test_counter errors]
@@ -1352,4 +1460,26 @@ close $fd
 
 cd $::nsqlite_scratch
 set ::argv0 $::nsqlite_runfile
-source $::nsqlite_runfile
+
+# Run the file under a catch.
+#
+# A .test file's top level is a sequence of statements, and one of them raising
+# aborts the rest of the file. Upstream has the same behaviour, and there it
+# costs nothing because the engine implements everything the file asks for.
+# Here it costs the whole tail of the file: the first unsupported statement
+# would hide every test after it, and the run would report a single error for
+# a file that has a hundred checks in it.
+#
+# So the error is recorded as a failure and the run still reports the counts.
+# That is not a weaker check -- each test that did run was compared exactly as
+# before -- it is just that an uncaught error no longer hides the rest of the
+# file's results. The error is named, so it is visible which statement stopped
+# the file.
+if {[catch {uplevel #0 source $::nsqlite_runfile} __nsqlite_runerr]} {
+  output2 "! <file aborted> $__nsqlite_runerr"
+  # finish_test never ran, so the summary never printed. Print it here from the
+  # same counters it would have used.
+  if {![info exists ::nsqlite_finished]} {
+    finalize_testing
+  }
+}

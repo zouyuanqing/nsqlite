@@ -16,7 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::affinity::apply as apply_affinity;
-use crate::catalog::{Catalog, Table};
+use crate::affinity::Affinity;
+use crate::catalog::{Catalog, Column, Table};
 use crate::error::{Error, Result, ResultCode};
 use crate::eval::{eval, truthy, EvalCtx};
 use crate::pager::Pager;
@@ -56,6 +57,20 @@ fn rebuild_table(name: &str, sql_text: &str, root: u32) -> Result<Table> {
 /// The page the schema b-tree is rooted at. SQLite fixes it at 1, and a reader
 /// finds the schema there without a lookup, so a table never takes that page.
 const SCHEMA_ROOT: u32 = 1;
+
+/// The columns of a schema table, in the order a query sees them.
+const SCHEMA_COLUMNS: &[&str] = &["type", "name", "tbl_name", "rootpage", "sql"];
+
+/// Whether `name` is one of the two names the schema table answers to.
+///
+/// SQLite has renamed this table twice. `sqlite_master` is the name in the
+/// suite's expectations and the one almost every query uses; `sqlite_schema`
+/// is the name since 3.33 and is what a modern query writes. Both name the
+/// same table, and a query that used the wrong one would otherwise get "no such
+/// table" for a table that exists.
+fn is_schema_table(name: &str) -> bool {
+    name.eq_ignore_ascii_case("sqlite_master") || name.eq_ignore_ascii_case("sqlite_schema")
+}
 
 /// One row of a result set.
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +112,10 @@ pub struct Connection {
     changes: usize,
     last_insert_rowid: i64,
     auto_rowid: i64,
+    /// Where `select` leaves the outcome of a query it could not return
+    /// directly, because reading the schema b-tree needs the pager borrowed
+    /// mutably and the SELECT path wants the outcome by value.
+    pending_outcome: Option<Outcome>,
 }
 
 impl Connection {
@@ -110,6 +129,7 @@ impl Connection {
             changes: 0,
             last_insert_rowid: 0,
             auto_rowid: 0,
+            pending_outcome: None,
         };
         conn.load_schema()?;
         Ok(conn)
@@ -126,6 +146,7 @@ impl Connection {
             changes: 0,
             last_insert_rowid: 0,
             auto_rowid: 0,
+            pending_outcome: None,
         };
         conn.load_schema()?;
         Ok(conn)
@@ -652,133 +673,297 @@ impl Connection {
                 _ => unreachable!("only three body shapes exist"),
             };
         };
-        if from.len() > 1 {
-            return Err(Error::new(ResultCode::Error, "a join is not supported yet"));
-        }
-
         // A SELECT with no FROM evaluates against an empty row, so a constant
         // expression works and a column reference does not.
         let Some(item) = from.first() else {
             return self.select_constants(sel, columns);
         };
-        let FromItem::Table(tref) = item else {
-            return Err(Error::new(
-                ResultCode::Error,
-                "a subquery in FROM is not supported yet",
-            ));
-        };
-        let table = self.table(&tref.name)?.clone();
+        // `sqlite_master` -- and its `sqlite_schema` alias -- is a real table to
+        // a query, and a good deal of the suite reads it: to check what a
+        // statement created, to list tables, and to assert a file reopened with
+        // the shape it was left in. It is not in the catalog because it is not
+        // a user table, so it is answered from the schema b-tree itself.
+        if self.select_schema_table(sel, from, columns, where_.as_ref())? {
+            return Ok(self.pending_outcome.take().expect("just produced one"));
+        }
+        // Every table in the FROM is resolved once, before any row is read, so
+        // an unknown table or a bad USING column is an error even when the query
+        // would have matched nothing.
+        let sources = crate::join::sources_from(&self.catalog_tables(), from)?;
+        let joined = crate::join::resolve(sources)?;
+        self.select_from(sel, columns, where_.as_ref(), &joined)
+    }
 
-        // The row source is the table itself. A record stores only the columns
-        // up to its last non-NULL, so a read has to pad back to the declared
-        // width; without that a trailing NULL column reads as absent and the
-        // zip that binds names to values drops it.
-        let source_rows = {
-            let mut tree = TableTree::open(&mut self.pager, table.root_page)?;
+    /// Answers a query whose FROM names the schema table.
+    ///
+    /// Returns true when the query was about the schema, in which case the
+    /// outcome is left in `pending_outcome` for the caller to take. It is left
+    /// rather than returned because reading the schema b-tree needs a mutable
+    /// borrow of the pager, and the SELECT path wants the outcome by value; a
+    /// field is simpler than splitting that borrow.
+    ///
+    /// Only a lone `FROM sqlite_master` is answered here. A join against it
+    /// falls through to the normal path, which does not know the name yet.
+    fn select_schema_table(
+        &mut self,
+        sel: &Select,
+        from: &[FromItem],
+        columns: &[crate::parser::ResultColumn],
+        where_: Option<&Expr>,
+    ) -> Result<bool> {
+        if from.len() != 1 {            return Ok(false);
+        }
+        let FromItem::Table(tref) = &from[0] else {
+            return Ok(false);
+        };
+        if !is_schema_table(&tref.name) {
+            return Ok(false);
+        }
+        // The rows are not supplied here. The schema table's rows live in the
+        // schema b-tree at SCHEMA_ROOT, which is exactly where `select_from`
+        // reads a table's rows from, so giving it a Table with that root is
+        // enough -- the same page a user table's rows would come from.
+        let table = Table {
+            name: "sqlite_master".into(),
+            columns: SCHEMA_COLUMNS
+                .iter()
+                .map(|n| Column {
+                    name: (*n).to_string(),
+                    declared_type: String::new(),
+                    affinity: Affinity::Text,
+                    not_null: false,
+                    default: None,
+                    rowid_alias: false,
+                })
+                .collect(),
+            rowid_alias: None,
+            without_rowid: false,
+            root_page: SCHEMA_ROOT,
+        };
+        let source = crate::join::Source {
+            name: crate::join::Source::scope_name(tref).to_ascii_lowercase(),
+            table,
+            join: None,
+            on: None,
+            using: Vec::new(),
+        };
+        let joined = crate::join::resolve(vec![source])?;
+        self.pending_outcome = Some(self.select_from(sel, columns, where_, &joined)?);
+        Ok(true)
+    }
+
+    /// Every table the catalog knows about, for resolving a FROM clause.
+    fn catalog_tables(&self) -> Vec<Table> {
+        self.catalog.all_tables()
+    }
+
+    /// Runs a SELECT whose FROM clause has been resolved.
+    ///
+    /// The rows come out of the nested loop left-major, which is the order
+    /// SQLite produces without an index. WHERE and the projection then see a
+    /// bound row carrying every column of every table, and ORDER BY sorts what
+    /// the projection produced.
+    fn select_from(
+        &mut self,
+        sel: &Select,
+        columns: &[crate::parser::ResultColumn],
+        where_: Option<&Expr>,
+        from: &crate::join::From,
+    ) -> Result<Outcome> {
+        // Whether this query groups at all, which decides everything below: a
+        // grouped query folds its rows into groups and then produces one row
+        // per group, while an ungrouped one produces a row per input row.
+        let group_by = match &sel.body {
+            SelectBody::Simple { group_by, .. } => group_by.clone(),
+            _ => Vec::new(),
+        };
+        let plan = crate::grouping::Plan::build(sel)?;
+        let grouped = plan.is_grouped() || plan.has_aggregate();
+
+        // The row source of each table. A record stores only the columns up to
+        // its last non-NULL, so a read has to pad back to the declared width.
+        let mut source_rows: Vec<Vec<crate::table_tree::Row>> =
+            Vec::with_capacity(from.sources.len());
+        for s in &from.sources {
+            let mut tree = TableTree::open(&mut self.pager, s.table.root_page)?;
             let mut rows = tree.scan(&mut self.pager)?;
             for r in &mut rows {
-                r.values.resize(table.len(), Value::Null);
+                r.values.resize(s.table.len(), Value::Null);
             }
-            rows
-        };
+            source_rows.push(rows);
+        }
 
         // The output column names: the alias, or the column's own name, or the
-        // expression's text.
-        let mut names = Vec::with_capacity(columns.len());
-        for rc in columns {
-            names.push(match &rc.alias {
-                Some(a) => a.clone(),
-                None => match &rc.expr {
-                    Expr::Column { name, .. } => name.clone(),
-                    _ => render_expr(&rc.expr),
-                },
-            });
-        }
-        // A star expands to every column of the table.
-        if columns.len() == 1 && is_star(&columns[0].expr) {
-            names = table.columns.iter().map(|c| c.name.clone()).collect();
-        }
-
-        let mut out = Vec::new();
-        for row in &source_rows {
-            let mut bound: Vec<(String, Value)> = table
-                .columns
-                .iter()
-                .zip(row.values.iter())
-                .map(|(c, v)| (c.name.clone(), v.clone()))
-                .collect();
-            // A rowid alias is stored as NULL and recovered from the key, so
-            // the bound row carries the rowid before any expression sees it.
-            // Doing it once here covers the predicate and the projection.
-            if let Some(i) = table.rowid_alias {
-                if let Some((_, slot)) = bound.get_mut(i) {
-                    *slot = Value::Integer(row.rowid);
-                }
+        // expression's text. A star takes the resolved expansion, which is
+        // every table's columns with a USING column counted once.
+        let star = columns.len() == 1 && is_star(&columns[0].expr);
+        let mut names: Vec<String> = Vec::with_capacity(columns.len());
+        if star {
+            names = from.star.iter().map(|(n, _, _)| n.clone()).collect();
+        } else {
+            for rc in columns {
+                names.push(match &rc.alias {
+                    Some(a) => a.clone(),
+                    None => match &rc.expr {
+                        Expr::Column { name, .. } => name.clone(),
+                        _ => render_expr(&rc.expr),
+                    },
+                });
             }
-            let params: Vec<Value> = Vec::new();
-            let ctx = EvalCtx {
-                params: &params,
-                row: bound.clone(),
-                columns: &bound,
-                context: Some(tref.name.clone()),
-            };
+        }
 
+        // Every column reference in WHERE, in the projection, in GROUP BY, in
+        // HAVING and in ORDER BY is resolved now, against the whole FROM. This
+        // is where an ambiguous or unknown column is reported, which is why a
+        // bad name fails even when the tables are empty.
+        let mut exprs: Vec<&Expr> = Vec::new();
+        if let Some(p) = where_ {
+            exprs.push(p);
+        }
+        if !star {
+            for rc in columns {
+                exprs.push(&rc.expr);
+            }
+        }
+        for e in &group_by {
+            exprs.push(e);
+        }
+        if let SelectBody::Simple {
+            having: Some(h), ..
+        } = &sel.body
+        {
+            exprs.push(h);
+        }
+        for (e, _) in &sel.order_by {
+            exprs.push(e);
+        }
+        let bound = crate::join::bind_all(from, &exprs, &names)?;
+
+        // The ON and USING constraints are bound against the same FROM, so they
+        // are resolved here too and evaluated inside the loop.
+        let on_exprs = crate::join::bind_constraints(from)?;
+
+        // The join itself. The loop is left-major: for each row of everything
+        // joined so far, the next table is scanned in full.
+        let params: Vec<Value> = Vec::new();
+        let mut rows = crate::join::nested_loop(from, &source_rows, &on_exprs, &params)?;
+        for jr in &mut rows {
+            jr.recover_rowids(from);
+        }
+
+        // WHERE runs before grouping, so it sees one row at a time and an
+        // aggregate in it is a misuse, which SQLite reports before any row is
+        // read. The error the message depends on is whether the query has an
+        // aggregate in scope at all.
+        let mut surviving: Vec<crate::grouping::Row> = Vec::with_capacity(rows.len());
+        for jr in &rows {
+            let ctx = build_ctx(jr, from, &bound);
             if let Some(pred) = where_ {
                 if !truthy(eval(pred, &ctx)?) {
                     continue;
                 }
             }
-            let mut values: Vec<Value> = Vec::with_capacity(names.len());
-            let star = columns.len() == 1 && is_star(&columns[0].expr);
-            for rc in columns {
+            surviving.push(crate::grouping::Row::new(jr, from, &bound));
+        }
+
+        if grouped {
+            // A grouped query produces one row per group. A result column that
+            // is an aggregate takes the group's value for it; a bare column or
+            // expression is evaluated against the group's first row, which is
+            // what SQLite does for `SELECT v, count(*) ... GROUP BY k`.
+            let groups = crate::grouping::run(&plan, &surviving)?;
+            let mut out: Vec<Row> = Vec::with_capacity(groups.len());
+            for g in &groups {
+                let ctx = EvalCtx {
+                    params: &[],
+                    row: g.named.clone(),
+                    columns: &[],
+                    resolved: g.resolved.clone(),
+                    context: None,
+                };
+                let mut values: Vec<Value> = Vec::with_capacity(names.len());
                 if star {
-                    values.extend(row.values.iter().cloned());
+                    values = g.first.clone();
                 } else {
+                    for rc in columns {
+                        match crate::grouping::Aggregate::of(&rc.expr) {
+                            Some(agg) => values.push(plan.result_of(&agg, &g)?),
+                            None => values.push(eval(&rc.expr, &ctx)?),
+                        }
+                    }
+                }
+                out.push(Row { values });
+            }
+            // ORDER BY sorts the groups' rows. An alias or an ordinal reads the
+            // projected value, and an aggregate in the ORDER BY of a grouped
+            // query is folded per group, which the plan already has.
+            let mut sorted = apply_group_order_by(sel, &plan, &names, &groups, &out)?;
+            apply_limit(sel, &mut sorted)?;
+            return Ok(Outcome::Query {
+                columns: names,
+                rows: sorted,
+            });
+        }
+
+        // The projected row and the joined row it came from are kept together,
+        // because a WHERE may drop rows and ORDER BY still has to sort on the
+        // joined values of the ones that survived.
+        let mut out: Vec<(Row, crate::join::JoinedRow)> = Vec::with_capacity(rows.len());
+        for (i, jr) in rows.iter().enumerate() {
+            let ctx = build_ctx(jr, from, &bound);
+            let mut values: Vec<Value> = Vec::with_capacity(names.len());
+            if star {
+                values = from
+                    .star
+                    .iter()
+                    .map(|(_, s, j)| {
+                        jr.source_slice(from, *s)
+                            .get(*j)
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect();
+            } else {
+                for rc in columns {
                     values.push(eval(&rc.expr, &ctx)?);
                 }
             }
-            // A rowid alias is stored as NULL and has to be recovered from the
-            // key, which is what makes the alias an alias rather than a
-            // column that happens to hold the same number.
-            let mut values = values;
-            if let (Some(i), true) = (
-                table.rowid_alias,
-                tref.name.eq_ignore_ascii_case(&table.name),
-            ) {
-                if i < values.len() {
-                    values[i] = Value::Integer(row.rowid);
-                }
-            }
-            // A rowid alias is stored as NULL and recovered from the key, which
-            // is what makes it an alias rather than a column that happens to
-            // hold the same number.
-            if let Some(i) = table.rowid_alias {
-                if i < values.len() {
-                    values[i] = Value::Integer(row.rowid);
-                }
-            }
-            out.push(Row { values });
+            let _ = i;
+            out.push((Row { values }, jr.clone()));
         }
 
-        apply_order_by(sel, &table, &mut out)?;
-        apply_limit(sel, &mut out)?;
+        let mut projected: Vec<Row> = out.iter().map(|(r, _)| r.clone()).collect();
+        apply_order_by(sel, from, &names, &out, &mut projected)?;
+        apply_limit(sel, &mut projected)?;
         Ok(Outcome::Query {
             columns: names,
-            rows: out,
+            rows: projected,
         })
     }
 
+
     /// A SELECT with no FROM, which yields exactly one row.
+    ///
+    /// A bare aggregate still produces that one row: it folds the empty row the
+    /// query evaluates against, so `SELECT count(*)` is 1 rather than an error.
+    /// The plan is asked first, because a HAVING or an aggregate in the GROUP BY
+    /// is an error whether or not there is a table.
     fn select_constants(
         &mut self,
         sel: &Select,
         columns: &[crate::parser::ResultColumn],
     ) -> Result<Outcome> {
+        let plan = crate::grouping::Plan::build(sel)?;
+        // The one group a no-FROM query has, whose accumulators are fresh.
+        let empty = plan.empty_group()?;
         let params: Vec<Value> = Vec::new();
         let ctx = EvalCtx::empty(&params);
         let mut values = Vec::with_capacity(columns.len());
         for rc in columns {
-            values.push(eval(&rc.expr, &ctx)?);
+            values.push(match crate::grouping::Aggregate::of(&rc.expr) {
+                Some(agg) => plan.result_of(&agg, &empty)?,
+                None => eval(&rc.expr, &ctx)?,
+            });
         }
         let names = columns
             .iter()
@@ -844,6 +1029,7 @@ impl Connection {
                 row: bound.clone(),
                 columns: &bound,
                 context: Some(table_name.to_string()),
+                resolved: Vec::new(),
             };
             if let Some(pred) = where_ {
                 if !truthy(eval(pred, &ctx)?) {
@@ -896,6 +1082,7 @@ impl Connection {
                     row: bound.clone(),
                     columns: &bound,
                     context: Some(table_name.to_string()),
+                    resolved: Vec::new(),
                 };
                 if !truthy(eval(pred, &ctx)?) {
                     continue;
@@ -958,70 +1145,50 @@ fn render_expr(e: &Expr) -> String {
 
 /// Applies an ORDER BY, sorting the result rows in place.
 ///
-/// The sort key is evaluated per row, which is what lets a key name an output
-/// column alias as well as a table column.
-fn apply_order_by(sel: &Select, table: &Table, rows: &mut Vec<Row>) -> Result<()> {
+/// The sort key is evaluated against the joined row, so a key may name a column
+/// of any table in the FROM as well as an alias of the result. An alias wins
+/// where the two could both match, which is what SQLite does: `SELECT a.x AS k
+/// FROM a ORDER BY k` sorts on the projected value, not on the table column.
+///
+/// The keys are computed once per row before the sort, so a comparison never
+/// re-evaluates an expression and the sort itself cannot fail.
+fn apply_order_by(
+    sel: &Select,
+    from: &crate::join::From,
+    names: &[String],
+    rows: &[(Row, crate::join::JoinedRow)],
+    out: &mut Vec<Row>,
+) -> Result<()> {
     if sel.order_by.is_empty() {
         return Ok(());
     }
     let params: Vec<Value> = Vec::new();
+    // The references in the ORDER BY are resolved against the FROM, so a key
+    // naming a column of either table works and an unknown one is an error.
+    let mut keys_exprs: Vec<&Expr> = Vec::new();
+    for (e, _) in &sel.order_by {
+        keys_exprs.push(e);
+    }
+    let bound = crate::join::bind_all(from, &keys_exprs, names)?;
     // Each row carries its sort keys alongside it, computed once, so a
     // comparison never re-evaluates an expression.
     let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
-    for row in rows.iter() {
-        let bound: Vec<(String, Value)> = table
-            .columns
-            .iter()
-            .zip(row.values.iter())
-            .map(|(c, v)| (c.name.clone(), v.clone()))
-            .collect();
-        let mut ctx = EvalCtx {
-            params: &params,
-            row: bound,
-            columns: &[],
-            context: Some(table.name.clone()),
-        };
-        // An ORDER BY may name a column of the table or an alias of the result,
-        // and a qualified alias is written table.alias.
+    for (row, jr) in rows.iter() {
         let mut keys = Vec::with_capacity(sel.order_by.len());
         for (expr, _) in &sel.order_by {
             let key = match expr {
-                Expr::Column {
-                    table: Some(t),
-                    name,
-                    ..
-                } if t == &table.name => {
-                    // A qualified reference that matches a result column is an
-                    // alias of this query.
-                    let idx = (0..table.columns.len())
-                        .find(|&i| table.columns[i].name.eq_ignore_ascii_case(name));
-                    match idx {
-                        Some(i) => row.values.get(i).cloned().unwrap_or(Value::Null),
-                        None => eval(expr, &ctx)?,
-                    }
+                Expr::Column { name, .. } if alias_index(names, name).is_some() => {
+                    // An output alias reads the projected value.
+                    row.values[alias_index(names, name).expect("just checked")]
+                        .clone()
                 }
-                _ => match expr {
-                    Expr::Column { name, .. } => {
-                        let out = (0..row.values.len()).find(|&i| {
-                            // The result column names are the table's, for a
-                            // star, and the aliases otherwise.
-                            table
-                                .columns
-                                .get(i)
-                                .map(|c| c.name.eq_ignore_ascii_case(name))
-                                .unwrap_or(false)
-                        });
-                        match out {
-                            Some(i) => row.values[i].clone(),
-                            None => eval(expr, &ctx)?,
-                        }
-                    }
-                    _ => eval(expr, &ctx)?,
-                },
+                _ => {
+                    let ctx = build_ctx(jr, from, &bound);
+                    eval(expr, &ctx)?
+                }
             };
             keys.push(key);
         }
-        ctx.params = &params;
         keyed.push((keys, row.clone()));
     }
     // Each key is compared in turn, and the first that differs decides. The
@@ -1037,8 +1204,133 @@ fn apply_order_by(sel: &Select, table: &Table, rows: &mut Vec<Row>) -> Result<()
         }
         std::cmp::Ordering::Equal
     });
-    *rows = keyed.into_iter().map(|(_, r)| r).collect();
+    *out = keyed.into_iter().map(|(_, r)| r).collect();
     Ok(())
+}
+
+/// The position of a result column with that name.
+fn alias_index(names: &[String], name: &str) -> Option<usize> {
+    names.iter().position(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// Sorts a grouped query's rows.
+///
+/// A grouped query has no joined row to sort on, so a key resolves in three
+/// ways, in the order SQLite tries them: an output alias or an ordinal reads
+/// the projected value, an aggregate is folded per group, and anything else
+/// reads the group's first row the way the projection did.
+fn apply_group_order_by(
+    sel: &Select,
+    plan: &crate::grouping::Plan,
+    names: &[String],
+    groups: &[crate::grouping::GroupOutput],
+    rows: &[Row],
+) -> Result<Vec<Row>> {
+    if sel.order_by.is_empty() {
+        return Ok(rows.to_vec());
+    }
+    let params: Vec<Value> = Vec::new();
+    let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
+    for (i, g) in groups.iter().enumerate() {
+        let ctx = EvalCtx {
+            params: &params,
+            row: g.named.clone(),
+            columns: &[],
+            resolved: g.resolved.clone(),
+            context: None,
+        };
+        let mut keys = Vec::with_capacity(sel.order_by.len());
+        for (expr, _) in &sel.order_by {
+            let key = order_key(plan, expr, names, g, &ctx, &rows[i])?;
+            keys.push(key);
+        }
+        keyed.push((keys, rows[i].clone()));
+    }
+    let order = &sel.order_by;
+    keyed.sort_by(|a, b| {
+        for (i, (_, ascending)) in order.iter().enumerate() {
+            let ord = a.0[i].compare(&b.0[i]);
+            if ord != std::cmp::Ordering::Equal {
+                return if *ascending { ord } else { ord.reverse() };
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    Ok(keyed.into_iter().map(|(_, r)| r).collect())
+}
+
+/// One sort key of a grouped query.
+fn order_key(
+    plan: &crate::grouping::Plan,
+    expr: &Expr,
+    names: &[String],
+    group: &crate::grouping::GroupOutput,
+    ctx: &EvalCtx<'_>,
+    row: &Row,
+) -> Result<Value> {
+    // An ordinal names an output column, so it reads the projected value.
+    if let Expr::Literal(crate::parser::Literal::Integer(n)) = expr {
+        if *n > 0 {
+            let at = (*n as usize) - 1;
+            if at < row.values.len() {
+                return Ok(row.values[at].clone());
+            }
+        }
+    }
+    // An alias names an output column too, and takes precedence over a table
+    // column of the same name, which is what SQLite does.
+    if let Expr::Column { name, .. } = expr {
+        if let Some(at) = alias_index(names, name) {
+            return Ok(row.values[at].clone());
+        }
+    }
+    // An aggregate in the ORDER BY of a grouped query is folded per group.
+    if let Some(agg) = crate::grouping::Aggregate::of(expr) {
+        return plan.result_of(&agg, group);
+    }
+    // Anything else reads the group's first row, so an ORDER BY on a table
+    // column the projection did not include still sorts.
+    let mut rewritten = expr.clone();
+    rewrite_aggregates(plan, &mut rewritten, group)?;
+    eval(&rewritten, ctx)
+}
+
+/// Replaces every aggregate call in `expr` with a literal of its result, so an
+/// ORDER BY expression that mentions one can be evaluated per group.
+fn rewrite_aggregates(
+    plan: &crate::grouping::Plan,
+    expr: &mut Expr,
+    group: &crate::grouping::GroupOutput,
+) -> Result<()> {
+    if let Some(agg) = crate::grouping::Aggregate::of(expr) {
+        *expr = crate::grouping::literal_of(plan.result_of(&agg, group)?);
+        return Ok(());
+    }
+    for child in crate::grouping::children_mut(expr) {
+        rewrite_aggregates(plan, child, group)?;
+    }
+    Ok(())
+}
+
+/// The evaluation context for one joined row.
+///
+/// The references were resolved before the statement ran, so they are read from
+/// the joined row by offset. The named row is carried as well because it is
+/// what a name that was not pre-resolved falls back to, and because it is the
+/// shape the rest of the executor already builds.
+fn build_ctx<'a>(
+    jr: &crate::join::JoinedRow,
+    from: &crate::join::From,
+    bound: &[crate::join::Bound],
+) -> EvalCtx<'a> {
+    let resolved = crate::join::resolved_values(jr, from, bound);
+    EvalCtx {
+        params: &[],
+        row: crate::join::named_row(from, jr),
+        columns: &[],
+        context: None,
+        resolved,
+    }
 }
 
 /// Applies LIMIT and OFFSET.
@@ -1403,12 +1695,460 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_join_is_refused_rather_than_silently_cross_joined() {
+    // --- joins ----------------------------------------------------------
+    //
+    // Every expectation below was taken from the sqlite3 in this repository's
+    // toolchain (3.53.4) by running the same script and the same queries. The
+    // fixture is the same throughout, so a test names the query and the rows
+    // sqlite3 printed for it.
+
+    /// The join fixture, shared by the tests below.
+    ///
+    /// `a` has two rows with x=2, one of them with a NULL y, and `b` has two
+    /// with x=2. That makes the row order observable: a nested loop has to
+    /// produce the same sequence of pairs every time, and a test that only
+    /// counted rows would not notice if it did not.
+    fn joined() -> Connection {
         let mut c = mem();
-        run(&mut c, "CREATE TABLE a(x)");
-        run(&mut c, "CREATE TABLE b(y)");
-        let e = c.execute_script("SELECT * FROM a, b").unwrap_err();
+        run(
+            &mut c,
+            "CREATE TABLE a(x, y);\
+             CREATE TABLE b(x, y);\
+             INSERT INTO a VALUES(1,'a1'),(2,'a2'),(3,'a3'),(2,NULL);\
+             INSERT INTO b VALUES(1,'b1'),(2,'b2'),(4,'b4'),(2,'b2dup');",
+        );
+        c
+    }
+
+    /// A row as text, the way sqlite3's default separator prints it, so the
+    /// expectations can be copied straight out of its output.
+    fn as_text(o: &Outcome) -> Vec<String> {
+        rows_of(o)
+            .iter()
+            .map(|r| {
+                r.values
+                    .iter()
+                    .map(|v| match v {
+                        Value::Null => String::new(),
+                        other => other.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_comma_join_filters_on_the_where_clause() {
+        let mut c = joined();
+        let o = run(&mut c, "SELECT * FROM a, b WHERE a.x = b.x");
+        assert_eq!(columns_of(&o), &["x", "y", "x", "y"]);
+        assert_eq!(
+            as_text(&o),
+            vec!["1|a1|1|b1", "2|a2|2|b2", "2|a2|2|b2dup", "2||2|b2", "2||2|b2dup"]
+        );
+    }
+
+    #[test]
+    fn an_inner_join_on_matches_the_comma_form() {
+        let mut c = joined();
+        let o = run(&mut c, "SELECT * FROM a JOIN b ON a.x = b.x");
+        assert_eq!(
+            as_text(&o),
+            vec!["1|a1|1|b1", "2|a2|2|b2", "2|a2|2|b2dup", "2||2|b2", "2||2|b2dup"]
+        );
+    }
+
+    #[test]
+    fn a_left_join_keeps_the_unmatched_left_row_as_null() {
+        // sqlite3 prints a.x=3 with both of b's columns empty, and it prints it
+        // in the position the left row had, which is what left-major means.
+        let mut c = joined();
+        let o = run(&mut c, "SELECT * FROM a LEFT JOIN b ON a.x = b.x");
+        assert_eq!(
+            as_text(&o),
+            vec![
+                "1|a1|1|b1",
+                "2|a2|2|b2",
+                "2|a2|2|b2dup",
+                "3|a3||",
+                "2||2|b2",
+                "2||2|b2dup",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cross_join_is_the_full_product_left_major() {
+        // Four rows each, sixteen pairs, and the outer loop is `a`: every row of
+        // `b` appears once per row of `a` before `a` advances.
+        let mut c = joined();
+        let o = run(&mut c, "SELECT * FROM a CROSS JOIN b");
+        assert_eq!(rows_of(&o).len(), 16);
+        assert_eq!(
+            &as_text(&o)[..4],
+            &["1|a1|1|b1", "1|a1|2|b2", "1|a1|4|b4", "1|a1|2|b2dup"]
+        );
+        // The last row of `a` is the one with the NULL y, and it still leads
+        // its own group of four.
+        assert_eq!(
+            &as_text(&o)[12..16],
+            &["2||1|b1", "2||2|b2", "2||4|b4", "2||2|b2dup"]
+        );
+    }
+
+    #[test]
+    fn an_order_by_sorts_a_projected_join() {
+        let mut c = joined();
+        let o = run(
+            &mut c,
+            "SELECT a.x, b.y FROM a INNER JOIN b ON a.x = b.x ORDER BY a.x",
+        );
+        // The column names are the bare column names, not the qualified text,
+        // because a column reference names its own column.
+        assert_eq!(columns_of(&o), &["x", "y"]);
+        assert_eq!(as_text(&o), vec!["1|b1", "2|b2", "2|b2dup", "2|b2", "2|b2dup"]);
+    }
+
+    #[test]
+    fn a_using_column_appears_once_in_a_star() {
+        // sqlite3 prints three columns for `a JOIN b USING (x)`, not four: the
+        // shared column is counted once and takes `a`'s value, which the equal
+        // constraint makes the same anyway.
+        let mut c = joined();
+        let o = run(&mut c, "SELECT * FROM a JOIN b USING (x)");
+        assert_eq!(columns_of(&o), &["x", "y", "y"]);
+        assert_eq!(
+            as_text(&o),
+            vec!["1|a1|b1", "2|a2|b2", "2|a2|b2dup", "2||b2", "2||b2dup"]
+        );
+    }
+
+    #[test]
+    fn a_left_join_with_using_also_counts_the_column_once() {
+        let mut c = joined();
+        let o = run(&mut c, "SELECT * FROM a LEFT JOIN b USING (x)");
+        assert_eq!(columns_of(&o), &["x", "y", "y"]);
+        assert_eq!(
+            as_text(&o),
+            vec![
+                "1|a1|b1",
+                "2|a2|b2",
+                "2|a2|b2dup",
+                "3|a3|",
+                "2||b2",
+                "2||b2dup",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_using_column_keeps_the_left_hand_value() {
+        // `a.x` is the column the star prints for the shared name, so it is the
+        // one a qualified reference names.
+        let mut c = joined();
+        let o = run(
+            &mut c,
+            "SELECT a.x, b.x, b.y FROM a JOIN b USING (x) ORDER BY a.x, b.y",
+        );
+        assert_eq!(columns_of(&o), &["x", "x", "y"]);
+        assert_eq!(
+            as_text(&o),
+            vec!["1|1|b1", "2|2|b2", "2|2|b2dup", "2|2|b2", "2|2|b2dup"]
+        );
+    }
+
+    #[test]
+    fn a_using_column_may_be_named_bare() {
+        // `x` is not ambiguous even though both tables have it: the USING clause
+        // made it one column.
+        let mut c = joined();
+        let o = run(&mut c, "SELECT x FROM a JOIN b USING (x) ORDER BY x");
+        assert_eq!(as_text(&o), vec!["1", "2", "2", "2", "2"]);
+    }
+
+    #[test]
+    fn a_using_column_that_is_not_on_both_sides_is_refused() {
+        // sqlite3: "cannot join using column nope - column not present in both
+        // tables", reported before the statement runs.
+        let mut c = joined();
+        let e = c
+            .execute_script("SELECT * FROM a JOIN b USING (nope)")
+            .unwrap_err();
+        assert_eq!(
+            e.message,
+            "cannot join using column nope - column not present in both tables"
+        );
+    }
+
+    #[test]
+    fn a_bare_column_in_two_tables_is_ambiguous() {
+        // sqlite3: "ambiguous column name: x".
+        let mut c = joined();
+        let e = c.execute_script("SELECT x FROM a, b").unwrap_err();
+        assert_eq!(e.message, "ambiguous column name: x");
+    }
+
+    #[test]
+    fn an_ambiguous_column_is_refused_in_the_where_clause_too() {
+        let mut c = joined();
+        let e = c
+            .execute_script("SELECT a.x FROM a, b WHERE x > 0")
+            .unwrap_err();
+        assert_eq!(e.message, "ambiguous column name: x");
+    }
+
+    #[test]
+    fn an_ambiguous_column_is_refused_when_the_tables_are_empty() {
+        // Resolution happens before the statement runs, so an empty table does
+        // not hide the error. This is why the check is not done per row.
+        let mut c = mem();
+        run(&mut c, "CREATE TABLE a(x); CREATE TABLE b(x);");
+        let e = c.execute_script("SELECT x FROM a, b").unwrap_err();
+        assert_eq!(e.message, "ambiguous column name: x");
+    }
+
+    #[test]
+    fn a_qualified_name_resolves_to_its_table() {
+        let mut c = joined();
+        let o = run(
+            &mut c,
+            "SELECT a.y, b.y FROM a JOIN b ON a.x = b.x ORDER BY a.x, b.y",
+        );
+        assert_eq!(as_text(&o), vec!["a1|b1", "a2|b2", "a2|b2dup", "|b2", "|b2dup"]);
+    }
+
+    #[test]
+    fn an_unknown_column_says_no_such_column() {
+        let mut c = joined();
+        let e = c.execute_script("SELECT zzz FROM a, b").unwrap_err();
+        assert_eq!(e.message, "no such column: zzz");
+        let e = c.execute_script("SELECT q.x FROM a, b").unwrap_err();
+        assert_eq!(e.message, "no such column: q.x");
+    }
+
+    #[test]
+    fn an_alias_renames_the_table_for_the_whole_query() {
+        // The alias is the only name that resolves; the original table name is
+        // gone, which is what sqlite3 does.
+        let mut c = joined();
+        let o = run(&mut c, "SELECT * FROM a AS p JOIN b AS q ON p.x = q.x");
+        assert_eq!(columns_of(&o), &["x", "y", "x", "y"]);
+        assert_eq!(
+            as_text(&o),
+            vec!["1|a1|1|b1", "2|a2|2|b2", "2|a2|2|b2dup", "2||2|b2", "2||2|b2dup"]
+        );
+        let e = c
+            .execute_script("SELECT a.x FROM a AS p JOIN b AS q ON p.x = q.x")
+            .unwrap_err();
+        assert_eq!(e.message, "no such column: a.x");
+    }
+
+    #[test]
+    fn an_alias_does_not_disambiguate_a_bare_column() {
+        // With `b AS q`, `x` is still ambiguous because `a` also has it, but
+        // `q.x` is not.
+        let mut c = joined();
+        let e = c
+            .execute_script("SELECT x, q.y FROM a JOIN b AS q ON a.x = q.x")
+            .unwrap_err();
+        assert_eq!(e.message, "ambiguous column name: x");
+    }
+
+    #[test]
+    fn a_self_join_needs_two_aliases() {
+        // The same table twice is legal as long as the two copies are told
+        // apart.
+        let mut c = joined();
+        let o = run(
+            &mut c,
+            "SELECT p.x, q.y FROM a AS p JOIN a AS q ON p.x = q.x ORDER BY p.x, q.y",
+        );
+        assert_eq!(columns_of(&o), &["x", "y"]);
+        assert_eq!(as_text(&o), &["1|a1", "2|a2", "2|", "2|a2", "2|"]);
+    }
+
+    #[test]
+    fn a_table_aliased_twice_is_ambiguous_through_the_star() {
+        // sqlite3 names the schema-qualified form for a star and the plain form
+        // for a name the query wrote.
+        let mut c = joined();
+        let e = c.execute_script("SELECT * FROM a AS p, b AS p").unwrap_err();
+        assert_eq!(e.message, "ambiguous column name: main.p.x");
+        let e = c
+            .execute_script("SELECT p.x FROM a AS p, b AS p")
+            .unwrap_err();
+        assert_eq!(e.message, "ambiguous column name: p.x");
+    }
+
+    #[test]
+    fn a_join_with_no_constraint_is_a_cross_product() {
+        // sqlite3: `a JOIN b` with nothing between is the full sixteen rows, so
+        // a bare JOIN constrains nothing.
+        let mut c = joined();
+        let o = run(&mut c, "SELECT * FROM a JOIN b");
+        assert_eq!(rows_of(&o).len(), 16);
+    }
+
+    #[test]
+    fn a_cross_join_with_a_constraint_is_an_inner_join() {
+        // sqlite3 treats the constraint as what decides, so the unmatched a.x
+        // row is dropped even though the join was written CROSS.
+        let mut c = joined();
+        let o = run(&mut c, "SELECT * FROM a CROSS JOIN b ON a.x = b.x");
+        assert_eq!(
+            as_text(&o),
+            vec!["1|a1|1|b1", "2|a2|2|b2", "2|a2|2|b2dup", "2||2|b2", "2||2|b2dup"]
+        );
+    }
+
+    #[test]
+    fn a_comma_may_be_followed_by_a_constraint() {
+        // sqlite3 accepts `a, b ON ...` and executes it as an inner join.
+        let mut c = joined();
+        let o = run(&mut c, "SELECT * FROM a, b ON a.x = b.x");
+        assert_eq!(rows_of(&o).len(), 5);
+    }
+
+    #[test]
+    fn a_three_way_join_folds_in_from_the_left() {
+        let mut c = joined();
+        run(
+            &mut c,
+            "CREATE TABLE c(x, z); INSERT INTO c VALUES(1,'c1'),(2,'c2'),(9,'c9');",
+        );
+        let o = run(
+            &mut c,
+            "SELECT a.y, b.y, c.z FROM a JOIN b ON a.x = b.x JOIN c ON b.x = c.x \
+             ORDER BY a.y, b.y, c.z",
+        );
+        assert_eq!(columns_of(&o), &["y", "y", "z"]);
+        assert_eq!(
+            as_text(&o),
+            vec!["a1|b1|c1", "a2|b2|c2", "a2|b2dup|c2", "|b2|c2", "|b2dup|c2"]
+        );
+    }
+
+    #[test]
+    fn a_three_way_join_can_be_written_with_commas() {
+        // The last table cross joins everything to its left, so every matching
+        // pair appears once per row of `c`.
+        let mut c = joined();
+        run(&mut c, "CREATE TABLE c(x, z); INSERT INTO c VALUES(2,'c2');");
+        let o = run(
+            &mut c,
+            "SELECT a.x, b.y, c.z FROM a, b ON a.x = b.x, c ORDER BY a.x, b.y",
+        );
+        assert_eq!(rows_of(&o).len(), 5);
+    }
+
+    #[test]
+    fn a_left_join_then_a_where_on_the_right_side_drops_the_null_row() {
+        // The WHERE runs after the join, so the row the LEFT join invented is
+        // removed again by a predicate on the right side.
+        let mut c = joined();
+        let o = run(
+            &mut c,
+            "SELECT a.y FROM a LEFT JOIN b ON a.x = b.x WHERE b.y IS NULL",
+        );
+        assert_eq!(as_text(&o), vec!["a3"]);
+    }
+
+    #[test]
+    fn an_on_constraint_of_false_leaves_every_left_row_unmatched() {
+        // `ON 0` matches nothing, so a LEFT join keeps all four left rows with a
+        // NULL right side and an inner join keeps none.
+        let mut c = joined();
+        let o = run(&mut c, "SELECT * FROM a LEFT JOIN b ON 0");
+        assert_eq!(as_text(&o), vec!["1|a1||", "2|a2||", "3|a3||", "2||"]);
+        let o = run(&mut c, "SELECT * FROM a JOIN b ON 0");
+        assert!(rows_of(&o).is_empty());
+    }
+
+    #[test]
+    fn a_join_over_empty_tables_produces_nothing() {
+        let mut c = mem();
+        run(&mut c, "CREATE TABLE a(x, y); CREATE TABLE b(x, y);");
+        let o = run(&mut c, "SELECT * FROM a LEFT JOIN b ON a.x = b.x");
+        assert!(rows_of(&o).is_empty());
+        let o = run(&mut c, "SELECT * FROM a, b");
+        assert!(rows_of(&o).is_empty());
+    }
+
+    #[test]
+    fn a_join_reads_a_rowid_alias_from_each_side() {
+        // The alias column stands for the key, so a join that projects it has
+        // to recover it for the table the row came from.
+        let mut c = mem();
+        run(
+            &mut c,
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, v);\
+             CREATE TABLE b(id INTEGER PRIMARY KEY, v);\
+             INSERT INTO a VALUES(10,'a'),(20,'b');\
+             INSERT INTO b VALUES(10,'x'),(30,'y');",
+        );
+        let o = run(
+            &mut c,
+            "SELECT a.id, b.id, b.v FROM a JOIN b ON a.id = b.id ORDER BY a.id",
+        );
+        assert_eq!(as_text(&o), vec!["10|10|x"]);
+        // And the unmatched right row keeps the LEFT join's NULL.
+        let o = run(
+            &mut c,
+            "SELECT a.id, b.id FROM a LEFT JOIN b ON a.id = b.id ORDER BY a.id",
+        );
+        assert_eq!(as_text(&o), vec!["10|10", "20|"]);
+    }
+
+    #[test]
+    fn a_join_respects_limit_and_offset() {
+        let mut c = joined();
+        let o = run(
+            &mut c,
+            "SELECT a.x, b.y FROM a, b WHERE a.x = b.x ORDER BY a.x LIMIT 2 OFFSET 1",
+        );
+        assert_eq!(as_text(&o), vec!["2|b2", "2|b2dup"]);
+    }
+
+    #[test]
+    fn an_order_by_may_name_a_column_of_either_table() {
+        // The key is a table column rather than an output alias, so it reads
+        // the joined row.
+        let mut c = joined();
+        let o = run(
+            &mut c,
+            "SELECT a.y FROM a JOIN b ON a.x = b.x ORDER BY b.y DESC, a.y",
+        );
+        assert_eq!(as_text(&o), vec!["a2", "a2", "", "a1", ""]);
+    }
+
+    #[test]
+    fn an_output_alias_wins_over_a_table_column_in_order_by() {
+        // `b.y AS k` renames the column, and ORDER BY k sorts on what the
+        // projection produced.
+        let mut c = joined();
+        let o = run(
+            &mut c,
+            "SELECT b.y AS k FROM a JOIN b ON a.x = b.x ORDER BY k",
+        );
+        assert_eq!(as_text(&o), vec!["b1", "b2", "b2dup", "b2", "b2dup"]);
+    }
+
+    #[test]
+    fn a_join_reports_an_unknown_table() {
+        let mut c = joined();
+        let e = c
+            .execute_script("SELECT * FROM a JOIN nope ON a.x = 1")
+            .unwrap_err();
+        assert_eq!(e.message, "no such table: nope");
+    }
+
+    #[test]
+    fn a_subquery_in_from_is_still_refused() {
+        let mut c = joined();
+        let e = c
+            .execute_script("SELECT * FROM a JOIN (SELECT 1 AS x) ON a.x = 1")
+            .unwrap_err();
         assert!(
             e.message.contains("not supported yet"),
             "got: {}",
@@ -1416,3 +2156,4 @@ mod tests {
         );
     }
 }
+

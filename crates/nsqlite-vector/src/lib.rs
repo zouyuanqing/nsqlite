@@ -47,6 +47,7 @@ mod config;
 mod embed;
 mod error;
 mod rerank;
+pub mod search;
 
 pub use config::{
     ClientConfig, DEFAULT_BASE_URL, DEFAULT_EMBED_MODEL, DEFAULT_RERANK_MODEL, DEFAULT_TIMEOUT,

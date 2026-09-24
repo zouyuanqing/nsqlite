@@ -227,7 +227,7 @@ pub fn resolve_ref(
     table: Option<&str>,
     name: &str,
     star: bool,
-) -> Result<Ref, Unresolved> {
+) -> std::result::Result<Ref, Unresolved> {
     let matches: Vec<(usize, usize)> = from
         .sources
         .iter()
@@ -316,12 +316,27 @@ impl JoinedRow {
         let len = from.sources[index].table.len();
         &self.values[start..start + len]
     }
-}
 
-/// What a join produced, ready for the WHERE clause and the projection.
-pub struct JoinOutput {
-    /// Every row that survived the join, left-major.
-    pub rows: Vec<JoinedRow>,
+    /// Substitutes each source's rowid into its rowid-alias column.
+    ///
+    /// An INTEGER PRIMARY KEY column is stored as NULL and stands for the row's
+    /// key, so the key has to be written back before any expression reads the
+    /// column. A source with no row — the right side of a LEFT join that did not
+    /// match — keeps the NULL, which is what makes the joined row read as all
+    /// NULL on that side.
+    pub fn recover_rowids(&mut self, from: &From) {
+        for (i, s) in from.sources.iter().enumerate() {
+            let Some(alias) = s.table.rowid_alias else {
+                continue;
+            };
+            let start: usize = from.sources[..i].iter().map(|s| s.table.len()).sum();
+            if let (Some(Some(rowid)), Some(slot)) =
+                (self.rowids.get(i), self.values.get_mut(start + alias))
+            {
+                *slot = Value::Integer(*rowid);
+            }
+        }
+    }
 }
 
 /// The nested-loop join.
@@ -338,14 +353,12 @@ pub struct JoinOutput {
 /// constraint at all keeps every pair, which is the cross product — including a
 /// bare `JOIN b` and a `CROSS JOIN b ON ...`, which SQLite executes as an inner
 /// join, so the constraint is still what decides.
-pub fn nested_loop<F>(
+pub fn nested_loop(
     from: &From,
     source_rows: &[Vec<crate::table_tree::Row>],
-    mut eval_row: F,
-) -> Result<Vec<JoinedRow>>
-where
-    F: FnMut(&JoinedRow) -> Result<bool>,
-{
+    on_exprs: &[Option<(Expr, Vec<Bound>)>],
+    params: &[Value],
+) -> Result<Vec<JoinedRow>> {
     let widths: Vec<usize> = from.sources.iter().map(|s| s.table.len()).collect();
     let total: usize = widths.iter().sum();
     let mut rows: Vec<JoinedRow> = Vec::new();
@@ -366,6 +379,7 @@ where
         let start: usize = widths[..i].iter().sum();
         let width = widths[i];
         let right = source_rows.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+        let on = on_exprs.get(i - 1).and_then(|o| o.as_ref());
         let mut next: Vec<JoinedRow> = Vec::new();
         for left in &rows {
             let mut matched = false;
@@ -378,7 +392,7 @@ where
                 }
                 jr.rowids.resize(i + 1, None);
                 jr.rowids[i] = Some(r.rowid);
-                if constraint_holds(from, i, &jr, &mut eval_row)? {
+                if constraint_holds(from, i, &jr, on, params)? {
                     matched = true;
                     next.push(jr);
                 }
@@ -403,43 +417,68 @@ where
     Ok(rows)
 }
 
-/// Whether a candidate pair satisfies the join's own constraint.
+/// Binds the ON expression of each join, alongside the references the statement
+/// itself contains.
 ///
-/// A join with no constraint keeps every pair. A USING constraint is an equality
-/// on each named column, and unlike an ON expression it is a test the planner
-/// applies itself: the columns must exist on both sides and must be equal, with
-/// the same NULL rules as `=`.
-fn constraint_holds<F>(
-    from: &From,
-    index: usize,
-    row: &JoinedRow,
-    eval_row: &mut F,
-) -> Result<bool>
-where
-    F: FnMut(&JoinedRow) -> Result<bool>,
-{
-    let src = &from.sources[index];
-    if let Some(on) = &src.on {
-        return eval_row(row);
-    }
-    if src.using.is_empty() {
-        return Ok(true);
-    }
-    // A USING column has to be on both sides. That is checked when the FROM is
-    // resolved, where the error names the column, so reaching here means the
-    // column exists on both sides and only the values are compared.
-    for name in &src.using {
-        let lv = lookup_in(row, from, index - 1, name);
-        let rv = lookup_in(row, from, index, name);
-        // The equality is the one an `=` would do, so NULL never matches NULL.
-        let (Some(lv), Some(rv)) = (lv, rv) else {
-            return Ok(true);
-        };
-        if lv.is_null() || rv.is_null() || !lv.eq_value(rv) {
-            return Ok(false);
+/// A join's ON is resolved against the same FROM as everything else, and it is
+/// resolved before the loop runs so a name in it that does not resolve is an
+/// error even when no pair would have been tested.
+pub fn bind_constraints(from: &From) -> Result<Vec<Option<(Expr, Vec<Bound>)>>> {
+    let mut out = Vec::with_capacity(from.sources.len());
+    for s in from.sources.iter().skip(1) {
+        match &s.on {
+            Some(on) => {
+                // A name in an ON clause is always a table column, so it is
+                // resolved with no output aliases in scope. The references are
+                // bound per join rather than shared with the statement, because
+                // they are evaluated against a row that is still being built:
+                // the tables to the right of this join are not in it yet.
+                let bound = bind_all(from, &[on], &[])?;
+                out.push(Some((on.clone(), bound)));
+            }
+            None => out.push(None),
         }
     }
-    Ok(true)
+    Ok(out)
+}
+
+/// The value a bound reference reads from a joined row.
+pub fn read(row: &JoinedRow, from: &From, r: &Ref) -> Value {
+    match r {
+        Ref::Column { source, column } => row
+            .source_slice(from, *source)
+            .get(*column)
+            .cloned()
+            .unwrap_or(Value::Null),
+    }
+}
+
+/// The bound values of a joined row, as the evaluator wants them: the offset
+/// each reference was written at, and the value it reads.
+pub fn resolved_values(row: &JoinedRow, from: &From, bound: &[Bound]) -> Vec<(usize, Value)> {
+    bound
+        .iter()
+        .map(|b| (b.at, read(row, from, &b.r#ref)))
+        .collect()
+}
+
+/// A bound row keyed by name, which is what a name-based lookup falls back to.
+///
+/// The names are qualified, so `x` resolves against the first source that has
+/// it. That fallback is only reached when nothing was pre-resolved, which is the
+/// single-table path this executor replaced; the join path pre-resolves
+/// everything, so a bare name that is ambiguous never reaches here.
+pub fn named_row(from: &From, jr: &JoinedRow) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    for (i, s) in from.sources.iter().enumerate() {
+        for (j, c) in s.table.columns.iter().enumerate() {
+            out.push((
+                c.name.clone(),
+                jr.source_slice(from, i).get(j).cloned().unwrap_or(Value::Null),
+            ));
+        }
+    }
+    out
 }
 
 /// The value of one named column of one source, if that source has it.
@@ -451,4 +490,250 @@ fn lookup_in(row: &JoinedRow, from: &From, index: usize, name: &str) -> Option<V
         .iter()
         .position(|c| c.name.eq_ignore_ascii_case(name))?;
     row.source_slice(from, index).get(j).cloned()
+}
+
+/// A column reference, resolved to where it reads from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bound {
+    /// The byte offset the reference was written at, which is how the
+    /// evaluator finds it again for each row.
+    pub at: usize,
+    pub r#ref: Ref,
+}
+
+/// Resolves every column reference an expression contains.
+///
+/// The walk is exhaustive over the expression tree, because a name can hide at
+/// any depth and an unvisited one would fall through to the bare-name lookup and
+/// silently read the wrong table. A subquery or a `CASE` operand is walked the
+/// same way, since a column reference inside one resolves against the same FROM.
+///
+/// A reference to a result column alias is not a table column and is left for
+/// the ORDER BY, which is where SQLite resolves an alias; the caller decides
+/// which names those are.
+pub fn bind_expr(from: &From, expr: &Expr, out: &mut Vec<Bound>) {
+    match expr {
+        Expr::Column { table, name, span } => {
+            // A name that is not a table column is left alone: it may be an
+            // output alias, and `check_unresolved` has already decided whether
+            // that is allowed.
+            if let Ok(r) = resolve_ref(from, table.as_deref(), name, false) {
+                out.push(Bound { at: span.start, r#ref: r });
+            }
+        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::Cast { expr, .. } => bind_expr(from, expr, out),
+        Expr::Binary { left, right, .. } => {
+            bind_expr(from, left, out);
+            bind_expr(from, right, out)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            bind_expr(from, expr, out);
+            bind_expr(from, low, out);
+            bind_expr(from, high, out)
+        }
+        Expr::InList { expr, list, .. } => {
+            bind_expr(from, expr, out);
+            for item in list {
+                bind_expr(from, item, out);
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            bind_expr(from, expr, out);
+            bind_expr(from, pattern, out);
+            if let Some(e) = escape {
+                bind_expr(from, e, out);
+            }
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                bind_expr(from, a, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => {
+            if let Some(o) = operand {
+                bind_expr(from, o, out);
+            }
+            for (w, t) in whens {
+                bind_expr(from, w, out);
+                bind_expr(from, t, out);
+            }
+            if let Some(o) = otherwise {
+                bind_expr(from, o, out);
+            }
+        }
+        // A literal, a parameter, and a subquery hold no column reference. A
+        // subquery has its own FROM and would resolve there, but the engine does
+        // not execute one yet.
+        Expr::Literal(_)
+        | Expr::NamedParameter(..)
+        | Expr::InSelect { .. }
+        | Expr::Exists { .. }
+        | Expr::Subquery { .. } => {}
+    }
+}
+
+/// Resolves every reference in a list of expressions, reporting the first that
+/// does not resolve.
+///
+/// `aliases` names the result columns, which a reference may name instead of a
+/// table column. A name in that list is not an error, because the caller reads
+/// it from the projected row rather than from the joined one.
+pub fn bind_all(from: &From, exprs: &[&Expr], aliases: &[String]) -> Result<Vec<Bound>> {
+    let mut out = Vec::new();
+    for e in exprs {
+        // Every reference is checked first, so an unknown or ambiguous name is
+        // reported before any row is read. The check and the collection are two
+        // passes over the same tree because the first one has to fail on the
+        // first bad name while the second collects all of them.
+        check_unresolved(from, e, aliases)?;
+        bind_expr(from, e, &mut out);
+    }
+    Ok(out)
+}
+
+/// Reports the first column reference in an expression that resolves to
+/// nothing and is not an output alias.
+fn check_unresolved(from: &From, expr: &Expr, aliases: &[String]) -> Result<()> {
+    let mut refs = Vec::new();
+    collect_columns(expr, &mut refs);
+    for (table, name) in refs {
+        if resolve_ref(from, table.as_deref(), &name, false).is_ok() {
+            continue;
+        }
+        if table.is_none() && aliases.iter().any(|a| a.eq_ignore_ascii_case(&name)) {
+            continue;
+        }
+        let e = resolve_ref(from, table.as_deref(), &name, false).unwrap_err();
+        return Err(unresolved_error(e));
+    }
+    Ok(())
+}
+
+/// Every column reference in an expression, with its qualifier.
+fn collect_columns(expr: &Expr, out: &mut Vec<(Option<String>, String)>) {
+    match expr {
+        Expr::Column { table, name, .. } => out.push((table.clone(), name.clone())),
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::Cast { expr, .. } => collect_columns(expr, out),
+        Expr::Binary { left, right, .. } => {
+            collect_columns(left, out);
+            collect_columns(right, out);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_columns(expr, out);
+            collect_columns(low, out);
+            collect_columns(high, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_columns(expr, out);
+            for i in list {
+                collect_columns(i, out);
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_columns(expr, out);
+            collect_columns(pattern, out);
+            if let Some(e) = escape {
+                collect_columns(e, out);
+            }
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_columns(a, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => {
+            if let Some(o) = operand {
+                collect_columns(o, out);
+            }
+            for (w, t) in whens {
+                collect_columns(w, out);
+                collect_columns(t, out);
+            }
+            if let Some(o) = otherwise {
+                collect_columns(o, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a candidate pair satisfies the join's own constraint.
+///
+/// A join with no constraint keeps every pair. A USING constraint is an equality
+/// on each named column, applied by the planner rather than evaluated as an
+/// expression, and it uses the same NULL rule as `=`: NULL never matches NULL,
+/// not even against itself.
+///
+/// An ON expression is evaluated as a WHERE over the combined row. A constraint
+/// that is not true — including one that is NULL — rejects the pair, which for
+/// a LEFT join is what leaves the left row unmatched.
+fn constraint_holds(
+    from: &From,
+    index: usize,
+    row: &JoinedRow,
+    on: Option<&(Expr, Vec<Bound>)>,
+    params: &[Value],
+) -> Result<bool> {
+    let src = &from.sources[index];
+    if let Some((on, bound)) = on {
+        let resolved = resolved_values(row, from, bound);
+        let ctx = crate::eval::EvalCtx {
+            params,
+            row: named_row(from, row),
+            columns: &[],
+            context: Some(src.name.clone()),
+            resolved,
+        };
+        return Ok(crate::eval::truthy(crate::eval::eval(on, &ctx)?));
+    }
+    if src.using.is_empty() {
+        return Ok(true);
+    }
+    // A USING column was checked to exist on both sides when the FROM was
+    // resolved, so only the values are compared here.
+    for name in &src.using {
+        let lv = lookup_in(row, from, index - 1, name);
+        let rv = lookup_in(row, from, index, name);
+        let (Some(lv), Some(rv)) = (lv, rv) else {
+            return Ok(true);
+        };
+        if lv.is_null() || rv.is_null() || !lv.eq_value(&rv) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The name-resolution check, exposed for the ON clauses, which resolve against
+/// the FROM with no output aliases in scope.
+pub fn check_unresolved_pub(from: &From, expr: &Expr, aliases: &[String]) -> Result<()> {
+    check_unresolved(from, expr, aliases)
 }

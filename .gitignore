@@ -15,3 +15,7 @@ test/interop/*.db
 parseprobe.log
 crates/nsqlite/parseprobe.log
 test/sqlite-run/
+
+# Per-run scratch from the suite runner and the agents that drive it.
+test/sqlite-run/
+*.tcl.out

@@ -28,6 +28,15 @@ pub struct EvalCtx<'a> {
     pub columns: &'a [(String, Value)],
     /// A name that did not resolve, kept for the "no such column" message.
     pub context: Option<String>,
+    /// Where each column reference in the statement was resolved to, by the
+    /// byte offset it was written at.
+    ///
+    /// A single-table query resolves a name against the one table and needs no
+    /// help, so it leaves this empty and the lookup falls through to `row`. A
+    /// join resolves every reference once, before the statement runs, because
+    /// that is when an ambiguous or unknown column has to be reported. The list
+    /// is rebuilt for each joined row, so it holds values rather than positions.
+    pub resolved: Vec<(usize, Value)>,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -38,6 +47,7 @@ impl<'a> EvalCtx<'a> {
             row: Vec::new(),
             columns: &[],
             context: None,
+            resolved: Vec::new(),
         }
     }
 
@@ -57,7 +67,18 @@ impl<'a> EvalCtx<'a> {
 pub fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Result<Value> {
     match expr {
         Expr::Literal(lit) => eval_literal(lit, ctx),
-        Expr::Column { table, name, .. } => {
+        Expr::Column {
+            table,
+            name,
+            span,
+        } => {
+            // A join resolves every reference before the statement runs, so a
+            // resolved reference is read straight from the joined row and the
+            // bare-name lookup below is never reached. The start offset
+            // identifies the reference, since the parser gave each one a span.
+            if let Some((_, v)) = ctx.resolved.iter().find(|(at, _)| *at == span.start) {
+                return Ok(v.clone());
+            }
             if let Some(v) = ctx.lookup(name) {
                 return Ok(v.clone());
             }
