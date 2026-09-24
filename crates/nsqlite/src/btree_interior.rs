@@ -149,6 +149,11 @@ impl InteriorPage {
         self.free_space() >= count * (cell_size + 2)
     }
 
+    /// Whether the page can be written as it stands, i.e. its cells fit.
+    pub fn can_write(&self) -> bool {
+        self.layout().is_ok()
+    }
+
     /// Serialises the page into `page`.
     pub fn write(&self, page: &mut [u8]) -> Result<()> {
         for b in page.iter_mut() {

@@ -14,6 +14,7 @@
 //! * [`btree`] — reading table b-trees, including overflow chains.
 //! * [`btree_write`] — writing table leaf pages.
 //! * [`btree_interior`] — table interior pages and leaf splitting.
+//! * [`table_tree`] — the growing, splitting b-tree above those pages.
 //! * [`text`] — the text encodings a file can declare.
 //! * [`value`] / [`error`] — the runtime value and error types.
 //!
@@ -27,7 +28,9 @@ pub mod error;
 pub mod page;
 pub mod pager;
 pub mod record;
+pub mod table_tree;
 pub mod text;
+pub mod tokenizer;
 pub mod value;
 pub mod varint;
 

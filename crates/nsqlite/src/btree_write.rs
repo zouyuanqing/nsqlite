@@ -130,21 +130,20 @@ impl LeafPage {
             let local = local_payload_size(page_type::TABLE_LEAF, payload_len, usable) as usize;
 
             // Gather the whole payload: the local part, then the overflow chain.
+            // The payload starts after the two varints, not at the cell offset.
+            let body_at = n + m;
             let mut payload = Vec::with_capacity(payload_len as usize);
-            if local > body.len() {
+            if local > body.len() - body_at {
                 return Err(Error::corrupt("cell is shorter than its local payload"));
             }
-            payload.extend_from_slice(&body[..local]);
+            payload.extend_from_slice(&body[body_at..body_at + local]);
             if local < payload_len as usize {
-                if body.len() < local + 4 {
+                let at = body_at + local;
+                if body.len() < at + 4 {
                     return Err(Error::corrupt("overflow pointer is truncated"));
                 }
-                let mut next = u32::from_be_bytes([
-                    body[local],
-                    body[local + 1],
-                    body[local + 2],
-                    body[local + 3],
-                ]);
+                let mut next =
+                    u32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
                 let cap = super::page::overflow_capacity_for(usable) as usize;
                 let mut guard = 0usize;
                 while payload.len() < payload_len as usize {

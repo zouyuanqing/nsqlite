@@ -58,6 +58,113 @@ fn run_err(path: &std::path::Path, sql: &str) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
+/// Writes a cell whose payload spills, allocating a real overflow chain.
+///
+/// The cell image and the chain both come out of the same pager, but the cell
+/// write holds a borrow of one page while the chain is being built, so the chain
+/// is written first and the cell is written afterwards.
+fn write_spilling_leaf(
+    pager: &mut nsqlite::pager::Pager,
+    page: &nsqlite::btree_write::LeafPage,
+    usable: u32,
+) {
+    use nsqlite::page::overflow_capacity_for;
+    let cap = overflow_capacity_for(usable) as usize;
+    // Resolve every spill up front, since the page write borrows the pager.
+    let mut chains: Vec<u32> = Vec::new();
+    for cell in &page.cells {
+        let local = cell.local_len(usable) as usize;
+        if local == cell.payload.len() {
+            chains.push(0);
+            continue;
+        }
+        let spill = &cell.payload[local..];
+        let mut first = 0u32;
+        let mut prev = 0u32;
+        let mut written = 0usize;
+        loop {
+            let n = pager.allocate().expect("allocating an overflow page");
+            if first == 0 {
+                first = n;
+            } else {
+                let p = pager.page(prev).unwrap();
+                p[0..4].copy_from_slice(&n.to_be_bytes());
+                pager.mark_dirty(prev);
+            }
+            let take = spill.len().saturating_sub(written).min(cap);
+            let p = pager.page(n).unwrap();
+            p[4..4 + take].copy_from_slice(&spill[written..written + take]);
+            pager.mark_dirty(n);
+            written += take;
+            prev = n;
+            if written >= spill.len() {
+                break;
+            }
+        }
+        chains.push(first);
+    }
+    let page_no = page.page_no;
+    {
+        let dst = pager.page(page_no).unwrap();
+        let mut next = chains.into_iter();
+        page.write(dst, usable, |_| Ok(next.next().unwrap_or(0))).expect("writing the leaf");
+    }
+    pager.mark_dirty(page_no);
+}
+
+/// Rewrites the `rootpage` column of a table's row in `sqlite_schema`.
+///
+/// The SQL layer refuses to modify `sqlite_schema`, and rightly so, but the
+/// engine has to keep it current when a root moves. This edits the record
+/// directly, which is what a real implementation does from inside the b-tree
+/// when a table is created. The rootpage column is an integer stored in a
+/// narrow serial type, so the value has to be re-encoded at the same width or
+/// the cell length changes and every later offset in the page shifts.
+fn set_schema_root(pager: &mut nsqlite::pager::Pager, table: &str, root: u32) {
+    use nsqlite::btree_write::LeafPage;
+    use nsqlite::record;
+
+    // sqlite_schema is always a table b-tree on page 1.
+    let schema = LeafPage::read(pager, 1).expect("reading sqlite_schema");
+    let cell = schema
+        .cells
+        .iter()
+        .find(|c| {
+            record::decode_record(&c.payload, pager.header().text_encoding)
+                .ok()
+                .and_then(|d| d.values.get(1).and_then(|v| v.as_str()).map(|s| s == table))
+                .unwrap_or(false)
+        })
+        .expect("the table must have a schema row");
+    let decoded = record::decode_record(&cell.payload, pager.header().text_encoding).unwrap();
+    assert_eq!(decoded.values.len(), 5, "sqlite_schema has five columns");
+    assert_eq!(decoded.values[0].as_str(), Some("table"));
+
+    // Re-encode with the new root. Column 3 is rootpage, and the columns are
+    // short enough that no cell grows, so the page layout is unchanged.
+    let mut values = decoded.values.clone();
+    values[3] = nsqlite::value::Value::Integer(root as i64);
+    let new_payload = record::encode(&values).bytes;
+    assert!(
+        new_payload.len() <= cell.payload.len(),
+        "the re-encoded schema row must not be longer than the original"
+    );
+
+    let usable = pager.usable_size();
+    let mut cells = schema.cells.clone();
+    cells[schema.cells.iter().position(|c| c.rowid == cell.rowid).unwrap()].payload =
+        new_payload;
+    let page = LeafPage { cells, ..schema };
+    write_spilling_leaf(pager, &page, usable);
+    // The schema cookie has to advance, or a reader keeps using its cached copy.
+    let cc = pager.header().change_counter.wrapping_add(1);
+    pager.header_mut().change_counter = cc;
+    pager.header_mut().version_valid_for = cc;
+    pager.header_mut().schema_cookie = pager.header().schema_cookie.wrapping_add(1);
+    pager.write_header().expect("writing the header");
+    pager.flush().expect("flushing");
+}
+
 /// Builds a database containing `rows` using this engine's writer.
 ///
 /// The schema is created by the real sqlite3 first, so the table's root page is
@@ -104,12 +211,7 @@ fn write_db(name: &str, rows: &[(i64, String)], columns: usize) -> PathBuf {
         cells,
         ..LeafPage::empty(root, 4096)
     };
-    {
-        let dst = pager.page(root).expect("root page");
-        page.write(dst, usable, |_| Ok(0))
-            .expect("writing the leaf");
-    }
-    pager.mark_dirty(root);
+    write_spilling_leaf(&mut pager, &page, usable);
     // The page count is unchanged, so the change counter alone has to advance,
     // or sqlite3 will not re-read the page count from the header.
     let cc = pager.header().change_counter.wrapping_add(1);
@@ -172,11 +274,7 @@ fn sqlite3_reads_back_every_row() {
         cells,
         ..LeafPage::empty(root, 4096)
     };
-    {
-        let dst = pager.page(root).unwrap();
-        page.write(dst, usable, |_| Ok(0)).unwrap();
-    }
-    pager.mark_dirty(root);
+    write_spilling_leaf(&mut pager, &page, usable);
     // The page count did not change, so only the change counter needs bumping.
     pager.header_mut().change_counter = pager.header().change_counter.wrapping_add(1);
     pager.header_mut().version_valid_for = pager.header().change_counter;
@@ -265,11 +363,7 @@ fn a_full_page_stores_content_start_as_zero() {
         cells.push(probe);
     }
     page.cells = cells;
-    {
-        let dst = pager.page(root).unwrap();
-        page.write(dst, usable, |_| Ok(0)).unwrap();
-    }
-    pager.mark_dirty(root);
+    write_spilling_leaf(&mut pager, &page, usable);
     pager.flush().unwrap();
     drop(pager);
 
@@ -281,4 +375,114 @@ fn a_full_page_stores_content_start_as_zero() {
         "the full page must still hold its cells"
     );
     drop(pager);
+}
+
+/// Builds a tree with this engine and has sqlite3 read every row back.
+///
+/// This is the end-to-end check for the whole write path: routing, leaf
+/// splitting, interior-node splitting, and root growth all have to produce a
+/// file whose b-tree is valid to a reader that knows nothing about this engine.
+#[test]
+fn sqlite3_reads_a_tree_that_grew_through_many_splits() {
+    if !sqlite3_available() {
+        eprintln!("skipping: sqlite3 not on PATH");
+        return;
+    }
+    use nsqlite::table_tree::{Row, TableTree};
+    use nsqlite::value::Value;
+
+    let path = work_dir().join("tree.db");
+    let _ = std::fs::remove_file(&path);
+    run(&path, "CREATE TABLE t(c0 TEXT, c1 TEXT);");
+    let root: u32 = run(&path, "SELECT rootpage FROM sqlite_schema WHERE name='t';")
+        .trim()
+        .parse()
+        .expect("root page");
+
+    // Wide enough rows that a 4096-byte page holds only a couple of dozen, so
+    // several thousand rows force leaves and interior nodes to split repeatedly.
+    const N: i64 = 3000;
+    {
+        let mut pager = nsqlite::pager::Pager::open(&path).unwrap();
+        let mut tree = TableTree::open(&mut pager, root).unwrap();
+        for i in 1..=N {
+            tree.insert(
+                &mut pager,
+                &Row {
+                    rowid: i,
+                    values: vec![Value::Text(format!("value-{i}")), Value::Text("y".repeat(60))],
+                },
+            )
+            .expect("inserting a row");
+        }
+        // The root moves as the tree grows, so the schema has to be updated to
+        // the new page: that is how a reopened connection finds the tree.
+        let new_root = tree.root();
+        drop(tree);
+        set_schema_root(&mut pager, "t", new_root);
+    }
+
+    let count = run(&path, "SELECT count(*) FROM t;");
+    assert_eq!(count.trim(), N.to_string(), "sqlite3 lost rows across a split");
+    let first = run(&path, "SELECT c0 FROM t WHERE rowid=1;");
+    assert_eq!(first.trim(), "value-1");
+    let last = run(&path, "SELECT c0 FROM t WHERE rowid=3000;");
+    assert_eq!(last.trim(), "value-3000");
+    let middle = run(&path, "SELECT c0 FROM t WHERE rowid=1500;");
+    assert_eq!(middle.trim(), "value-1500");
+    // A scan must come back in rowid order, which is what the interior
+    // separators encode.
+    let ordered = run(&path, "SELECT count(*) FROM (SELECT rowid FROM t ORDER BY rowid);");
+    assert_eq!(ordered.trim(), N.to_string());
+    let integrity = run(&path, "PRAGMA integrity_check;");
+    assert_eq!(integrity.trim(), "ok", "the grown tree failed integrity_check");
+}
+
+/// The same, with negative rowids, which use the nine-byte varint form and so
+/// take a different path through the cell size arithmetic.
+#[test]
+fn sqlite3_reads_a_tree_with_negative_rowids() {
+    if !sqlite3_available() {
+        return;
+    }
+    use nsqlite::table_tree::{Row, TableTree};
+    use nsqlite::value::Value;
+
+    let path = work_dir().join("neg.db");
+    let _ = std::fs::remove_file(&path);
+    run(&path, "CREATE TABLE t(c0 TEXT);");
+    let root: u32 = run(&path, "SELECT rootpage FROM sqlite_schema WHERE name='t';")
+        .trim()
+        .parse()
+        .expect("root page");
+
+    let mut keys: Vec<i64> = (1..=800).map(|i| -i).collect();
+    keys.extend(1..=800);
+    {
+        let mut pager = nsqlite::pager::Pager::open(&path).unwrap();
+        let mut tree = TableTree::open(&mut pager, root).unwrap();
+        for k in &keys {
+            tree.insert(
+                &mut pager,
+                &Row { rowid: *k, values: vec![Value::Text(format!("k{k}"))] },
+            )
+            .expect("inserting a row");
+        }
+        let new_root = tree.root();
+        drop(tree);
+        set_schema_root(&mut pager, "t", new_root);
+    }
+
+    let count = run(&path, "SELECT count(*) FROM t;");
+    assert_eq!(count.trim(), (keys.len() as i64).to_string());
+    let lo = run(&path, "SELECT c0 FROM t WHERE rowid=-800;");
+    assert_eq!(lo.trim(), "k-800");
+    let hi = run(&path, "SELECT c0 FROM t WHERE rowid=800;");
+    assert_eq!(hi.trim(), "k800");
+    let min = run(&path, "SELECT min(rowid) FROM t;");
+    assert_eq!(min.trim(), "-800");
+    let max = run(&path, "SELECT max(rowid) FROM t;");
+    assert_eq!(max.trim(), "800");
+    let integrity = run(&path, "PRAGMA integrity_check;");
+    assert_eq!(integrity.trim(), "ok", "the negative-rowid tree failed integrity_check");
 }
