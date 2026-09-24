@@ -468,10 +468,7 @@ mod tests {
         // The cell that did not fit is the trigger, and the split places it.
         let pending = Cell {
             rowid: n,
-            payload: LeafPage::encode_payload(
-                &[crate::value::Value::Text("y".repeat(60))],
-                None,
-            ),
+            payload: LeafPage::encode_payload(&[crate::value::Value::Text("y".repeat(60))], None),
             first_overflow: 0,
         };
         let split = split_leaf(&mut pager, &page, usable, &pending).unwrap();
