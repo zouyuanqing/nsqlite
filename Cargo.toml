@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/nsqlite",
+    "crates/nsqlite-vector",
 ]
 
 [workspace.package]

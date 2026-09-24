@@ -1,0 +1,16 @@
+[package]
+name = "nsqlite-vector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "OpenRouter embeddings and rerank HTTP client"
+
+[dependencies]
+ureq = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+name = "nsqlite_vector"
+path = "src/lib.rs"

@@ -210,7 +210,7 @@ fn reads_every_storage_class_from_a_real_file() {
     assert_eq!(by_name("medium"), Value::Integer(140_737_488_355_327));
     assert_eq!(by_name("max"), Value::Integer(i64::MAX));
     assert_eq!(by_name("min"), Value::Integer(i64::MIN));
-    assert_eq!(by_name("real"), Value::real(3.14159));
+    assert_eq!(by_name("real"), Value::real(std::f64::consts::PI));
     assert_eq!(by_name("negreal"), Value::real(-0.5));
     assert_eq!(by_name("text"), Value::Text("héllo wörld".into()));
     assert_eq!(by_name("empty"), Value::Text(String::new()));

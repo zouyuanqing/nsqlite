@@ -4,3 +4,8 @@
 *.db-shm
 *.db-journal
 test/interop/*.db
+# Vendored upstream checkouts and generated fixtures: fetched by tools/, not
+# committed.
+/test/sqlite-suite/
+/testsuite/
+/.research/
