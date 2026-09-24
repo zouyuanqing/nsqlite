@@ -299,6 +299,10 @@ impl Connection {
                         "cannot start a transaction within a transaction",
                     ));
                 }
+                // The journal is created now, so a page the transaction never
+                // changes has nothing to restore and one it does is captured
+                // before it is written.
+                self.pager.begin_journal()?;
                 self.tx = TxState::InTransaction;
                 Ok(Outcome::Nothing)
             }
@@ -309,8 +313,13 @@ impl Connection {
                         "cannot commit - no transaction is active",
                     ));
                 }
-                self.tx = TxState::None;
+                // A commit is a write followed by the journal's removal, so a
+                // crash between the two leaves a hot journal and the next
+                // connection rolls the whole transaction back rather than
+                // finding half of it.
                 self.pager.flush()?;
+                self.pager.commit_journal()?;
+                self.tx = TxState::None;
                 Ok(Outcome::Changed(0))
             }
             Stmt::Rollback => {
@@ -320,13 +329,14 @@ impl Connection {
                         "cannot rollback - no transaction is active",
                     ));
                 }
-                // Without a journal there is nothing to roll back to, so the
-                // honest outcome is to refuse rather than pretend.
+                self.pager.rollback_journal()?;
                 self.tx = TxState::None;
-                Err(Error::new(
-                    ResultCode::Error,
-                    "cannot rollback - no journal is active",
-                ))
+                // The catalog is in memory, so a rolled back table has to go
+                // back to what the file says, not what this connection
+                // remembers doing.
+                self.catalog = Catalog::new();
+                self.load_schema()?;
+                Ok(Outcome::Changed(0))
             }
             Stmt::CreateIndex { .. } => Err(Error::new(
                 ResultCode::Error,

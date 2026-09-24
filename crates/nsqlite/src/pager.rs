@@ -7,7 +7,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use super::error::{Error, Result};
+use super::error::{Error, Result, ResultCode};
+use super::journal::{self, Journal, RecoveredPage};
 use super::page::{DbHeader, HEADER_SIZE};
 
 /// The number of cached pages held before the least recently used one is
@@ -46,6 +47,14 @@ pub struct Pager {
     dirty: Vec<u32>,
     /// Path of the temporary file backing an in-memory database, removed on drop.
     memory_path: Option<std::path::PathBuf>,
+    /// The database's own path, which a journal is named after. A memory
+    /// database has one too, since its backing file is a real path.
+    path: Option<std::path::PathBuf>,
+    /// The journal of the transaction in progress, if there is one.
+    journal: Option<Journal>,
+    /// The nonce the next journal uses, advanced per transaction so a record
+    /// left by an earlier one cannot validate by accident.
+    nonce: u32,
 }
 
 impl Pager {
@@ -80,6 +89,9 @@ impl Pager {
                 clock: 0,
                 dirty: Vec::new(),
                 memory_path: None,
+                path: None,
+                journal: None,
+                nonce: 1,
             }
         } else {
             if len < HEADER_SIZE as u64 {
@@ -100,7 +112,11 @@ impl Pager {
                 clock: 0,
                 dirty: Vec::new(),
                 memory_path: None,
+                path: None,
+                journal: None,
+                nonce: 1,
             };
+            pager.path = Some(path.to_owned());
             // The header's page count is authoritative only when the change
             // counter matches version-valid-for; otherwise the file length is.
             let file_pages = (len / page_size as u64) as u32;
@@ -111,6 +127,9 @@ impl Pager {
             }
             pager
         };
+        if !fresh {
+            pager.replay_hot_journal()?;
+        }
         if fresh {
             // A zero-length file has no page 1 yet, so there is nothing to
             // re-read: the in-memory header is already the authoritative one.
@@ -138,7 +157,8 @@ impl Pager {
         let _ = std::fs::remove_file(&path);
         let mut pager = Pager::open(&path)?;
         pager.header.page_size = page_size;
-        pager.memory_path = Some(path);
+        pager.memory_path = Some(path.clone());
+        pager.path = Some(path);
         Ok(pager)
     }
 
@@ -197,7 +217,14 @@ impl Pager {
     }
 
     /// Marks page `n` dirty so the next [`Pager::flush`] writes it out.
+    ///
+    /// Inside a transaction the page's current contents go into the journal
+    /// first, which is the only point where the pre-image still exists: once
+    /// the page has been modified, what it held before is gone.
     pub fn mark_dirty(&mut self, n: u32) {
+        if self.journal.is_some() && n > 0 {
+            let _ = self.journal_page(n);
+        }
         if let Some((_, origin, _)) = self.cache.get_mut(&n) {
             *origin = Origin::Dirty;
         }
@@ -358,6 +385,139 @@ impl Pager {
         }
         self.dirty.clear();
         self.file.flush()?;
+        Ok(())
+    }
+
+    /// Starts journalling, so the pages a transaction changes can be put back.
+    ///
+    /// The page count is recorded in the header, because a rollback has to know
+    /// whether the file grew and needs shortening.
+    pub fn begin_journal(&mut self) -> Result<()> {
+        if self.journal.is_some() {
+            return Ok(());
+        }
+        let path = self.path.clone().ok_or_else(|| {
+            Error::new(
+                ResultCode::Error,
+                "an in-memory database cannot be journalled",
+            )
+        })?;
+        self.nonce = self.nonce.wrapping_add(1);
+        let mut j = Journal::create(&path, self.page_size, 512, self.nonce)?;
+        j.set_original_size(self.header.db_size_pages)?;
+        self.journal = Some(j);
+        Ok(())
+    }
+
+    /// Whether a journal is open.
+    pub fn journalling(&self) -> bool {
+        self.journal.is_some()
+    }
+
+    /// Writes the journal's pre-image of page `n` if it has not been written
+    /// yet.
+    pub fn journal_page(&mut self, n: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        if let Some(j) = &self.journal {
+            if j.recorded_pages().contains(&n) {
+                return Ok(());
+            }
+        }
+        let current = self.read_page(n)?;
+        if let Some(j) = self.journal.as_mut() {
+            j.record(n, &current)?;
+        }
+        Ok(())
+    }
+
+    /// The commit: the journal's deletion is what makes the change permanent.
+    pub fn commit_journal(&mut self) -> Result<()> {
+        if let Some(mut j) = self.journal.take() {
+            j.sync()?;
+            j.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Puts back every page the journal holds, and shortens the file if the
+    /// transaction grew it.
+    pub fn rollback_journal(&mut self) -> Result<()> {
+        let Some(mut j) = self.journal.take() else {
+            return Ok(());
+        };
+        j.sync()?;
+        let original = j.header().db_size;
+        // The cache holds the newer versions, so it is dropped before the
+        // journal's come back; otherwise a later read would see the cache.
+        self.cache.clear();
+        self.lru.clear();
+        self.dirty.clear();
+        for page in j.recorded_pages().to_vec() {
+            let contents = j.page_contents(page)?;
+            self.write_page_at(page, &contents)?;
+        }
+        self.truncate(original)?;
+        j.discard()?;
+        // The rollback undid the change counter's progress, so the next write
+        // has to advance it rather than reuse a value already on disk.
+        self.header.change_counter = self.header.change_counter.wrapping_add(1);
+        self.header.version_valid_for = self.header.change_counter;
+        self.write_header()?;
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Puts back the pages of a journal left behind by an interrupted
+    /// transaction.
+    ///
+    /// This runs before the caller sees the database at all, because until it
+    /// has, the file is mid-transaction and reading it would mix the committed
+    /// and uncommitted states.
+    fn replay_hot_journal(&mut self) -> Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        let Some(hot) = journal::find_hot(&path)? else {
+            return Ok(());
+        };
+        self.cache.clear();
+        self.lru.clear();
+        self.dirty.clear();
+        for RecoveredPage { page_no, contents } in hot.recover()? {
+            if page_no == 0 || page_no > hot.original_size() {
+                // A page the database did not have before the transaction was
+                // never written, and one past the original size is past the
+                // file as it was.
+                continue;
+            }
+            self.write_page_at(page_no, &contents)?;
+        }
+        if hot.original_size() > 0 {
+            self.truncate(hot.original_size())?;
+        }
+        hot.finish()?;
+        self.write_header()?;
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Writes a page's bytes without going through the cache.
+    fn write_page_at(&mut self, n: u32, contents: &[u8]) -> Result<()> {
+        let offset = (n as u64 - 1) * self.page_size as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(contents)?;
+        Ok(())
+    }
+
+    /// Shortens the file to `pages` pages, or extends it with zeroes.
+    fn truncate(&mut self, pages: u32) -> Result<()> {
+        let len = pages as u64 * self.page_size as u64;
+        if self.file.metadata()?.len() != len {
+            self.file.set_len(len)?;
+        }
+        self.header.db_size_pages = pages;
         Ok(())
     }
 

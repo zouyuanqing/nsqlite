@@ -12,6 +12,8 @@
 //!   overflow thresholds.
 //! * [`pager`] — the page cache over a database file.
 //! * [`connection`] — running statements against a database.
+//! * [`aggregate`] — aggregate functions and grouping.
+//! * [`journal`] — the rollback journal.
 //! * [`catalog`] — the tables a connection knows about.
 //! * [`eval`] — expression evaluation and the built-in functions.
 //! * [`affinity`] — how a declared type is interpreted.
@@ -26,6 +28,7 @@
 //! of these and live in their own modules as they land.
 
 pub mod affinity;
+pub mod aggregate;
 pub mod btree;
 pub mod btree_interior;
 pub mod btree_write;
@@ -33,6 +36,7 @@ pub mod catalog;
 pub mod connection;
 pub mod error;
 pub mod eval;
+pub mod journal;
 pub mod page;
 pub mod pager;
 pub mod parser;
