@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/nsqlite",
+    "crates/nsqlite-capi",
     "crates/nsqlite-vector",
     "crates/nsqlited",
 ]

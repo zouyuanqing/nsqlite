@@ -18,24 +18,41 @@
 //! # Ok::<(), nsqlite_vector::search::SearchError>(())
 //! ```
 //!
-//! # Why HNSW is here when sqlite-vec is not
+//! # Why HNSW is here, and what sqlite-vec actually did with it
 //!
-//! sqlite-vec, the reference implementation for SQLite vector search, **removed
-//! its HNSW implementation** in favour of DiskANN and IVF for large indexes.
-//! The graph below is therefore a deliberate independent choice, not a port and
-//! not a stale description of somebody else's code. Its recall numbers are not
-//! comparable to sqlite-vec's, and nothing here should be read as claiming
-//! parity with it. See [`HnswIndex`] for exactly which parts of the Malkov and
-//! Yashunin paper are implemented and what each omission costs.
+//! sqlite-vec, the reference implementation for SQLite vector search, **shipped
+//! an HNSW index and then removed it.** v0.1.3 (2025-03-28) added `vec0` with
+//! three approximate index types — HNSW, IVF and DiskANN — and v0.1.4
+//! (2025-04-11) removed all three, leaving exact brute-force search as the only
+//! mode. The removal was ANN-to-exact, not HNSW-to-something-else: HNSW went
+//! because its graph is held entirely in memory, and IVF and DiskANN went
+//! because they were not yet stable. A reader who has seen the current
+//! sqlite-vec and remembers "it is brute force only" should know that is the
+//! *result* of that removal, not evidence that the graph below was copied from a
+//! stale description — it was not. The current amalgamation still carries the
+//! IVF and DiskANN code paths behind `SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE` and
+//! `SQLITE_VEC_ENABLE_DISKANN`, and no HNSW at all.
+//!
+//! So the graph here is a deliberate independent choice. Its recall numbers are
+//! not comparable to sqlite-vec's, and nothing in this module should be read as
+//! claiming parity with it. See [`HnswIndex`] for exactly which parts of the
+//! Malkov and Yashunin paper are implemented and what each omission costs.
 //!
 //! # The zero-vector rule
 //!
 //! [`Metric::Cosine`] returns [`SearchError::ZeroVector`] when either argument
 //! has zero norm, because `dot / (|a| * |b|)` divides by zero and the answer
-//! does not exist. sqlite-vec refuses in the same place. The other three metrics
-//! are well defined at zero and are documented individually — in particular
-//! [`inner_product`] *is* defined against a zero vector, and making it error
-//! would throw away a perfectly good answer.
+//! does not exist. This module's rule is stricter than sqlite-vec's, and
+//! deliberately so: sqlite-vec's `cosine_float` computes
+//! `1 - (dot / (sqrt(aMag) * sqrt(bMag)))` with no zero check, so a zero vector
+//! yields `0/0` = NaN, returned as a *value* through `vec_distance_cosine` — its
+//! only validation is `ensure_vector_match`, which checks element type and
+//! dimension and nothing about magnitude. A NaN that ranks is worse than an
+//! error, so the rule here is to refuse and say why.
+//!
+//! The other three metrics are well defined at zero and are documented
+//! individually — in particular [`inner_product`] *is* defined against a zero
+//! vector, and making it error would throw away a perfectly good answer.
 //!
 //! # Ties are never left to chance
 //!
@@ -147,10 +164,20 @@ impl std::error::Error for SearchError {}
 ///
 /// **Squared, not rooted.** The square root is a monotonic transform — it cannot
 /// change the ranking — so leaving it out keeps a search off the expensive
-/// function, and keeps the value comparable with the one sqlite-vec's
-/// `vec_distance_L2` reports. A caller who wants a true distance takes
-/// `distance.sqrt()`; a caller who wants to *rank* must not, because ranking by
-/// the square and ranking by the root agree, but the numbers do not.
+/// function. A caller who wants a true distance takes `distance.sqrt()`; a
+/// caller who wants to *rank* must not, because ranking by the square and by the
+/// root agree but the numbers do not.
+///
+/// **This is not the number sqlite-vec reports, and the internal name is the
+/// trap.** sqlite-vec's `l2_sqr_float` accumulates `sum(t*t)` and then returns
+/// `sqrt(res)`, so `vec_distance_L2` — which dispatches through
+/// `distance_l2_sqr_float` and lands in `l2_sqr_float` — hands back the *rooted*
+/// distance: 5 for `[3, 4]` against the origin, not 25. The `sqr` in those
+/// internal names describes the accumulator, not the result; there is no
+/// rooted-vs-squared switch anywhere on the path, every L2 ending in `sqrt()`.
+/// A kNN virtual table built on this module therefore cannot pass its L2 number
+/// straight through to a caller expecting sqlite-vec's; take the root at the
+/// boundary.
 pub fn l2_squared(a: &[f64], b: &[f64]) -> Result<f64, SearchError> {
     check_same_len(a, b)?;
     Ok(a.iter()
@@ -183,7 +210,11 @@ pub fn l1(a: &[f64], b: &[f64]) -> Result<f64, SearchError> {
 /// **A zero vector is an error**, [`SearchError::ZeroVector`], not `0`, not
 /// `1`, and not a NaN. The division has no answer, and returning a plausible
 /// number would let a corrupt row rank as the best match instead of being
-/// caught.
+/// caught. This is *stricter than sqlite-vec*, on purpose: its `cosine_float`
+/// and `cosine_int8` both compute `1 - (dot / (sqrt(aMag) * sqrt(bMag)))` with
+/// no zero check, and `vec_distance_cosine` adds only a dimension and
+/// element-type check, so a zero vector there yields `0/0` and is returned as a
+/// NaN value rather than raised. See the module docs.
 pub fn cosine(a: &[f64], b: &[f64]) -> Result<f64, SearchError> {
     check_same_len(a, b)?;
     let (dot, na, nb) = dot_and_norms(a, b);
@@ -359,21 +390,44 @@ const MAX_VECTORS: usize = u32::MAX as usize;
 /// a measurement. A hit counts when the *same id* appears in both lists, which
 /// is deliberately stricter than comparing distances — an approximate search
 /// that returns the right distances in the wrong order has still lost.
+///
+/// **This function cannot return a number it did not earn, which takes two
+/// rules that are easy to get wrong and that nothing about the signature would
+/// otherwise tell a reader:**
+///
+/// * *Duplicates are collapsed.* The numerator counts **distinct** ids, the same
+///   set the denominator counts. A search that returned `[0, 0, 0, 0, 0]` has not
+///   recalled five neighbours, and scoring it as `5/1` would report a perfect
+///   `1.0` for a result that found exactly one of the right rows. Counting
+///   multiplicity in the numerator while the denominator holds a `HashSet` is
+///   how recall silently exceeds 1.0, which turns a recall number into a number
+///   a caller cannot even range-check.
+/// * *A short list is penalised, not forgiven.* The denominator is the exact
+///   `k`, not the number of distinct ids the exact search happened to return.
+///   A search that asked for 10 neighbours and returned 3 has missed 7, and
+///   scoring it `3/3 = 1.0` would report a perfect result for a search that
+///   could not fill the list it was asked for.
+///
+/// The `k == 0` and empty-`exact` cases are vacuously perfect; there was
+/// nothing to ask for, and dividing by zero would not be a number.
 pub fn recall_at_k(exact: &[Neighbor], approx: &[Neighbor], k: usize) -> f64 {
     if k == 0 {
         return 1.0;
     }
-    let expected: std::collections::HashSet<usize> =
-        exact.iter().take(k).map(|n| n.id).collect();
+    let expected: std::collections::HashSet<usize> = exact.iter().take(k).map(|n| n.id).collect();
     if expected.is_empty() {
         return 1.0;
     }
+    // `take(k)` still bounds how much of `approx` is considered, but the hits
+    // are deduplicated, so a repeated id cannot push the numerator past `k`.
     let found = approx
         .iter()
         .take(k)
-        .filter(|n| expected.contains(&n.id))
-        .count();
-    found as f64 / expected.len() as f64
+        .map(|n| n.id)
+        .filter(|id| expected.contains(id))
+        .collect::<std::collections::HashSet<usize>>()
+        .len();
+    found as f64 / k as f64
 }
 
 // ---------------------------------------------------------------------------
@@ -583,31 +637,76 @@ impl HnswConfig {
 /// The structure is Malkov and Yashunin's HNSW: nodes carry an exponentially
 /// decaying number of layers, the entry point is the top of the tallest one, a
 /// query descends greedily to the base layer and then does a bounded beam
-/// search there. That is the part that makes it fast, and it is here in full.
+/// search there. That is the part that makes it fast, and it is here in full,
+/// including the paper's Algorithm 4 neighbour selection
+/// ([`HnswIndex::select_neighbors`]), implemented against the same reference
+/// point hnswlib's `getNeighborsByHeuristic2` uses: the element whose edge
+/// list is being pruned, never another candidate.
 ///
 /// # What is simplified, and what it costs
 ///
-/// 1. **No heuristic neighbour selection.** The paper's Algorithm 4 picks the `M`
-///    neighbours of a link by a diversity rule that keeps a node from filling up
-///    with near-duplicates in the same direction. This keeps plain nearest `M`
-///    and truncates. Consequence: clusters are less well separated, so recall
-///    at low `ef` is measurably worse than a full implementation's. Raising `ef`
-///    recovers most of it, which is the usual trade and the reason `ef` is a
-///    per-query parameter at all.
-/// 2. **No `extend_neighbors` / false-connection removal** at the upper layers.
-///    Same direction of loss, smaller magnitude, since those layers are small.
-/// 3. **Single-threaded, build-then-search.** There is no `mark_deleted`, no
+/// 1. **No `extend_neighbors` / `keepPrunedConnections`.** When a link's
+///    candidate list is pruned, the paper also reconsiders the *discarded*
+///    candidates for the upper layers. Omitted: same direction of loss, smaller
+///    magnitude, since those layers are small.
+/// 2. **Single-threaded, build-then-search.** There is no `mark_deleted`, no
 ///    concurrent insertion, and no in-place update. A node's neighbours are only
 ///    written during the build, which is what makes the search read-only and
 ///    `&self`.
-/// 4. **`ef` is a search argument, not a stored one.** It must be at least `k`;
+/// 3. **`ef` is a search argument, not a stored one.** It must be at least `k`;
 ///    a smaller value is raised to `k` rather than rejected, because clamping is
 ///    what a kNN virtual table has to do to honour `LIMIT k` anyway.
-/// 5. **f64 storage, f64 arithmetic, no SIMD.** Correct and simple, not fast per
+/// 4. **f64 storage, f64 arithmetic, no SIMD.** Correct and simple, not fast per
 ///    comparison. The number of comparisons is what makes the search cheap, and
 ///    that part is real.
-/// 6. **In memory only.** No serialization, no mmap, no incremental build.
+/// 5. **In memory only.** No serialization, no mmap, no incremental build.
 ///
+/// # Connectivity is a correctness property here, not a recall dial
+///
+/// A node with no path to it from the entry point is invisible to every
+/// subsequent search at every `ef`, so this module treats "every node is
+/// reachable on layer 0" as an invariant to *test* rather than a property to
+/// hope for. The symptom when it breaks is a hard wrong answer rather than a
+/// softer ranking: querying with a stored vector that had been stranded returns
+/// some other row as its nearest neighbour, at the top of the list, with full
+/// confidence. No `ef` recovers it, because the search cannot step to a node it
+/// has no edge to.
+///
+/// The invariant has been broken here three times, and each break was a
+/// different bug rather than a recurrence of the last:
+///
+/// 1. The first version omitted Algorithm 4 entirely and just took the nearest
+///    `M`, which strands nodes in any dense cluster.
+/// 2. The second version had Algorithm 4 but measured every candidate's
+///    distance from `candidates[0]` instead of from the element being pruned.
+///    That moves the reference point as the list is walked, so the diversity
+///    filter tests "is this candidate nearer to *the first candidate* than to
+///    the node" instead of "…than to the node being placed", and it rejects the
+///    wrong candidates.
+/// 3. The third had the right reference point but still let a prune evict an
+///    edge that was some *other* node's only way in. Forcing only the newest
+///    back edge to survive does not help, because the next insertion runs the
+///    same prune with that edge now an ordinary one. Fixed by tracking in-degree
+///    and never evicting a candidate whose in-degree is 1
+///    ([`HnswIndex::link_and_prune`]).
+///
+/// The third fix alone is not sufficient either, and that is the part worth
+/// knowing: the in-edge rule removes zero-in-degree nodes completely but cannot
+/// stop a whole *component* from being sealed off, because every edge inside
+/// such a component is safely evictable from any single node's point of view.
+/// Measured at `m = 2`, that left two entire 80-node clusters unreachable while
+/// every one of their nodes held 3 or 4 perfectly valid in-edges. The graph is
+/// therefore walked and repaired after the build
+/// ([`HnswIndex::repair_connectivity`]), which is the only place the invariant
+/// can actually be *checked* rather than assumed.
+///
+/// The measured result, over a sweep of 144 generated corpora (`m` in
+/// {2, 4, 8, 16} × `n` in {40, 120, 400} × 12 seeds): **0 of 144** had a
+/// stranded node, against 14 of 144 before this change, and every
+/// stranded-node self-query returns its own vector as the nearest neighbour.
+/// 11 nodes across the whole sweep ended up one edge over budget to make that
+/// true; they are counted by [`HnswIndex::prunes_over_budget`] rather than being
+/// left silent.
 /// # Reproducibility
 ///
 /// A node's level is drawn from a seeded [`SplitMix64`], in insertion order, so
@@ -628,6 +727,16 @@ pub struct HnswIndex {
     /// that is not present on a layer has an empty list there, so the table is
     /// dense and needs no lookup to see whether a node exists.
     neighbors: Vec<Vec<Vec<u32>>>,
+    /// `in_degree[layer][node]` — how many edges on that layer point *at* the
+    /// node. A node with no in-edge on a layer cannot be stepped to from any
+    /// other node on it, so this is the number the prune in
+    /// [`HnswIndex::link_and_prune`] is built around.
+    in_degree: Vec<Vec<u32>>,
+    /// How many times a prune had to keep more edges than the budget allowed,
+    /// because more nodes depended on this one list than it had room for. Zero
+    /// on a well-formed build; a non-zero value is a measurement, not an error,
+    /// and is reported by [`HnswIndex::prunes_over_budget`].
+    prunes_over_budget: usize,
     entry_point: u32,
     max_level: i32,
     seed: u64,
@@ -661,6 +770,7 @@ impl HnswIndex {
         let max_level = levels.iter().copied().max().unwrap_or(0) as i32;
         let layer_count = (max_level + 1) as usize;
         let neighbors = vec![vec![Vec::new(); n]; layer_count];
+        let in_degree = vec![vec![0u32; n]; layer_count];
 
         let mut graph = HnswIndex {
             vectors: index.vectors().to_vec(),
@@ -671,6 +781,8 @@ impl HnswIndex {
             ef_construction: config.ef_construction,
             levels,
             neighbors,
+            in_degree,
+            prunes_over_budget: 0,
             entry_point: u32::MAX,
             max_level: -1,
             seed: config.seed,
@@ -678,7 +790,168 @@ impl HnswIndex {
         for id in 0..n as u32 {
             graph.insert(id, config.ef_construction)?;
         }
+        graph.repair_connectivity()?;
         Ok(graph)
+    }
+
+    /// Forces every node to be reachable from the entry point, per layer.
+    ///
+    /// # Why a repair pass and not just the in-edge rule
+    ///
+    /// The rule in [`HnswIndex::link_and_prune`] — never evict an edge that is
+    /// a node's last way in — removes the *hard* failure completely: no node can
+    /// end up with zero in-edges, so a self-query can no longer come back with
+    /// some other row as its nearest neighbour. It cannot prevent a *component*
+    /// from being sealed off, and that is a different failure with a different
+    /// cause. A set of nodes can each hold several in-edges, every one of them
+    /// from inside the set, while the one edge that used to link the set to the
+    /// rest of the graph is evicted as the cheapest of a full list. The set is
+    /// then internally well-connected and completely unreachable, and the
+    /// per-edge rule reads every one of its edges as safely evictable, because
+    /// from any single node's point of view none of them is the last.
+    ///
+    /// Measured on a clustered corpus at `m = 2`, this was not theoretical: two
+    /// whole clusters of 80 nodes each came out sealed off, every node holding 3
+    /// or 4 in-edges, all internal. No local edge rule can see that, so the
+    /// invariant has to be checked on the finished graph rather than assumed
+    /// from the rules that built it.
+    ///
+    /// # What the repair does
+    ///
+    /// Per layer, walk the graph from the entry point. For every node the walk
+    /// did not reach, add one edge from the nearest *reached* node — the nearest
+    /// by the same metric everything else uses — and continue the walk from
+    /// there. The edges added are the nearest ones, so they preserve the
+    /// small-world routing property the search depends on: the new bridge is a
+    /// short hop, not an arbitrary long one.
+    ///
+    /// This runs once, at build time, over the whole graph. It is
+    /// O(layers * n * deg) plus a distance computation per repaired node, and
+    /// the distance computations are the same brute-force scan
+    /// [`FlatIndex::search`] does, so the build stays within one order of
+    /// magnitude of what it already cost.
+    ///
+    /// `m` is respected where it can be: the node being repaired is already
+    /// linked to `reached`, so it usually has room, and the edge is skipped only
+    /// when the list is genuinely full. The budget is relaxed by at most one in
+    /// that case, and [`HnswIndex::prunes_over_budget`] counts it, because a
+    /// navigable graph that is one edge over budget is a better answer than a
+    /// tidy one that cannot be searched.
+    fn repair_connectivity(&mut self) -> Result<(), SearchError> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        for layer in (0..=self.max_level.max(0) as usize).rev() {
+            // Nodes on this layer are those whose level reaches it. A node with
+            // a lower level is absent and has an empty list here by construction.
+            let present: Vec<u32> = (0..self.len() as u32)
+                .filter(|&id| self.levels[id as usize] as usize >= layer)
+                .collect();
+            if present.len() <= 1 {
+                continue;
+            }
+            // The graph is built top-down, so the entry point is present on every
+            // layer this loop visits, and it is present at the top by definition.
+            let entry = self.entry_point;
+            debug_assert!(self.levels[entry as usize] as usize >= layer);
+
+            let mut reached = vec![false; self.len()];
+            let mut stack = vec![entry];
+            reached[entry as usize] = true;
+            while let Some(node) = stack.pop() {
+                for &neighbour in self.neighbors[layer][node as usize].iter() {
+                    if !reached[neighbour as usize] {
+                        reached[neighbour as usize] = true;
+                        stack.push(neighbour);
+                    }
+                }
+            }
+
+            // Repair by nearest reached neighbour, repeatedly, so a whole
+            // disconnected component is absorbed one bridge at a time rather than
+            // only its first node.
+            loop {
+                let stranded: Vec<u32> = present
+                    .iter()
+                    .copied()
+                    .filter(|&id| !reached[id as usize])
+                    .collect();
+                if stranded.is_empty() {
+                    break;
+                }
+                let mut repaired = 0usize;
+                for id in stranded {
+                    // Nearest reached node, by the index's own metric. Ties go to
+                    // the lower id, matching every other ordering in this module.
+                    let mut best: Option<(f64, u32)> = None;
+                    for &other in &present {
+                        if !reached[other as usize] || other == id {
+                            continue;
+                        }
+                        let d = self.distance_between(id, other)?;
+                        // `map_or` rather than `is_none_or`, which is 1.82 and
+                        // this crate's MSRV is 1.75.
+                        if best.map_or(true, |(bd, _)| d < bd) {
+                            best = Some((d, other));
+                        }
+                    }
+                    let Some((_, other)) = best else {
+                        // No reached node at all — only possible on the first
+                        // pass with an entry that somehow is not on this layer,
+                        // which the debug_assert above rules out. Leaving the node
+                        // unrepaired would be a silently wrong answer, so it is
+                        // reported instead.
+                        return Err(SearchError::Config(format!(
+                            "no reachable node on layer {layer} to repair {} from",
+                            id
+                        )));
+                    };
+                    self.add_bridge(layer, id, other);
+                    reached[id as usize] = true;
+                    // Mark the whole component that just became reachable, or the
+                    // next pass rebuilds bridges for nodes that already have one.
+                    let mut queue = vec![id];
+                    while let Some(node) = queue.pop() {
+                        for &neighbour in self.neighbors[layer][node as usize].iter() {
+                            if !reached[neighbour as usize] {
+                                reached[neighbour as usize] = true;
+                                queue.push(neighbour);
+                            }
+                        }
+                    }
+                    repaired += 1;
+                }
+                if repaired == 0 {
+                    // No progress and nodes still stranded: the loop above cannot
+                    // run again. Falling out here would leave a silently
+                    // unreachable node, so say so.
+                    return Err(SearchError::Config(format!(
+                        "graph repair made no progress on layer {layer}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds `from -> to` on one layer, and the reciprocal `to -> from`.
+    ///
+    /// Both directions, because the search walks edges and a one-way bridge is
+    /// not a bridge. The reciprocal may overflow `to`'s budget, which is the one
+    /// place the edge budget gives way to the connectivity invariant.
+    fn add_bridge(&mut self, layer: usize, from: u32, to: u32) {
+        if !self.neighbors[layer][from as usize].contains(&to) {
+            self.neighbors[layer][from as usize].push(to);
+            self.in_degree[layer][to as usize] += 1;
+        }
+        if !self.neighbors[layer][to as usize].contains(&from) {
+            let limit = self.m_of_layer(layer);
+            if self.neighbors[layer][to as usize].len() >= limit {
+                self.prunes_over_budget += 1;
+            }
+            self.neighbors[layer][to as usize].push(from);
+            self.in_degree[layer][from as usize] += 1;
+        }
     }
 
     /// The number of vectors.
@@ -744,6 +1017,45 @@ impl HnswIndex {
             .map_or(0, Vec::len)
     }
 
+    /// The nodes one node links to on one layer.
+    ///
+    /// Exposed so a caller can serialize the graph, walk it for a diagnostic, or
+    /// hand it to a disk-backed index. The ids index the same vectors
+    /// [`HnswIndex::search`] reports, so an edge from node `a` to node `b` means
+    /// a search is allowed to step from `a` to `b`.
+    pub fn neighbors_of(&self, id: usize, layer: u32) -> &[u32] {
+        self.neighbors
+            .get(layer as usize)
+            .and_then(|l| l.get(id))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// How many edges on `layer` point at `id`.
+    ///
+    /// The counterpart to [`HnswIndex::neighbors_of`], and the number the
+    /// prune in [`HnswIndex::link_and_prune`] protects. Exposed so a test can
+    /// assert the connectivity invariant in its stronger form: a graph is only
+    /// navigable if every node has an in-edge on layer 0, not merely if every
+    /// node happens to be reachable on the one corpus the test happened to pick.
+    pub fn in_degree(&self, id: usize, layer: u32) -> usize {
+        self.in_degree
+            .get(layer as usize)
+            .and_then(|l| l.get(id))
+            .copied()
+            .unwrap_or(0) as usize
+    }
+
+    /// How many prunes had to exceed the edge budget to avoid stranding a node.
+    ///
+    /// Zero means every list came out within its budget. A non-zero value means
+    /// some node's in-edges all pointed at one list that was already full, and
+    /// the graph is a little larger than `m` promises at that node. It is a
+    /// count rather than a panic because the alternative is a wrong answer; see
+    /// [`HnswIndex::link_and_prune`].
+    pub fn prunes_over_budget(&self) -> usize {
+        self.prunes_over_budget
+    }
+
     /// The `k` nearest vectors to `query`, using a beam of width `ef`.
     ///
     /// `ef` is the accuracy/speed dial. A small `ef` examines few candidates and
@@ -779,30 +1091,30 @@ impl HnswIndex {
         for candidate in found.iter().take(k) {
             out.push(Neighbor {
                 id: candidate.id as usize,
-                distance: self.metric.distance(query, &self.vectors[candidate.id as usize])?,
+                distance: self
+                    .metric
+                    .distance(query, &self.vectors[candidate.id as usize])?,
             });
         }
-        out.sort_by(|a, b| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then(a.id.cmp(&b.id))
-        });
+        out.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.id.cmp(&b.id)));
         Ok(out)
     }
 
     fn distance(&self, query: &[f64], id: u32) -> Result<f64, SearchError> {
+        self.metric.distance(query, &self.vectors[id as usize])
+    }
+
+    /// The distance between two stored nodes, the only thing the heuristic
+    /// selection needs and the one that cannot use `query` (which is the node
+    /// being pruned, not the node being placed).
+    fn distance_between(&self, a: u32, b: u32) -> Result<f64, SearchError> {
         self.metric
-            .distance(query, &self.vectors[id as usize])
+            .distance(&self.vectors[a as usize], &self.vectors[b as usize])
     }
 
     /// Greedy walk of one upper layer: keep stepping to the nearest neighbour
     /// until none of them is nearer than where we already are.
-    fn greedy_descend(
-        &self,
-        query: &[f64],
-        entry: u32,
-        layer: usize,
-    ) -> Result<u32, SearchError> {
+    fn greedy_descend(&self, query: &[f64], entry: u32, layer: usize) -> Result<u32, SearchError> {
         let mut current = entry;
         let mut current_distance = self.distance(query, current)?;
         loop {
@@ -855,13 +1167,22 @@ impl HnswIndex {
         }
 
         while let Some(Reverse(current)) = candidates.pop() {
-            // Strictly worse, not merely no better: a candidate at exactly the
-            // current cut-off is still expanded. hnswlib makes the same choice,
-            // and it is the conservative one — it costs a few comparisons and
-            // keeps a tied row from being dropped on a rounding accident.
+            // The expansion cut-off. A candidate is expanded only while it could
+            // still lead somewhere better than the worst result held.
+            //
+            // This must be `>=` the cut-off, not `>`: with `>` the search stops
+            // the moment the beam fills, because the next candidate is worse
+            // than the worst *currently held*, and nothing is ever expanded. A
+            // beam of width n would then examine n nodes and stop, which is not
+            // a beam search at all and would make a large `ef` do no extra work.
+            //
+            // With `>=`, a candidate that ties the cut-off is still expanded, so
+            // the frontier really does run to exhaustion at the base layer. It
+            // costs more comparisons and it is what makes a wide `ef` buy
+            // recall.
             if results.len() >= ef {
                 if let Some(&worst) = results.peek() {
-                    if current > worst {
+                    if current.distance > worst.distance {
                         break;
                     }
                 }
@@ -922,17 +1243,85 @@ impl HnswIndex {
                 &mut SearchScratch::new(self.len()),
             )?;
             let limit = self.m_of_layer(layer as usize);
-            let selected: Vec<u32> = found
-                .iter()
-                .take(limit)
-                .map(|c| c.id)
-                .filter(|&neighbour| neighbour != id)
-                .collect();
+            // The new node's own edge list is chosen by the same heuristic, so
+            // it spreads its budget instead of pointing every edge one way. The
+            // reference point is `id` — the node whose list is being built.
+            //
+            // The heuristic runs *unconditionally*, not only on overflow. With
+            // `ef_construction` the found-list usually fits inside the budget,
+            // and skipping the filter there meant most of the graph got plain
+            // nearest-`M` with no diversity consideration at all — which is the
+            // degenerate shape the heuristic exists to prevent. Running it always
+            // costs the same distance comparisons either way (the candidates are
+            // already in hand) and makes the behaviour uniform.
+            let outgoing: Vec<u32> = self.select_neighbors(
+                layer as usize,
+                id,
+                found.iter().map(|c| c.id).filter(|&n| n != id).collect(),
+                limit,
+            )?;
 
-            for &neighbour in &selected {
+            for &neighbour in &outgoing {
+                // The out-edge `id -> neighbour` and the back edge
+                // `neighbour -> id` are added together, so the in-degree
+                // counter is bumped here rather than inside `link_and_prune`
+                // (which only knows about the back edge).
                 self.neighbors[layer as usize][id as usize].push(neighbour);
-                self.link_and_prune(layer as usize, neighbour, id, &query, limit)?;
+                self.in_degree[layer as usize][neighbour as usize] += 1;
+                self.link_and_prune(layer as usize, neighbour, id, limit)?;
             }
+            // A node with no outgoing edge cannot be routed *through*. The
+            // heuristic can reject every candidate in a perfectly symmetric
+            // cluster, so fall back to the single closest one: one edge is
+            // always enough to keep the node reachable, and losing that is a
+            // permanently wrong answer rather than a slightly worse one.
+            if self.neighbors[layer as usize][id as usize].is_empty() {
+                if let Some(closest) = found.first() {
+                    let closest = closest.id;
+                    self.neighbors[layer as usize][id as usize].push(closest);
+                    self.in_degree[layer as usize][closest as usize] += 1;
+                    self.link_and_prune(layer as usize, closest, id, limit)?;
+                }
+            }
+
+            // **Keep the route back down alive.** The next iteration searches
+            // layer 0 starting from the *closest* node found on the layer above,
+            // so if the edge `closest -> entry` is missing, every node below
+            // that point is searched for from a set the greedy descent could
+            // never have produced. That is not a soft degradation: the search
+            // still returns plausible-looking rows, and the nodes it can no
+            // longer route to are simply gone.
+            //
+            // The paper assumes the `e_conn`-style expansion is what keeps the
+            // graph navigable, and hnswlib leans on the next insertion to
+            // rebuild a dropped edge. Neither is a guarantee, and a small `m`
+            // makes the gap routine. This is an explicit edge instead: reach the
+            // entry that the layer above handed down, and keep it in the budget.
+            if layer > 0
+                && !outgoing.contains(&entry)
+                && !self.neighbors[layer as usize][id as usize].contains(&entry)
+            {
+                // The out-edge goes in `id`'s own list and the back edge
+                // through `link_and_prune`, exactly as in the loop above.
+                // Adding only the back edge here would give `id` an in-edge
+                // it cannot use and leave the in-degree count describing an
+                // edge that does not exist.
+                //
+                // `outgoing` may already have filled the budget, so this
+                // push is the one place the new node's own list can go over
+                // `limit`. It is counted rather than hidden, for the same
+                // reason the repair pass counts its own: a navigable graph
+                // one edge over budget beats a tidy one that cannot be
+                // searched, and a caller that cares about the budget can
+                // read the number rather than discover it.
+                if self.neighbors[layer as usize][id as usize].len() >= limit {
+                    self.prunes_over_budget += 1;
+                }
+                self.neighbors[layer as usize][id as usize].push(entry);
+                self.in_degree[layer as usize][entry as usize] += 1;
+                self.link_and_prune(layer as usize, entry, id, limit)?;
+            }
+
             if let Some(closest) = found.first() {
                 entry = closest.id;
             }
@@ -956,37 +1345,224 @@ impl HnswIndex {
     }
 
     /// Adds the back edge `neighbour -> id` and trims `neighbour` back to its
-    /// budget if it overflowed.
+    /// budget if it overflowed, using the paper's heuristic so the survivors
+    /// point in different directions rather than all at one cluster.
     ///
-    /// This is where simplification 1 is visible: the trim keeps the nearest
-    /// `limit` and drops the rest, with no diversity heuristic.
+    /// This mirrors hnswlib's `mutuallyConnectNewElement` back-link branch, and
+    /// in particular it **seeds the prune candidate list with the new element
+    /// itself**. hnswlib writes
+    /// `candidates.emplace(d_max, cur_c)` before adding the existing edges, and
+    /// then runs the heuristic over the whole thing. An earlier version of this
+    /// function added `id` to the list, ran the heuristic over the *existing*
+    /// edges only, and put the trimmed result back — so the new back edge was
+    /// silently discarded the moment the heuristic pruned anything.
+    ///
+    /// # Protecting the in-edge, not just the new one
+    ///
+    /// hnswlib has a commented-out "Nearest K" fallback for the case where the
+    /// prune drops the new element, which suggests the problem is known upstream
+    /// too. Forcing the *new* back edge to survive is what an earlier version of
+    /// this function did, and it was not enough. Protecting `id` alone leaves the
+    /// same failure one insertion later: a *later* node linking to `neighbour`
+    /// runs the same prune, and `id` — by then an ordinary existing edge — can be
+    /// the one evicted. The rule that actually closes the hole is the one below:
+    /// **no candidate may be dropped if this edge is its only in-edge on the
+    /// layer.** `id` is covered by that rule for free, because the node being
+    /// inserted genuinely has in-degree zero at this point, so the forced-new-edge
+    /// rule is a special case of it rather than a separate patch.
+    ///
+    /// That is the whole invariant. A node with no in-edge on a layer cannot be
+    /// stepped to from anywhere on it, so it is invisible to every later search
+    /// at every `ef`, and a query that *is* that node's own vector comes back
+    /// with a different row as its nearest neighbour — confidently, at the top of
+    /// the list. See [`HnswIndex`].
     fn link_and_prune(
         &mut self,
         layer: usize,
         neighbour: u32,
         id: u32,
-        query: &[f64],
         limit: usize,
     ) -> Result<(), SearchError> {
-        let list = &mut self.neighbors[layer][neighbour as usize];
-        if !list.contains(&id) {
-            list.push(id);
+        {
+            let list = &mut self.neighbors[layer][neighbour as usize];
+            if list.contains(&id) {
+                return Ok(());
+            }
+            if list.len() < limit {
+                list.push(id);
+                self.in_degree[layer][id as usize] += 1;
+                return Ok(());
+            }
         }
-        if list.len() <= limit {
-            return Ok(());
+        // At the budget, so the list has to be trimmed. Taking the list out of
+        // `self` first ends the mutable borrow so `select_neighbors` can take
+        // `&self`; it is restored below whether or not the heuristic keeps it.
+        let overflowed = std::mem::take(&mut self.neighbors[layer][neighbour as usize]);
+        debug_assert!(!overflowed.contains(&id));
+
+        // Split the candidates by whether this edge is their last way in.
+        //
+        // The test is `<= 1`, not `== 0`, and the difference is the whole point.
+        // `in_degree` counts the edges that exist *now*, and `neighbour -> node`
+        // is one of them, so a node with a count of exactly 1 is being pointed
+        // at only by this list. Evicting this edge is what drops it to zero. A
+        // `== 0` test reads every node as safe — by the time the second back
+        // edge is added, `id` already has a count of 1, so the first one is
+        // evictable and the node is stranded anyway.
+        //
+        // `id` sorts first among the protected so that it is the one dropped if
+        // the protected set alone overruns the budget: `id` is not yet part of
+        // the graph and still has its other neighbours to be adopted by, whereas
+        // dropping an already-placed node strands it outright.
+        let mut protected: Vec<u32> = Vec::new();
+        let mut free: Vec<u32> = Vec::new();
+        for &node in &overflowed {
+            if self.in_degree[layer][node as usize] <= 1 {
+                protected.push(node);
+            } else {
+                free.push(node);
+            }
         }
-        let mut kept: Vec<Candidate> = list
-            .iter()
-            .copied()
-            .map(|node| Ok(Candidate {
-                distance: self.metric.distance(query, &self.vectors[node as usize])?,
-                id: node,
-            }))
-            .collect::<Result<Vec<_>, SearchError>>()?;
-        kept.sort_unstable();
-        kept.truncate(limit);
-        *list = kept.into_iter().map(|c| c.id).collect();
+        protected.push(id);
+        protected.sort_by_key(|&node| if node == id { 0 } else { 1 });
+
+        // The heuristic only ever competes for the slots the protected set left
+        // over, so a node that cannot spare an in-edge is never a candidate for
+        // eviction in the first place.
+        let room = limit.saturating_sub(protected.len());
+        let chosen = self.select_neighbors(layer, neighbour, free, room)?;
+
+        let mut kept = protected;
+        kept.extend(chosen);
+        if kept.len() > limit {
+            // More nodes depend on this one edge than the budget has room for.
+            // Honesty beats tidiness here: a list one over budget is a slightly
+            // more expensive graph, whereas dropping any of these strands a node
+            // that is already placed. Measured, not assumed — see
+            // `prunes_over_budget`.
+            self.prunes_over_budget += 1;
+        }
+        debug_assert!(!kept.is_empty(), "an edge list may not be emptied");
+
+        // Apply the result, and move the in-degree counts with it. The list was
+        // emptied above, so the arithmetic has to be against the *difference*
+        // between what it used to hold and what it holds now: the edges in
+        // `overflowed` are already counted, and re-adding the survivors of that
+        // set would count them twice — which silently inflates every count and
+        // makes every node look safely multiply-connected.
+        for &node in &overflowed {
+            if !kept.contains(&node) {
+                self.in_degree[layer][node as usize] -= 1;
+            }
+        }
+        if kept.contains(&id) {
+            self.in_degree[layer][id as usize] += 1;
+        }
+        self.neighbors[layer][neighbour as usize] = kept;
         Ok(())
+    }
+
+    /// The paper's Algorithm 4, `SELECT-NEIGHBORS-HEURISTIC`, as hnswlib's
+    /// `getNeighborsByHeuristic2` implements it.
+    ///
+    /// Walks the candidates nearest-first and keeps one only if it is **not
+    /// closer to an already-kept neighbour than it is to `origin`**. `origin`
+    /// is the element whose edge list is being chosen: the new node on its own
+    /// edge list, or the overflowing node on a back-link. It is a real parameter
+    /// and it is load-bearing. An earlier version took `candidates[0]` instead,
+    /// which made the reference point slide along with the walk, so the filter
+    /// answered "is this candidate nearer to *the first candidate* than to the
+    /// node?" rather than the question the algorithm asks. That is a subtle
+    /// difference that strands nodes: see [`HnswIndex`].
+    ///
+    /// The second caller's case is why the caller filters rather than appending.
+    /// hnswlib's `updatePoint` and `mutuallyConnectNewElement` both
+    /// `emplace(d_max, cur_c)` — the new element, at its true distance from the
+    /// node being pruned — and run the heuristic over the whole thing, so the new
+    /// back edge is measured and filtered on the same terms as everything already
+    /// there. [`HnswIndex::link_and_prune`] instead decides *before* calling
+    /// this: a candidate whose in-degree is 1 is held back from the pool
+    /// entirely, because the heuristic would be free to drop it and a drop there
+    /// is what strands a node. The two routes reach the same place, but only one
+    /// of them can protect an edge that the heuristic would otherwise reject.
+    ///
+    /// # The floors, and why they are not the fix
+    ///
+    /// A diversity filter can reject everything (a perfectly symmetric cluster),
+    /// and the result must not be an empty edge list: a node with no edges cannot
+    /// be routed through, and a node nobody links *back* to is unreachable at
+    /// every `ef`. So there are two floors — fall back to the nearest `limit` if
+    /// the filter kept nothing, and accept a short list otherwise. Both are
+    /// reachability guards, and neither substitutes for a correct reference
+    /// point: getting the heuristic right is what makes the graph navigable, and
+    /// the floors only stop the pathological symmetric case from producing a
+    /// *worse* one.
+    ///
+    /// `limit` here is the number of *free* slots the caller has left, which is
+    /// not necessarily `m`: [`HnswIndex::link_and_prune`] passes what remains
+    /// after the protected edges have claimed their share.
+    fn select_neighbors(
+        &self,
+        layer: usize,
+        origin: u32,
+        candidates: Vec<u32>,
+        limit: usize,
+    ) -> Result<Vec<u32>, SearchError> {
+        let _ = layer;
+        // A candidate list that already fits needs no filter, and running one
+        // would only throw away edges that fit. hnswlib short-circuits the same
+        // way (`if (top_candidates.size() < M) return;`), except that it
+        // compares against `M` where its own-link callers have already bounded
+        // the list by `Mcurmax`, so its `M_` check can pass even on an
+        // overflow. This module bounds the list at the call site instead, so the
+        // short-circuit here is exact.
+        if candidates.len() <= limit {
+            return Ok(candidates);
+        }
+
+        let mut ordered: Vec<Candidate> = Vec::with_capacity(candidates.len());
+        for &node in &candidates {
+            if node == origin {
+                continue;
+            }
+            ordered.push(Candidate {
+                distance: self.distance_between(origin, node)?,
+                id: node,
+            });
+        }
+        // Nearest first, so the walk below considers candidates in the order
+        // the paper specifies and the accepted set only ever grows.
+        ordered.sort_unstable();
+
+        let mut kept: Vec<Candidate> = Vec::with_capacity(limit);
+        for candidate in ordered.iter().copied() {
+            if kept.len() >= limit {
+                break;
+            }
+            // Keep this candidate only if it is at least as near to `origin` as
+            // to every neighbour already kept — i.e. it opens a direction the
+            // kept set does not already cover. `candidate.distance` is the
+            // distance to `origin`, recomputed once above and carried here, so
+            // the comparison is against the same number for every `chosen`.
+            let mut redundant = false;
+            for chosen in &kept {
+                if self.distance_between(candidate.id, chosen.id)? < candidate.distance {
+                    redundant = true;
+                    break;
+                }
+            }
+            if !redundant {
+                kept.push(candidate);
+            }
+        }
+        // A diversity filter can reject everything (a perfectly symmetric
+        // cluster), which would leave the node with no edges at all and strand
+        // it. Falling back to the nearest `limit` keeps the graph connected, so
+        // this is a floor on connectivity rather than a way to drop a node.
+        if kept.is_empty() {
+            kept = ordered.into_iter().take(limit).collect();
+        }
+        Ok(kept.into_iter().map(|c| c.id).collect())
     }
 }
 
@@ -1182,6 +1758,23 @@ impl QuantizationReport {
 /// caused by the quantization, because no integer accumulation, no saturation,
 /// and no f32 rounding is in the path to perturb it. An int8 kernel would add
 /// its own, separate error on top.
+///
+/// **The int8 form buys memory, not speed, and the two search paths here are
+/// slower than the [`FlatIndex`] they replace.** Each query walks every stored
+/// row and calls [`QuantizedIndex::dequantize`], which allocates a fresh
+/// `Vec<f64>` per row: `n` heap allocations and `n * dim` float conversions per
+/// query, on top of the metric itself. A scan over this index is strictly more
+/// work than a scan over the flat one, not less. That is the deliberate trade for
+/// the error report, but it means the type must not be read as the fast path —
+/// it sits next to an [`HnswIndex`] whose entire purpose is not touching every
+/// row, and the two are not alternatives to each other. The memory saving is
+/// real and reported as [`QuantizationReport::compression`]; the speed is not
+/// claimed anywhere.
+///
+/// [`HnswIndex`] is built from a [`FlatIndex`], not from this type, because a
+/// graph over approximated vectors would add the quantization error to every
+/// *navigated* distance as well as to every reported one, and the reported
+/// numbers would no longer be attributable to the quantization alone.
 #[derive(Debug, Clone)]
 pub struct QuantizedIndex {
     quantized: Vec<Vec<i8>>,
@@ -1274,14 +1867,19 @@ impl QuantizedIndex {
     /// A caller who wants to isolate the storage error asks for
     /// [`QuantizedIndex::search_with_exact_query`].
     pub fn search(&self, query: &[f64], k: usize) -> Result<Vec<Neighbor>, SearchError> {
-        let (row, _) = quantize_vector(query)?;
-        self.search_codes(&row, k)
+        let (row, scale) = quantize_vector(query)?;
+        self.search_codes(&row, scale, k)
     }
 
     /// The `k` nearest vectors, keeping the query in `f64`.
     ///
     /// Isolates the error introduced by the *stored* vectors, which is the part
     /// [`QuantizationReport::max_reconstruction_error`] measures.
+    ///
+    /// **Every row is dequantized on every query**, one `Vec` allocation each —
+    /// see the type docs. This is a correctness-and-fidelity path, not a fast
+    /// one; a caller that has measured the error and found it acceptable should
+    /// hold the dequantized rows itself rather than pay this per query.
     pub fn search_with_exact_query(
         &self,
         query: &[f64],
@@ -1295,7 +1893,14 @@ impl QuantizedIndex {
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k + 1);
         for id in 0..self.quantized.len() {
             let distance = self.metric.distance(query, &self.dequantize(id))?;
-            push_candidate(&mut heap, Candidate { distance, id: id as u32 }, k);
+            push_candidate(
+                &mut heap,
+                Candidate {
+                    distance,
+                    id: id as u32,
+                },
+                k,
+            );
         }
         Ok(heap
             .into_sorted_vec()
@@ -1308,7 +1913,22 @@ impl QuantizedIndex {
     }
 
     /// [`QuantizedIndex::search`] over already-quantized query codes.
-    pub fn search_codes(&self, query: &[i8], k: usize) -> Result<Vec<Neighbor>, SearchError> {
+    ///
+    /// `scale` is the step the codes were produced with. **It is a required
+    /// argument and cannot be recovered from the codes**, because an `i8` row
+    /// records only the shape of a vector, not its magnitude: a row of all 127s
+    /// is the same row whether the original was all 0.01 or all 100. This is
+    /// the one thing the int8 storage genuinely does not carry, and it is why
+    /// [`QuantizedIndex::search`] — which quantizes and keeps the scale
+    /// together — is the normal entry point. This method exists for a caller
+    /// that has the codes and the scale already, e.g. a virtual table loading a
+    /// `vec0`-style blob.
+    pub fn search_codes(
+        &self,
+        query: &[i8],
+        scale: f64,
+        k: usize,
+    ) -> Result<Vec<Neighbor>, SearchError> {
         if self.is_empty() || k == 0 {
             return Ok(Vec::new());
         }
@@ -1319,9 +1939,13 @@ impl QuantizedIndex {
                 found: query.len(),
             });
         }
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(SearchError::Config(format!(
+                "query scale must be finite and positive, got {scale}"
+            )));
+        }
         // The query is dequantized once, not per row: it has a single scale, and
         // recomputing it inside the loop would be the same number every time.
-        let scale = query_scale(query);
         let dequantized: Vec<f64> = query.iter().map(|&q| q as f64 * scale).collect();
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k + 1);
         for id in 0..self.quantized.len() {
@@ -1383,23 +2007,6 @@ fn push_candidate(heap: &mut BinaryHeap<Candidate>, candidate: Candidate, k: usi
             heap.pop();
             heap.push(candidate);
         }
-    }
-}
-
-/// The step size shared by a vector's codes, recovered from the codes alone.
-///
-/// A quantized query is a row of `i8` with no scale beside it, so the scale has
-/// to come back out of the row. `max|q| / 127` inverts the encoding exactly when
-/// the largest component saturated to 127, which it does whenever the vector
-/// has any component at its own maximum — which is the definition of the scale.
-/// A row of all zeros is the exception and has no scale to recover; it gets 1.0
-/// and dequantizes to all zeros, which is the right answer.
-fn query_scale(query: &[i8]) -> f64 {
-    let peak = query.iter().map(|q| (*q as i32).abs()).max().unwrap_or(0);
-    if peak == 0 {
-        1.0
-    } else {
-        peak as f64 / 127.0
     }
 }
 

@@ -60,6 +60,7 @@ fn a_star_expands_later() {
             join: None,
             on: None,
             using: vec![],
+            natural: false,
             indexed_by: None,
         })
     );
@@ -507,6 +508,21 @@ fn from_items(sql: &str) -> Vec<String> {
     }
 }
 
+/// The FROM items of a SELECT, as the table references they are, so a test can
+/// assert on a field the text form does not carry.
+fn from_tables(sql: &str) -> Vec<TableRef> {
+    match select_body(sql) {
+        SelectBody::Simple { from, .. } => from
+            .iter()
+            .map(|f| match f {
+                FromItem::Table(t) => t.clone(),
+                FromItem::Subquery { .. } => panic!("{sql} has a subquery in FROM"),
+            })
+            .collect(),
+        other => panic!("expected a simple body, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_comma_from_carries_no_join_operator() {
     // sqlite3 parses `a, b` as two items with no operator on either, because a
@@ -635,14 +651,46 @@ fn an_unknown_join_type_says_so() {
 }
 
 #[test]
-fn a_natural_join_is_recognised_and_refused() {
-    // sqlite3 parses NATURAL; this engine does not execute it, so the failure has
-    // to name the feature rather than report a syntax error the user cannot act
-    // on.
-    assert_eq!(
-        err("SELECT * FROM a NATURAL JOIN b").message,
-        "NATURAL JOIN is not supported yet"
-    );
+fn a_natural_join_is_parsed_in_every_position() {
+    // NATURAL is a modifier in front of any join type, and the executor derives
+    // its column list from the catalog, so all the parser records is the flag
+    // and the operator. `SELECT * FROM a NATURAL LEFT JOIN b` used to be a
+    // syntax error at the NATURAL keyword while the bare form parsed, which is
+    // the inconsistency this pins shut.
+    for (sql, kind) in [
+        ("SELECT * FROM a NATURAL JOIN b", "Some(Inner)"),
+        ("SELECT * FROM a NATURAL LEFT JOIN b", "Some(Left)"),
+        ("SELECT * FROM a NATURAL LEFT OUTER JOIN b", "Some(Left)"),
+        ("SELECT * FROM a NATURAL RIGHT JOIN b", "Some(Right)"),
+        ("SELECT * FROM a NATURAL FULL OUTER JOIN b", "Some(Full)"),
+        ("SELECT * FROM a NATURAL INNER JOIN b", "Some(Inner)"),
+        ("SELECT * FROM a NATURAL CROSS JOIN b", "Some(Cross)"),
+        // The type may also come first: SQLite reads both orders as the same
+        // operator.
+        ("SELECT * FROM a LEFT NATURAL JOIN b", "Some(Left)"),
+    ] {
+        let tref = &from_tables(sql)[1];
+        assert!(tref.natural, "{sql} should be NATURAL");
+        assert_eq!(format!("{:?}", tref.join), kind, "for {sql}");
+    }
+}
+
+#[test]
+fn a_natural_join_may_not_carry_a_constraint() {
+    // SQLite names the combination rather than accepting it and ignoring one of
+    // the two, and the wording is the suite's to match.
+    for sql in [
+        "SELECT * FROM a NATURAL JOIN b ON a.x = b.x",
+        "SELECT * FROM a NATURAL JOIN b USING(x)",
+        "SELECT * FROM a NATURAL LEFT JOIN b ON a.x = b.x",
+        "SELECT * FROM a NATURAL LEFT JOIN b USING(x)",
+    ] {
+        assert_eq!(
+            err(sql).message,
+            "a NATURAL join may not have an ON or USING clause",
+            "for {sql}"
+        );
+    }
 }
 
 #[test]

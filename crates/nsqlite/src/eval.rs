@@ -67,11 +67,7 @@ impl<'a> EvalCtx<'a> {
 pub fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Result<Value> {
     match expr {
         Expr::Literal(lit) => eval_literal(lit, ctx),
-        Expr::Column {
-            table,
-            name,
-            span,
-        } => {
+        Expr::Column { table, name, span } => {
             // A join resolves every reference before the statement runs, so a
             // resolved reference is read straight from the joined row and the
             // bare-name lookup below is never reached. The start offset
@@ -716,7 +712,13 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
             expect_arity(name, args, 1)?;
             Ok(match &args[0] {
                 Value::Null => Value::Null,
-                Value::Integer(i) => Value::Integer(i.wrapping_abs()),
+                // wrapping_abs on i64::MIN gives i64::MIN back, so the
+                // magnitude of the most negative integer has to come from the
+                // float path rather than wrapping.
+                Value::Integer(i) => match i.checked_abs() {
+                    Some(v) => Value::Integer(v),
+                    None => Value::real(-(*i as f64)),
+                },
                 Value::Real(r) => Value::real(r.abs()),
                 other => numeric_of(other),
             })
@@ -840,29 +842,66 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
                 other => other.to_string(),
             };
             let chars: Vec<char> = s.chars().collect();
-            // A negative start counts from the end, and a start of 0 behaves
-            // like 1, which is the off-by-one the documentation calls out.
+            let len = chars.len() as i64;
             let start_raw = as_index(&args[1])?;
-            // A negative start counts back from the end, so -3 of "hello" is
-            // the third character from the end. A start of zero behaves as one.
-            let start = if start_raw < 0 {
-                (chars.len() as i64 + start_raw).max(0) as usize
-            } else {
-                start_raw.max(1) as usize - 1
-            };
             let n = if args.len() == 3 {
                 as_index(&args[2])?
             } else {
                 -1
             };
-            let (from, to) = if n < 0 {
-                // No length, or a negative one, runs to the end.
-                (start, chars.len())
+            // Everything is in SQLite's 1-based positions, where the start
+            // counts the first character as 1 and a negative one counts back
+            // from the end. `from` and `to` below are 0-based indices into
+            // `chars`.
+            //
+            // Two cases are not the obvious one, and both were checked against
+            // sqlite3 3.53.4 over a sweep of every start and length rather than
+            // recalled:
+            //
+            //  * Position 0 is the slot *before* the first character, not a
+            //    synonym for position 1, so a length counts from there and
+            //    spends one character on it: substr('hello',0,2) is 'h' while
+            //    substr('hello',1,2) is 'he'.
+            //
+            //  * A negative length is not a window running to the end. It is the
+            //    |n| characters ending immediately *before* the start position:
+            //    substr('abcdef',3,-2) is 'ab' and substr('abcdef',4,-2) is
+            //    'bc'. The start still decides where the window sits; only its
+            //    end moves backwards.
+            //
+            // A positive start counts the first character as 1, so its 0-based
+            // index is one less; zero is the slot before the string, so it
+            // stays at 0. A negative start counts back from the end and lands
+            // on a 0-based index directly -- and is NOT clamped up to 0: a
+            // start before the beginning is past the end of the window in the
+            // other direction, so substr('hello',-10,1) is empty where
+            // substr('hello',-5,1) is 'h'. Clamping it to 0 would silently
+            // return a character from the front instead.
+            let start0 = if start_raw < 0 {
+                len + start_raw
             } else {
-                (start, (start + n as usize).min(chars.len()))
+                (start_raw - 1).max(0)
             };
+            let (from, to) = if args.len() == 3 && n < 0 {
+                // The window ends just before the start, and is |n| long.
+                let k = -n;
+                let to = if start_raw == 0 { 0 } else { start0 };
+                let from = (to - k).max(0);
+                (from, to)
+            } else {
+                let from = start0;
+                let to = if args.len() == 3 {
+                    // Position 0 spends its first character on the slot before
+                    // the string, so it yields one fewer character.
+                    from + if start_raw == 0 { (n - 1).max(0) } else { n }
+                } else {
+                    len
+                };
+                (from, to)
+            };
+            let (from, to) = (from.clamp(0, len), to.clamp(from.clamp(0, len), len));
             let out = chars
-                .get(from.min(chars.len())..to.max(from).min(chars.len()))
+                .get(from as usize..to as usize)
                 .map(|c| c.iter().collect::<String>())
                 .unwrap_or_default();
             Ok(Value::Text(out))
@@ -935,6 +974,8 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
             if args.len() == 2 {
                 return Ok(Value::Text(Value::real(r).to_string()));
             }
+            // A real even for a whole number: sqlite3 reports typeof as
+            // 'real' for round(-5).
             Ok(Value::real(r))
         }
         "min" | "max" => {
@@ -944,13 +985,16 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
                     format!("wrong number of arguments to function {lname}()"),
                 ));
             }
+            // The scalar min and max are NULL if any argument is NULL, which is
+            // what SQLite does: `SELECT min(NULL, 1)` is NULL, not 1. The
+            // *aggregate* min and max are the opposite — they skip NULLs — and
+            // the two are distinguished by arity, since a one-argument min is
+            // the fold and this is only reached with two or more.
+            if args.iter().any(|a| a.is_null()) {
+                return Ok(Value::Null);
+            }
             let mut best: Option<Value> = None;
             for a in args {
-                // A NULL is ignored rather than poisoning the result, and an
-                // all-NULL call yields NULL.
-                if a.is_null() {
-                    continue;
-                }
                 best = Some(match best {
                     None => a.clone(),
                     Some(cur) => {
@@ -969,9 +1013,14 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
             }
             Ok(best.unwrap_or(Value::Null))
         }
+        // The name is reported as it was written, not as the lowercased form
+        // the dispatch matches on. sqlite3 3.53.4 answers `SELECT XYZZY(1)`
+        // with `no such function: XYZZY`, so a test that writes the name in
+        // mixed case and compares the message needs the original spelling.
+        // The arity error above already reads `name` for the same reason.
         _ => Err(Error::new(
             ResultCode::Error,
-            format!("no such function: {lname}"),
+            format!("no such function: {name}"),
         )),
     }
 }
@@ -1042,7 +1091,18 @@ fn quote(v: &Value) -> String {
     match v {
         Value::Null => "NULL".into(),
         Value::Integer(i) => i.to_string(),
-        Value::Real(r) => Value::real(*r).to_string(),
+        // A real always quotes with a decimal point, and `-0.0` is not a thing
+        // sqlite3 will print: `quote(-0.0)` is `0.0`, because the sign of a
+        // negative zero does not survive the conversion to text. The display
+        // format would otherwise give `-0`, which is a string no reader of the
+        // output could parse back into a real.
+        Value::Real(r) if r.is_sign_negative() && *r == 0.0 => "0.0".into(),
+        // A real always quotes with a decimal point, so this has to go through
+        // the same renderer the rest of the engine uses for a real rather than
+        // through `Display`, which writes an integral real as `1` where sqlite3
+        // writes `1.0`. Checked against sqlite3 3.53.4: quote(1.0) is `1.0` and
+        // quote(2451545.0) is `2451545.0`.
+        Value::Real(r) => crate::func_math::real_to_text(*r),
         Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
         Value::Blob(b) => format!("X'{}'", hex(&Value::Blob(b.clone()))),
     }
@@ -1261,15 +1321,62 @@ mod tests {
     fn substr_handles_a_negative_start() {
         assert_eq!(ok("substr('hello', -3)"), Value::Text("llo".into()));
         assert_eq!(ok("substr('hello', -3, 2)"), Value::Text("ll".into()));
-        // A start of zero behaves as one.
-        assert_eq!(ok("substr('hello', 0, 2)"), Value::Text("he".into()));
+        // A start before the beginning is past the end of the window rather
+        // than clamped to the front, so there is nothing to return. Checked
+        // against sqlite3 3.53.4, where substr('hello',-5,1) is 'h' and
+        // substr('hello',-10,1) is empty.
+        assert_eq!(ok("substr('hello', -5, 1)"), Value::Text("h".into()));
+        assert_eq!(ok("substr('hello', -10, 1)"), Value::Text("".into()));
+        assert_eq!(ok("substr('hello', -10, 10)"), Value::Text("hello".into()));
+    }
+
+    /// A start of 0 is the slot *before* the first character, not a synonym for
+    /// 1, so a length counts from there and spends one character on it. All of
+    /// these were read off sqlite3 3.53.4 rather than worked out; the sweep
+    /// they came from is every start from 0 to 8 and every length from 0 to 10
+    /// and -1 to -3, over strings of four different lengths.
+    #[test]
+    fn substr_start_zero_is_before_the_first_character() {
+        assert_eq!(ok("substr('hello', 0, 2)"), Value::Text("h".into()));
+        assert_eq!(ok("substr('hello', 0, 3)"), Value::Text("he".into()));
+        assert_eq!(ok("substr('hello', 0, 4)"), Value::Text("hel".into()));
+        assert_eq!(ok("substr('hello', 0, 0)"), Value::Text("".into()));
+        // A large length still reaches the end of the string.
+        assert_eq!(ok("substr('hello', 0, 10)"), Value::Text("hello".into()));
+        // And it is not the same as starting at 1, which is where the old
+        // clamping treated it.
+        assert_eq!(ok("substr('hello', 1, 2)"), Value::Text("he".into()));
+        assert_eq!(ok("substr('hello', 1, 1)"), Value::Text("h".into()));
+    }
+
+    /// A negative length is the |n| characters ending immediately *before* the
+    /// start, not a window running on to the end. The start still decides where
+    /// the window sits; only its end moves backwards.
+    #[test]
+    fn substr_negative_length_is_a_window_ending_before_the_start() {
+        assert_eq!(ok("substr('abcdef', 3, -2)"), Value::Text("ab".into()));
+        assert_eq!(ok("substr('abcdef', 4, -2)"), Value::Text("bc".into()));
+        assert_eq!(ok("substr('abcdef', 5, -2)"), Value::Text("cd".into()));
+        assert_eq!(ok("substr('abcdef', 2, -2)"), Value::Text("a".into()));
+        assert_eq!(ok("substr('abcdef', 1, -2)"), Value::Text("".into()));
+        // A negative length past the beginning is empty, not the front.
+        assert_eq!(ok("substr('hello', 1, -1)"), Value::Text("".into()));
+        // The two-argument form has no length at all and runs to the end, which
+        // is why the argument count and not the sign is what distinguishes it.
+        assert_eq!(ok("substr('hello', 2)"), Value::Text("ello".into()));
     }
 
     #[test]
-    fn min_max_ignore_nulls() {
-        assert_eq!(ok("min(3, NULL, 1)"), Value::Integer(1));
-        assert_eq!(ok("max(3, NULL, 1)"), Value::Integer(3));
+    fn scalar_min_and_max_are_null_if_any_argument_is() {
+        // Checked against sqlite3 3.53.4, where `min(3, NULL, 1)` is NULL and
+        // not 1: the scalar form propagates a NULL rather than skipping it. The
+        // *aggregate* min and max are the opposite and skip NULLs, which is why
+        // a one-argument min is a fold rather than a scalar call.
+        assert_eq!(ok("min(3, NULL, 1)"), Value::Null);
+        assert_eq!(ok("max(3, NULL, 1)"), Value::Null);
         assert_eq!(ok("min(NULL, NULL)"), Value::Null);
+        assert_eq!(ok("min(3, 1)"), Value::Integer(1));
+        assert_eq!(ok("max(3, 1)"), Value::Integer(3));
     }
 
     #[test]
@@ -1319,6 +1426,31 @@ mod tests {
     fn an_unknown_function_says_so() {
         let e = is_err("nosuchfunction(1)");
         assert!(e.message.contains("no such function"), "got: {}", e.message);
+    }
+
+    /// An unknown function is reported the way it was spelled, not folded to
+    /// lowercase. The tokenizer folds a bare identifier because SQL names are
+    /// case-insensitive, but the message is a quotation of what the user wrote,
+    /// and sqlite3 quotes it exactly.
+    ///
+    /// Every expectation here was read off sqlite3 3.53.4. The quoted forms
+    /// report the name without its quotes, which is what the parser recovers
+    /// from the span.
+    #[test]
+    fn an_unknown_function_keeps_the_case_it_was_written_in() {
+        for (sql, want) in [
+            ("AbC(1)", "no such function: AbC"),
+            ("abC(1)", "no such function: abC"),
+            ("XYZZY(1)", "no such function: XYZZY"),
+            ("\"AbC\"(1)", "no such function: AbC"),
+            ("`AbC`(1)", "no such function: AbC"),
+        ] {
+            assert_eq!(is_err(sql).message, want, "{sql}");
+        }
+        // The name still dispatches case-insensitively, which is the whole
+        // reason the tokenizer folds it in the first place.
+        assert_eq!(ok("ABS(-3)"), Value::Integer(3));
+        assert_eq!(ok("abs(-4)"), Value::Integer(4));
     }
 
     #[test]

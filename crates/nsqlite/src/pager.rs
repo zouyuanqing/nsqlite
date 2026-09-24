@@ -207,8 +207,20 @@ impl Pager {
     ///
     /// The returned borrow points into the cache, so it is invalidated by the
     /// next call to this method; callers must not hold it across a write.
+    ///
+    /// Inside a transaction this is where the page's pre-image is taken, and it
+    /// has to be here rather than in [`Pager::mark_dirty`]: the caller
+    /// overwrites the buffer through the reference this returns, so by the time
+    /// `mark_dirty` runs the old contents are already gone and the journal
+    /// would record the new ones, making a rollback restore the interrupted
+    /// transaction instead of undoing it.
     pub fn page(&mut self, n: u32) -> Result<&mut [u8]> {
         debug_assert!(n > 0, "page numbers are 1-based");
+        if self.journal.is_some() && n > 0 {
+            // Taken before the buffer is handed out, and idempotent: a page
+            // already in the journal keeps the copy that predates the change.
+            let _ = self.journal_page(n);
+        }
         self.clock += 1;
         if !self.cache.contains_key(&n) {
             self.fetch(n)?;
@@ -230,13 +242,13 @@ impl Pager {
 
     /// Marks page `n` dirty so the next [`Pager::flush`] writes it out.
     ///
-    /// Inside a transaction the page's current contents go into the journal
-    /// first, which is the only point where the pre-image still exists: once
-    /// the page has been modified, what it held before is gone.
+    /// The page's pre-image is taken in [`Pager::page`], before the caller can
+    /// modify it. Capturing it here instead would record the page's already
+    /// modified contents, so a rollback would put the interrupted transaction
+    /// back rather than undoing it. A page allocated during a transaction is
+    /// the exception: it did not exist before, so there is nothing to record,
+    /// and the file is shortened to its old size on a rollback.
     pub fn mark_dirty(&mut self, n: u32) {
-        if self.journal.is_some() && n > 0 {
-            let _ = self.journal_page(n);
-        }
         if let Some((_, origin, _)) = self.cache.get_mut(&n) {
             *origin = Origin::Dirty;
         }
@@ -515,8 +527,21 @@ impl Pager {
             self.truncate(hot.original_size())?;
         }
         hot.finish()?;
-        self.write_header()?;
-        self.flush()?;
+        // The restored pages went straight to the file, so there is nothing in
+        // the cache to flush -- and writing the header back here would be
+        // actively wrong. `self.header` was parsed from the *crashed* page 1,
+        // so `write_header` would re-apply the interrupted transaction's
+        // change counter, freelist_trunk, freelist_count, schema cookie and
+        // version-valid-for over the pre-image the journal just put back. An
+        // interrupted DROP TABLE is the case that shows it: the pre-image
+        // clears the freelist, the re-applied header keeps the trunk page the
+        // DROP freed, and the recovered file names a page that now holds a
+        // b-tree page image. Real sqlite3 calls that corrupt --
+        // `PRAGMA integrity_check` reports "Freelist: 2nd reference to page N"
+        // and then the next write clobbers a live page. Re-read the restored
+        // page 1 and leave the file byte for byte as the journal wrote it,
+        // which is what sqlite3 does: it restores the file exactly.
+        self.load_header()?;
         Ok(())
     }
 

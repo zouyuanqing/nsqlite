@@ -19,3 +19,8 @@ test/sqlite-run/
 # Per-run scratch from the suite runner and the agents that drive it.
 test/sqlite-run/
 *.tcl.out
+
+# The suite shim runs a test file in the working directory; stray copies of
+# the suite's own .test files land here.
+*.test
+*.tcl

@@ -113,26 +113,18 @@ pub fn apply(value: &crate::value::Value, affinity: Affinity) -> crate::value::V
             },
             Value::Real(r) if affinity == Affinity::Integer => {
                 // A real converts to an integer only when nothing is lost.
-                if r.fract() == 0.0
-                    && r.is_finite()
-                    && *r >= i64::MIN as f64
-                    && *r <= i64::MAX as f64
-                {
-                    Value::Integer(*r as i64)
-                } else {
-                    value.clone()
+                match lossless_int(*r) {
+                    Some(i) => Value::Integer(i),
+                    None => value.clone(),
                 }
             }
-            Value::Real(r)
-                if affinity == Affinity::Numeric && r.fract() == 0.0 && r.is_finite() =>
-            {
+            Value::Real(r) if affinity == Affinity::Numeric => {
                 // NUMERIC keeps the real part when one is present and otherwise
                 // narrows to an integer, which is what makes a NUMERIC column
                 // hold integers for whole values.
-                if *r >= i64::MIN as f64 && *r <= i64::MAX as f64 {
-                    Value::Integer(*r as i64)
-                } else {
-                    value.clone()
+                match lossless_int(*r) {
+                    Some(i) => Value::Integer(i),
+                    None => value.clone(),
                 }
             }
             // A REAL column holds a real even for a whole number: verified
@@ -144,13 +136,37 @@ pub fn apply(value: &crate::value::Value, affinity: Affinity) -> crate::value::V
     }
 }
 
-/// A number parsed from text, remembering whether it had a fractional part, so
-/// a REAL-affinity column can reject an integer spelling.
+/// The integer a real converts to, or `None` when that would lose something.
+///
+/// SQLite does not test `r.fract() == 0.0`; it narrows and asks whether
+/// converting back reproduces the real. That is a looser test than "has no
+/// fractional part", and the difference is visible: every `f64` at or above
+/// 2^53 is a whole number with a fraction below the ulp, so `fract() == 0.0`
+/// is true for all of them -- but not all of them fit an `i64`, and the ones
+/// that do not must stay real. Verified against sqlite3 3.53.4:
+///
+/// ```text
+/// INSERT INTO t VALUES('9223372036854774784.0');  -- integer
+/// INSERT INTO t VALUES('9223372036854775807.0');  -- real 9.2233720368547758e+18
+/// ```
+///
+/// The `2^53` boundary is where the round trip starts to matter: below it an
+/// `f64` that looks whole always is one, and above it a real may be whole in
+/// appearance and still not name an `i64`.
+fn lossless_int(r: f64) -> Option<i64> {
+    if !r.is_finite() || r < i64::MIN as f64 || r >= -(i64::MIN as f64) {
+        return None;
+    }
+    let i = r as i64;
+    (i as f64 == r).then_some(i)
+}
+
+/// A number parsed from text, remembering whether it named an integer exactly,
+/// so a REAL-affinity column can render `5.0` where an INTEGER would render `5`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Number {
     integer: Option<i64>,
     real: f64,
-    is_real: bool,
 }
 
 /// Parses text as a number, or returns `None` if it is not entirely numeric.
@@ -162,40 +178,41 @@ fn text_to_number(s: &str) -> Option<Number> {
     if t.is_empty() {
         return None;
     }
-    // A hex literal is not a number in this context: SQLite does not accept
-    // 0x10 as a numeric value when applying affinity.
-    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return i64::from_str_radix(hex, 16).ok().map(|i| Number {
-            integer: Some(i),
-            real: i as f64,
-            is_real: false,
-        });
-    }
+    // A hex literal is not a number in this context, and affinity agrees:
+    // sqlite3 leaves the text '0x10' alone in an INTEGER column, so the branch
+    // that used to parse it as 16 contradicts the comment above it and the
+    // engine. Verified against sqlite3 3.53.4 -- `typeof` is 'text' for every
+    // affinity when the value is the string '0x10'. The 0x form is a *literal*
+    // spellings rule, applied by the parser, not an affinity rule.
     // Reject anything Rust would accept but SQLite would not, so the two
     // parsers agree.
     if t.chars()
         .any(|c| matches!(c, 'n' | 'N' | 'i' | 'I' | 'x' | 'X' | '_'))
-        && !t.starts_with("0x")
-        && !t.starts_with("0X")
     {
         return None;
     }
-    let has_fraction = t.contains('.') || t.contains('e') || t.contains('E');
     if let Ok(i) = t.parse::<i64>() {
         return Some(Number {
             integer: Some(i),
             real: i as f64,
-            is_real: false,
         });
     }
-    match t.parse::<f64>() {
-        Ok(f) if f.is_finite() => Some(Number {
-            integer: None,
-            real: f,
-            is_real: has_fraction,
-        }),
-        _ => None,
+    // A spelling with a fraction or an exponent that lands on a whole number is
+    // still an integer where the round trip is exact: sqlite3 stores '5.0',
+    // '-5.0' and '1e3' as integers in a NUMERIC column. This is the text
+    // counterpart of `lossless_int`, and it has to be tried after the `i64`
+    // parse so a plain '5' keeps its exact integer.
+    let f = t.parse::<f64>().ok()?;
+    if !f.is_finite() {
+        // 'inf' and 'nan' are text to sqlite3, not numbers. The character
+        // filter above already rejects the spellings that reach here as whole
+        // words, so this only catches a numeric overflow such as '1e400'.
+        return None;
     }
+    Some(Number {
+        integer: lossless_int(f),
+        real: f,
+    })
 }
 
 impl Number {
@@ -205,10 +222,6 @@ impl Number {
             Some(i) => crate::value::Value::Integer(i),
             None => crate::value::Value::real(self.real),
         }
-    }
-
-    fn is_real(self) -> bool {
-        self.is_real
     }
 
     /// The value as a real, which is what a REAL column stores even for a whole
@@ -366,6 +379,111 @@ mod tests {
         assert_eq!(
             apply(&Value::real(4.5), Affinity::Numeric),
             Value::real(4.5)
+        );
+    }
+
+    /// A whole real narrows to an integer when the `f64` -> `i64` -> `f64`
+    /// round trip is exact, which is a different test from "has no fractional
+    /// part" once the real is large enough that its ulp exceeds 1.
+    ///
+    /// The spellings are taken from sqlite3 3.53.4, where each of these was
+    /// inserted into a NUMERIC column and `typeof` read back.
+    #[test]
+    fn numeric_affinity_narrows_on_exactness_not_on_frac() {
+        // The ones that round trip: every spelling of a whole number becomes an
+        // integer, fraction, exponent, sign, padding or not. The expected value
+        // is spelled out rather than parsed, so the test states the answer
+        // instead of re-running the parser it is checking.
+        for (s, want) in [
+            ("5.0", 5i64),
+            ("-5.0", -5),
+            ("5.00", 5),
+            ("5.", 5),
+            (".0", 0),
+            ("0.0", 0),
+            ("5e0", 5),
+            ("1e3", 1000),
+            (" 5.0 ", 5),
+            ("+5.0", 5),
+            ("0", 0),
+        ] {
+            assert_eq!(
+                apply(&Value::Text(s.into()), Affinity::Numeric),
+                Value::Integer(want),
+                "{s:?}"
+            );
+            assert_eq!(
+                apply(&Value::Text(s.into()), Affinity::Integer),
+                Value::Integer(want),
+                "{s:?}"
+            );
+        }
+        // A real that does not fit an i64 stays real even though it is whole in
+        // appearance: 9223372036854775807 as an f64 is 2^63, one past i64::MAX.
+        let past_max = 9223372036854775807.0f64;
+        assert_eq!(
+            apply(&Value::real(past_max), Affinity::Numeric),
+            Value::real(past_max)
+        );
+        assert_eq!(
+            apply(&Value::real(past_max), Affinity::Integer),
+            Value::real(past_max)
+        );
+        // The largest double that does name an i64 does narrow.
+        let fits = 9223372036854774784.0f64;
+        assert_eq!(
+            apply(
+                &Value::Text("9223372036854774784.0".into()),
+                Affinity::Numeric
+            ),
+            Value::Integer(9223372036854774784)
+        );
+        assert_eq!(
+            apply(&Value::real(fits), Affinity::Numeric),
+            Value::Integer(9223372036854774784)
+        );
+        // A fraction stays a fraction.
+        for a in [Affinity::Numeric, Affinity::Integer] {
+            assert_eq!(apply(&Value::Text("0.5".into()), a), Value::real(0.5));
+            assert_eq!(apply(&Value::Text("-0.5".into()), a), Value::real(-0.5));
+            assert_eq!(apply(&Value::real(0.5), a), Value::real(0.5));
+        }
+        // An infinite real is not an integer. sqlite3 renders an out-of-range
+        // exponent as Inf and keeps it real.
+        assert_eq!(
+            apply(&Value::real(f64::INFINITY), Affinity::Numeric),
+            Value::real(f64::INFINITY)
+        );
+    }
+
+    /// The `0x` form is a literal spelling, not an affinity rule: sqlite3
+    /// leaves the *string* `0x10` as text in an INTEGER column. Verified
+    /// against sqlite3 3.53.4, where `typeof` is `text` for all four
+    /// affinities.
+    #[test]
+    fn affinity_leaves_a_hex_spelled_string_as_text() {
+        for a in [
+            Affinity::Integer,
+            Affinity::Numeric,
+            Affinity::Real,
+            Affinity::Text,
+            Affinity::Blob,
+        ] {
+            assert_eq!(
+                apply(&Value::Text("0x10".into()), a),
+                Value::Text("0x10".into()),
+                "{a}"
+            );
+        }
+    }
+
+    /// Text that overflows a real is text, not `Inf`: sqlite3 keeps `1e400` as
+    /// text in a NUMERIC column rather than converting it to an infinity.
+    #[test]
+    fn affinity_leaves_an_unrepresentable_real_as_text() {
+        assert_eq!(
+            apply(&Value::Text("1e400".into()), Affinity::Numeric),
+            Value::Text("1e400".into())
         );
     }
 

@@ -25,7 +25,7 @@ use crate::value::Value;
 /// CREATE TABLE t(a,b);
 /// INSERT INTO t VALUES(1,'x'),(2,'y'),(3,'x'),(NULL,'z'),(5,'y');
 /// ```
-fn fixture() -> Connection {
+pub(crate) fn fixture() -> Connection {
     let mut c = Connection::open_memory().unwrap();
     run(&mut c, "CREATE TABLE t(a, b)");
     run(
@@ -42,7 +42,7 @@ fn empty() -> Connection {
     c
 }
 
-fn run(c: &mut Connection, sql: &str) -> Outcome {
+pub(crate) fn run(c: &mut Connection, sql: &str) -> Outcome {
     c.execute_script(sql)
         .unwrap_or_else(|e| panic!("{sql:?} failed: {e}"))
         .into_iter()
@@ -50,33 +50,30 @@ fn run(c: &mut Connection, sql: &str) -> Outcome {
         .unwrap()
 }
 
-fn query(c: &mut Connection, sql: &str) -> (Vec<String>, Vec<Vec<Value>>) {
+pub(crate) fn query(c: &mut Connection, sql: &str) -> (Vec<String>, Vec<Vec<Value>>) {
     match run(c, sql) {
-        Outcome::Query { columns, rows } => (
-            columns,
-            rows.into_iter().map(|r| r.values).collect(),
-        ),
+        Outcome::Query { columns, rows } => (columns, rows.into_iter().map(|r| r.values).collect()),
         other => panic!("expected a query, got {other:?}"),
     }
 }
 
-fn rows(c: &mut Connection, sql: &str) -> Vec<Vec<Value>> {
+pub(crate) fn rows(c: &mut Connection, sql: &str) -> Vec<Vec<Value>> {
     query(c, sql).1
 }
 
-fn error(c: &mut Connection, sql: &str) -> String {
+pub(crate) fn error(c: &mut Connection, sql: &str) -> String {
     c.execute_script(sql).unwrap_err().message
 }
 
-fn ints(v: &[i64]) -> Vec<Value> {
+pub(crate) fn ints(v: &[i64]) -> Vec<Value> {
     v.iter().map(|i| Value::Integer(*i)).collect()
 }
 
-fn text(s: &str) -> Value {
+pub(crate) fn text(s: &str) -> Value {
     Value::Text(s.into())
 }
 
-fn real(r: f64) -> Value {
+pub(crate) fn real(r: f64) -> Value {
     Value::real(r)
 }
 
@@ -150,7 +147,10 @@ fn having_keeps_the_groups_that_pass() {
             &mut c,
             "SELECT b, count(*) FROM t GROUP BY b HAVING count(*) >= 2"
         ),
-        [vec![text("x"), Value::Integer(2)], vec![text("y"), Value::Integer(2)]]
+        [
+            vec![text("x"), Value::Integer(2)],
+            vec![text("y"), Value::Integer(2)]
+        ]
     );
 }
 
@@ -371,7 +371,10 @@ fn a_bare_aggregate_over_no_rows_still_produces_a_row() {
 fn the_empty_set_results_are_null_except_count() {
     let mut c = empty();
     assert_eq!(
-        rows(&mut c, "SELECT sum(a), avg(a), min(a), max(a), count(*) FROM t"),
+        rows(
+            &mut c,
+            "SELECT sum(a), avg(a), min(a), max(a), count(*) FROM t"
+        ),
         [vec![
             Value::Null,
             Value::Null,
@@ -457,7 +460,11 @@ fn count_star_and_count_column_differ_on_nulls() {
     let mut c = fixture();
     assert_eq!(
         rows(&mut c, "SELECT count(*), count(a), count(b) FROM t"),
-        [vec![Value::Integer(5), Value::Integer(4), Value::Integer(5)]]
+        [vec![
+            Value::Integer(5),
+            Value::Integer(4),
+            Value::Integer(5)
+        ]]
     );
 }
 
@@ -649,9 +656,12 @@ fn string_agg_is_group_concat_with_a_required_separator() {
     );
 }
 
-/// `SELECT group_concat(a*2) FROM t GROUP BY b` → `x|2,6, y|4,10`
+/// `SELECT b, group_concat(a*2) FROM t GROUP BY b` → `x|2,6, y|4,10, z|NULL`
 ///
-/// The argument is an expression, and it is evaluated per row before the fold.
+/// The argument is an expression, evaluated per row before the fold. The z
+/// group is here because its only row folds to NULL, not because it was left
+/// out: `a*2` on a NULL `a` is NULL, and a group_concat that saw only NULLs
+/// has nothing to join.
 #[test]
 fn group_concat_takes_an_expression_argument() {
     let mut c = fixture();
@@ -660,6 +670,7 @@ fn group_concat_takes_an_expression_argument() {
         [
             vec![text("x"), text("2,6")],
             vec![text("y"), text("4,10")],
+            vec![text("z"), Value::Null],
         ]
     );
 }
@@ -667,24 +678,28 @@ fn group_concat_takes_an_expression_argument() {
 /// `SELECT sum(a*2) FROM t` → `22`
 #[test]
 fn an_aggregate_argument_is_an_expression() {
-    assert_eq!(rows(&mut fixture(), "SELECT sum(a*2) FROM t"), [ints(&[22])]);
+    assert_eq!(
+        rows(&mut fixture(), "SELECT sum(a*2) FROM t"),
+        [ints(&[22])]
+    );
 }
 
 // --- WHERE, ordering, and the misuse errors -----------------------------
 
-/// `SELECT b, count(*) FROM t WHERE a > 1 GROUP BY b` → `y|2`
+/// `SELECT b, count(*) FROM t WHERE a > 1 GROUP BY b` → `x|1, y|2`
 ///
 /// The WHERE runs before the fold, so it drops rows and the groups are
-/// whatever survives.
+/// whatever survives. `a > 1` keeps (2,'y'), (3,'x') and (5,'y'), which are
+/// two groups: x with one row and y with two.
 #[test]
 fn where_runs_before_grouping() {
     let mut c = fixture();
     assert_eq!(
-        rows(
-            &mut c,
-            "SELECT b, count(*) FROM t WHERE a > 1 GROUP BY b"
-        ),
-        [vec![text("y"), Value::Integer(2)]]
+        rows(&mut c, "SELECT b, count(*) FROM t WHERE a > 1 GROUP BY b"),
+        [
+            vec![text("x"), Value::Integer(1)],
+            vec![text("y"), Value::Integer(2)],
+        ]
     );
 }
 
@@ -738,7 +753,10 @@ fn an_aggregate_in_order_by_needs_a_group() {
 fn an_aggregate_in_order_by_of_a_grouped_query_folds() {
     let mut c = fixture();
     assert_eq!(
-        rows(&mut c, "SELECT b, count(*) FROM t GROUP BY b ORDER BY count(*)"),
+        rows(
+            &mut c,
+            "SELECT b, count(*) FROM t GROUP BY b ORDER BY count(*)"
+        ),
         [
             vec![text("z"), Value::Integer(1)],
             vec![text("x"), Value::Integer(2)],
@@ -800,10 +818,11 @@ fn limit_applies_after_grouping() {
 }
 
 /// `SELECT b, count(*) FROM t GROUP BY b HAVING count(*) > 0 ORDER BY sum(a)`
-/// → `x|2, y|2`
+/// → `z|1, x|2, y|2`
 ///
 /// ORDER BY may name an aggregate the projection did not include; it folds the
-/// group like any other.
+/// group like any other. The z group's sum is NULL, which sorts before every
+/// number, so it leads.
 #[test]
 fn order_by_folds_an_aggregate_the_projection_omits() {
     let mut c = fixture();
@@ -813,6 +832,7 @@ fn order_by_folds_an_aggregate_the_projection_omits() {
             "SELECT b, count(*) FROM t GROUP BY b HAVING count(*) > 0 ORDER BY sum(a)"
         ),
         [
+            vec![text("z"), Value::Integer(1)],
             vec![text("x"), Value::Integer(2)],
             vec![text("y"), Value::Integer(2)],
         ]
@@ -850,7 +870,10 @@ fn a_having_on_a_non_aggregate_query_is_refused() {
 fn a_having_may_name_a_grouping_column() {
     let mut c = fixture();
     assert_eq!(
-        rows(&mut c, "SELECT b, count(*) FROM t GROUP BY b HAVING b = 'x'"),
+        rows(
+            &mut c,
+            "SELECT b, count(*) FROM t GROUP BY b HAVING b = 'x'"
+        ),
         [vec![text("x"), Value::Integer(2)]]
     );
 }

@@ -195,6 +195,11 @@ pub struct TableRef {
     /// The columns a USING clause named, which must be equal across the join
     /// and appear once in the output of a star.
     pub using: Vec<String>,
+    /// Whether the join was written NATURAL, in which case the columns that must
+    /// be equal are the two tables' shared ones rather than a written list.
+    /// The parser cannot work that out — it does not read the catalog — so the
+    /// executor derives the list from the tables it resolves.
+    pub natural: bool,
     pub indexed_by: Option<String>,
 }
 
@@ -334,6 +339,16 @@ pub enum Stmt {
     Begin,
     Commit,
     Rollback,
+    /// `ANALYZE`, which collects planner statistics into `sqlite_stat1`.
+    ///
+    /// It is a statement of its own rather than a member of `Unsupported`
+    /// because it has to *succeed*. The suite uses it to finish a setup block,
+    /// so a syntax error there abandons the whole block and every table it was
+    /// going to create stays missing -- one missing statement turns a hundred
+    /// tests into "no such table". This engine has no statistics to collect
+    /// and no query planner that consults them, so running it changes nothing
+    /// that a query can observe.
+    Analyze,
 }
 
 /// Where an INSERT takes its rows from.
@@ -607,6 +622,16 @@ impl<'a> Parser<'a> {
                 self.skip_to_semicolon()?;
                 Ok(Stmt::Rollback)
             }
+            Some(Token::Keyword(Keyword::Analyze)) => {
+                // ANALYZE optionally names a table or an index to look at, and
+                // optionally an "index-list" argument after that. All of it is
+                // consumed and discarded: this engine collects no statistics.
+                self.advance();
+                while self.peek_token()?.is_some() && !self.eat_punct(Punct::Semicolon)? {
+                    self.advance();
+                }
+                Ok(Stmt::Analyze)
+            }
             Some(Token::Keyword(k)) => {
                 // The keyword is consumed here; leaving it in place would leave
                 // the script loop looking at the same token for ever.
@@ -828,45 +853,68 @@ impl<'a> Parser<'a> {
             // constrained `a CROSS JOIN b ON ...` an inner one. A missing operator
             // with a table still ahead means a comma was consumed and the next
             // table simply cross joins.
-            let kind = if self.eat_punct(Punct::Comma)? {
-                None
+            let (kind, natural) = if self.eat_punct(Punct::Comma)? {
+                (None, false)
             } else {
                 match self.join_operator()? {
-                    Some(kind) => Some(kind),
+                    Some(op) => op,
                     // Neither a comma nor a join operator: the clause is over.
                     None => break,
                 }
             };
             let mut next = self.from_item()?;
+            // A NATURAL join's constraint is the columns the two tables share,
+            // which only the catalog knows, so the parser records that the join
+            // was NATURAL and the executor derives the list. An ON or a USING
+            // alongside NATURAL is a mistake SQLite names outright, and it can
+            // only be seen once the two words have both been read.
+            if natural && self.at_join_constraint() {
+                return Err(Error::new(
+                    crate::error::ResultCode::Error,
+                    "a NATURAL join may not have an ON or USING clause",
+                ));
+            }
             let (on, using) = self.join_constraint()?;
-            set_join(&mut next, kind, on, using)?;
+            if natural {
+                set_natural(&mut next, kind)?;
+            } else {
+                set_join(&mut next, kind, on, using)?;
+            }
             out.push(next);
         }
         Ok(out)
+    }
+
+    /// Whether an ON or a USING clause follows, for the NATURAL check.
+    ///
+    /// Only the two keywords matter, not the clause itself, so this does not
+    /// consume anything.
+    fn at_join_constraint(&self) -> bool {
+        self.at_keyword(Keyword::On) || self.at_keyword(Keyword::Using)
     }
 
     /// The join operator at the cursor, or `None` if the FROM clause ends here.
     ///
     /// `INNER`, `LEFT` and `CROSS` are all written as an optional modifier in
     /// front of `JOIN`, and a bare `JOIN` is an inner join. `OUTER` may follow
-    /// `LEFT` or `INNER` and changes nothing. `NATURAL` is a modifier this engine
-    /// does not execute, but it is recognised here so the failure names the
-    /// unsupported feature rather than a bare syntax error.
-    fn join_operator(&mut self) -> Result<Option<JoinKind>> {
+    /// `LEFT` or `INNER` and changes nothing. `NATURAL` is a modifier in front of
+    /// any of them, and the pair is returned so the caller knows to derive the
+    /// constraint from the columns the two tables share.
+    ///
+    /// The second element says whether `NATURAL` was written, because it decides
+    /// what a following ON or USING means: after `NATURAL` either is an error,
+    /// and without it either is the join's constraint.
+    fn join_operator(&mut self) -> Result<Option<(Option<JoinKind>, bool)>> {
         // A join operator is only one if a `JOIN` follows it. A bare `LEFT` with
         // nothing after it is a table named `left`, which SQLite allows, so
-        // nothing is consumed until the `JOIN` is confirmed.
+        // nothing is consumed until the `JOIN` is confirmed. The same holds for
+        // `NATURAL`, which is also a usable table name.
         let save = self.pos;
-        if self.eat_keyword(Keyword::Natural)? {
-            if self.at_keyword(Keyword::Join) {
-                return Err(Error::new(
-                    crate::error::ResultCode::Error,
-                    "NATURAL JOIN is not supported yet",
-                ));
-            }
-            self.pos = save;
-            return Ok(None);
-        }
+        // `NATURAL` may stand alone in front of `JOIN` or in front of a type, so
+        // it is eaten here and the type loop below runs either way. What decides
+        // whether this is an operator at all is the `JOIN` that has to follow
+        // both: `a natural` is a table called natural, not half a join.
+        //
         // The type is spelled out as text rather than collapsed into a kind
         // first, because SQLite validates the combination of the two words and
         // names the invalid one: `INNER OUTER` is an error, `LEFT OUTER` is not.
@@ -876,6 +924,9 @@ impl<'a> Parser<'a> {
         // matters once an OUTER is actually seen; a bare `INNER JOIN` is legal.
         let mut type_allows_outer = false;
         let mut have_type = false;
+        // `NATURAL LEFT JOIN` and `LEFT NATURAL JOIN` are the same operator, so
+        // it is read here and again after the type has been taken.
+        let natural = self.eat_keyword(Keyword::Natural)?;
         for (kw, k, allows_outer) in [
             (Keyword::Left, JoinKind::Left, true),
             (Keyword::Right, JoinKind::Right, true),
@@ -891,6 +942,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        let natural = natural || self.eat_keyword(Keyword::Natural)?;
         // `OUTER` is only valid after a type that is already an outer join. With
         // no type in front of it, or after a type that is not, the two words
         // together are not a join SQLite knows.
@@ -914,7 +966,7 @@ impl<'a> Parser<'a> {
                 format!("unknown join type: {spelled}"),
             ));
         }
-        Ok(Some(kind))
+        Ok(Some((Some(kind), natural)))
     }
 
     /// The ON or USING constraint that closes a join, if it has one.
@@ -979,6 +1031,7 @@ impl<'a> Parser<'a> {
             join: None,
             on: None,
             using: Vec::new(),
+            natural: false,
             indexed_by,
         }))
     }
@@ -1497,6 +1550,23 @@ impl<'a> Parser<'a> {
     fn after_identifier(&mut self, name: String, span: Span) -> Result<Expr> {
         // A call is an identifier immediately followed by an open paren.
         if self.at_punct(Punct::LParen) {
+            // The tokenizer folds a bare identifier to lowercase, because SQL
+            // names are case-insensitive, but sqlite3 reports an unknown
+            // function the way it was spelled: `SELECT AbC(1)` answers
+            // `no such function: AbC`. So the call takes the name back off the
+            // source by span. A quoted name keeps its case already, and its span
+            // covers the quotes, so the quotes are trimmed here -- sqlite3
+            // answers `SELECT "AbC"(1)` with `no such function: AbC`, without
+            // them.
+            let written = self.sql.get(span.start..span.end).map(|w| {
+                let w = w.trim();
+                w.strip_prefix(['"', '`'])
+                    .and_then(|w| w.strip_suffix(['"', '`']))
+                    .or_else(|| w.strip_prefix('[').and_then(|w| w.strip_suffix(']')))
+                    .unwrap_or(w)
+                    .to_string()
+            });
+            let name = written.unwrap_or(name);
             return self.function_call(name, span);
         }
         // A qualified column is `table.column` or `schema.table.column`.
@@ -2366,6 +2436,26 @@ fn set_join(
             tref.join = kind;
             tref.on = on;
             tref.using = using;
+            Ok(())
+        }
+        FromItem::Subquery { .. } => Err(Error::new(
+            crate::error::ResultCode::Error,
+            "a subquery in FROM is not supported yet",
+        )),
+    }
+}
+
+/// Records a NATURAL join operator on a freshly parsed FROM item.
+///
+/// A NATURAL join has no written constraint: the columns that must be equal are
+/// the two tables' shared ones, and only the executor knows what those are since
+/// it is the one that reads the catalog. So the item records the operator and the
+/// flag, and `sources_from` fills the column list in.
+fn set_natural(item: &mut FromItem, kind: Option<JoinKind>) -> Result<()> {
+    match item {
+        FromItem::Table(tref) => {
+            tref.join = kind;
+            tref.natural = true;
             Ok(())
         }
         FromItem::Subquery { .. } => Err(Error::new(

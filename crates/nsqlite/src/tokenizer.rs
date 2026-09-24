@@ -1244,13 +1244,17 @@ impl<'a> Tokenizer<'a> {
         if !self.peek().is_some_and(is_id_continue) {
             return Err(unrecognized(self.src, start, self.pos));
         }
-        let name_start = self.pos;
         while self.peek().is_some_and(is_id_continue) {
             self.bump();
         }
+        // The sigil is part of the name, because SQLite treats the three forms
+        // as three different parameters: a statement binding `@x`, `:x` and
+        // `$x` has three parameters, not one written three ways. Dropping the
+        // sigil here would make them collide and bind one slot three times.
+        let name = self.src[start..self.pos].to_string();
         Ok(Token::Parameter {
             index: None,
-            name: Some(self.src[name_start..self.pos].to_string()),
+            name: Some(name),
         })
     }
 
@@ -1470,7 +1474,7 @@ mod tests {
             one("$x"),
             Token::Parameter {
                 index: None,
-                name: Some("x".into())
+                name: Some("$x".into())
             }
         );
     }
@@ -1812,19 +1816,24 @@ mod tests {
     fn named_parameters_carry_a_name() {
         for sigil in [':', '@', '$'] {
             let src = format!("{sigil}name");
+            // The sigil is kept, so the three spellings are three parameters
+            // rather than one name written three ways.
             assert_eq!(
                 one(&src),
                 Token::Parameter {
                     index: None,
-                    name: Some("name".into())
-                }
+                    name: Some(src.clone())
+                },
+                "{src} should keep its sigil"
             );
         }
         assert_eq!(
             one("?name"),
             Token::Parameter {
                 index: None,
-                name: Some("name".into())
+                // The sigil stays in the name here too, so ?name is a name and
+                // not the anonymous ? that takes the next free index.
+                name: Some("?name".into())
             }
         );
     }
@@ -1867,14 +1876,14 @@ mod tests {
             one(":$"),
             Token::Parameter {
                 index: None,
-                name: Some("$".into())
+                name: Some(":$".into())
             }
         );
         assert_eq!(
             one("$$abc"),
             Token::Parameter {
                 index: None,
-                name: Some("$abc".into())
+                name: Some("$$abc".into())
             }
         );
         // A digit run right after the sigil is still an index, not a name.

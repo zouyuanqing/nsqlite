@@ -38,6 +38,15 @@ pub enum Acc {
         exact: Option<i64>,
         n: i64,
         saw_float: bool,
+        /// The running integer total left the range of an i64. The error is
+        /// not raised here but held until `result`, because a real arriving
+        /// later turns the fold into a real and the overflow stops mattering.
+        /// Checked against sqlite3 3.53.4: `sum` over
+        /// `(i64::MAX, 0.0, 1)` is 9.2233720368547758e+18, while the same rows
+        /// without the real -- `(i64::MAX, 1)` -- is "integer overflow", and so
+        /// is `(i64::MAX, '1')`, because the text '1' is an exact integer and
+        /// does not promote the fold.
+        overflowed: bool,
     },
     Min {
         best: Option<Value>,
@@ -67,8 +76,83 @@ pub enum Acc {
         n: i64,
     },
     CountDistinct {
-        seen: HashMap<String, ()>,
+        seen: HashMap<Vec<u8>, ()>,
     },
+}
+
+/// The error SQLite reports when an integer `sum` leaves the range of an i64.///
+/// The wording is sqlite3 3.53.4's, taken from
+/// `SELECT sum(a) FROM s` over `(9223372036854775807, 1)`: "Error: integer
+/// overflow". It is the same message an expression like `1+9223372036854775807`
+/// gives, which is why the engine has one spelling for it.
+fn integer_overflow() -> Error {
+    Error::new(ResultCode::Error, "integer overflow")
+}
+
+/// The value as an exact integer, or `None` if it is not one.
+///
+/// This is what decides whether `sum` stays an integer fold. SQLite keeps the
+/// total integral as long as every input is a *number with no fractional part*,
+/// and the storage class alone does not decide that. Checked against sqlite3
+/// 3.53.4, with the total reported as `sum(v), typeof(sum(v))`:
+///
+/// | input | sum | typeof |
+/// |---|---|---|
+/// | `'1'` | 1 | integer |
+/// | `'1', 1` | 2 | integer |
+/// | `1, '1'` | 2 | integer |
+/// | `'1', 1.0` | 2.0 | real |
+/// | `'abc', 1` | 1.0 | real |
+/// | `x'31'` | 1.0 | real |
+/// | `'1e2'` | 100.0 | real |
+/// | `'0x10'` | 0.0 | real |
+///
+/// So the rules are: text counts if it **parses as a number** and the number
+/// it parses as is integral (`'1e2'` parses but is not integral, so it
+/// promotes; `'0x10'` does not parse, so it promotes); a blob always promotes,
+/// even when its bytes spell an integer, because a blob is not a number in
+/// SQLite's numeric conversion for this purpose; and an infinite or
+/// out-of-range value is never integral.
+///
+/// The check has to run on the **value**, not on the number it converts to,
+/// because the conversion loses the distinction: `as_f64` renders the text
+/// `'abc'` as 0.0 and the blob `x'31'` as 1.0, and both of those are integral
+/// as numbers, so converting first would keep the total an integer where
+/// sqlite3 promotes it.
+fn integer_valued(v: &Value) -> Option<i64> {
+    // Which class a value belongs to decides whether it promotes the sum to a
+    // real, and for a REAL the answer is always no: `sum` over (1, 0.0) is the
+    // real 1.0 in sqlite3 3.53.4, even though 0.0 is an exact integer and
+    // (1, 0) sums to the integer 1. So the test below is "is this an exact
+    // integer *in a class that stays integral*", not "is this number whole".
+    //
+    // Text is the only class where "does this read as a number" and "what
+    // number" are different questions, and a blob never counts, so both are
+    // settled before the conversion.
+    match v {
+        Value::Real(_) => return None,
+        // The parse is the check *and* the conversion. `as_f64` below only
+        // converts the two numeric classes — it is deliberately not SQLite's
+        // text-to-number coercion — so the number text reads as has to be taken
+        // from the parse, or every text input would fall out as `None` and
+        // promote the sum.
+        Value::Text(s) => {
+            let f = s.trim().parse::<f64>().ok()?;
+            return exact_int_of(f);
+        }
+        Value::Blob(_) => return None,
+        _ => {}
+    }
+    let f = v.as_f64()?;
+    exact_int_of(f)
+}
+
+/// The number as an i64, if it is a whole number that fits and is finite.
+fn exact_int_of(f: f64) -> Option<i64> {
+    if !f.is_finite() || f.fract() != 0.0 || f < i64::MIN as f64 || f > i64::MAX as f64 {
+        return None;
+    }
+    Some(f as i64)
 }
 
 impl Acc {
@@ -104,6 +188,7 @@ impl Acc {
                         exact: Some(0),
                         n: 0,
                         saw_float: false,
+                        overflowed: false,
                     }
                 } else {
                     Acc::Total { n: 0, total: 0.0 }
@@ -144,19 +229,33 @@ impl Acc {
                 Acc::Product { acc: 1.0, n: 0 }
             }
             other => {
+                // As in `eval::call`, the name is reported as it was written
+                // rather than as the lowercased form the dispatch matched on.
+                // sqlite3 3.53.4 answers `SELECT XYZZY(1)` with
+                // `no such function: XYZZY`.
                 return Err(Error::new(
                     ResultCode::Error,
-                    format!("no such function: {other}"),
-                ))
+                    format!("no such function: {name}"),
+                ));
             }
         })
     }
 
     /// Feeds one row's value. A NULL is skipped by every aggregate except
     /// count(*), which the caller signals by passing a non-null placeholder.
-    pub fn step(&mut self, v: &Value) {
+    ///
+    /// This can fail, and does for exactly one reason: an integer `sum` that
+    /// would leave the range of an i64. SQLite reports that as "integer
+    /// overflow" rather than quietly switching to a real, and it reports it
+    /// while folding the row that overflowed — so a query whose WHERE or
+    /// HAVING never folds the offending pair does not see the error at all.
+    /// Verified with sqlite3 3.53.4: `SELECT sum(a) FROM s` over
+    /// `(i64::MAX, 1)` is "integer overflow", while the same rows with a
+    /// `WHERE a>2` is `i64::MAX`, and `SELECT total(a)` over both is a real in
+    /// either case because `total` is a float fold and never overflows.
+    pub fn step(&mut self, v: &Value) -> Result<()> {
         if v.is_null() {
-            return;
+            return Ok(());
         }
         match self {
             Acc::Count { n } => *n += 1,
@@ -165,33 +264,77 @@ impl Acc {
                 exact,
                 n,
                 saw_float,
+                overflowed,
             } => {
                 *n += 1;
                 match v {
                     Value::Integer(i) if !*saw_float => match exact {
                         Some(e) => match e.checked_add(*i) {
                             Some(sum) => *exact = Some(sum),
-                            // Integer overflow makes the running total a real
-                            // for the rest of the scan, which is what SQLite
-                            // does rather than wrapping.
+                            // The running total is an integer and this value
+                            // does not fit, so there is no i64 to hold it. The
+                            // error is not raised here: a real further down
+                            // promotes the fold and makes it irrelevant, so it
+                            // is held until `result` and only raised if the fold
+                            // is still integer-valued then.
+                            //
+                            // `exact` keeps its value. It is what says the fold
+                            // is still an integer one, and `try_result` reads it
+                            // to decide whether the held overflow is an error
+                            // or a real that happens to be inexact. Clearing it
+                            // here would leave the flag with nothing to gate on
+                            // and every overflow would come out as a real.
                             None => {
-                                *total += *e as f64;
-                                *exact = None;
-                                *saw_float = true;
+                                *overflowed = true;
+                                *total = *e as f64 + *i as f64;
                             }
                         },
                         None => *total += *i as f64,
                     },
                     Value::Integer(i) => *total += *i as f64,
+                    // A value that is *not* an exact integer promotes the fold
+                    // to a real. What counts as an exact integer is narrower
+                    // than "is a number": the text '1' adds 1 and leaves the
+                    // total an integer, while the text 'abc' adds 0 and makes
+                    // it a real. Checked against sqlite3 3.53.4, which gives
+                    // `sum` over `('1', 1)` as the integer 2 but over
+                    // `('1', 1, 1.0)` as the real 3.0, and over `('abc', 1)`
+                    // as the real 1.0. So the promotion is about the value,
+                    // not the storage class.
                     other => {
-                        if !*saw_float {
-                            if let Some(e) = *exact {
-                                *total = e as f64;
+                        let as_int = integer_valued(other);
+                        match as_int {
+                            // Still an exact integer, so the fold stays one.
+                            // This arm is only reachable with a float already in
+                            // `saw_float`; the integer arms above handle the
+                            // rest.
+                            Some(i) if !*saw_float => {
+                                if let Some(e) = *exact {
+                                    match e.checked_add(i) {
+                                        Some(sum) => *exact = Some(sum),
+                                        // Held rather than raised, for the same
+                                        // reason as the integer arm above, and
+                                        // `exact` is left alone for the same
+                                        // reason too.
+                                        None => {
+                                            *overflowed = true;
+                                            *total = e as f64 + i as f64;
+                                        }
+                                    }
+                                }
                             }
-                            *exact = None;
-                            *saw_float = true;
+                            Some(i) => *total += i as f64,
+                            None => {
+                                if !*saw_float {
+                                    if let Some(e) = *exact {
+                                        *total = e as f64;
+                                    }
+                                    *exact = None;
+                                    *saw_float = true;
+                                }
+                                *total += other.as_f64().unwrap_or(0.0);
+                            }
                         }
-                        *total += other.as_f64().unwrap_or(0.0);
                     }
                 }
             }
@@ -223,7 +366,15 @@ impl Acc {
                 // A NULL contributes nothing and does not make the result NULL,
                 // which is the one place a NULL is not skipped outright.
                 let _ = any_null;
-                parts.push(v.to_string());
+                // A blob is concatenated as its **bytes**, not as the `x'..'`
+                // display form, so it is the one class that is not
+                // `to_string`. sqlite3 3.53.4 gives `group_concat(v)` over
+                // `(x'31', 'z')` as `1,z` and over `(x'3132')` as `12`, while
+                // `to_string` would give `x'31',z` and `x'3132'`.
+                match v {
+                    Value::Blob(b) => parts.push(String::from_utf8_lossy(b).into_owned()),
+                    other => parts.push(other.to_string()),
+                }
             }
             Acc::Total { n, total } => {
                 *n += 1;
@@ -234,9 +385,10 @@ impl Acc {
                 *acc *= v.as_f64().unwrap_or(0.0);
             }
             Acc::CountDistinct { seen } => {
-                seen.insert(v.to_string(), ());
+                seen.insert(v.identity_key(), ());
             }
         }
+        Ok(())
     }
 
     /// The aggregate's value over what it was fed.
@@ -245,50 +397,59 @@ impl Acc {
     /// sum and the average are NULL, and min and max are NULL because nothing
     /// was ever a candidate.
     pub fn result(&self) -> Value {
+        self.try_result().unwrap_or(Value::Null)
+    }
+
+    /// The group's result, or the error an integer `sum` is holding.
+    ///
+    /// An integer `sum` that left the range of an i64 does not fail on the row
+    /// that overflowed. It fails here, and only if the fold is still
+    /// integer-valued: a real seen at any point promotes the sum to a real and
+    /// makes the overflow irrelevant. That is why the error cannot come out of
+    /// `step`, and why `result` has to be the one that can fail.
+    pub fn try_result(&self) -> Result<Value> {
         match self {
-            Acc::Count { n } => Value::Integer(*n),
-            Acc::CountDistinct { seen } => Value::Integer(seen.len() as i64),
+            Acc::Count { n } => Ok(Value::Integer(*n)),
+            Acc::CountDistinct { seen } => Ok(Value::Integer(seen.len() as i64)),
             Acc::Sum {
-                total, exact, n, ..
+                total,
+                exact,
+                n,
+                saw_float,
+                overflowed,
             } => {
                 if *n == 0 {
-                    Value::Null
+                    Ok(Value::Null)
+                } else if *overflowed && !*saw_float {
+                    // The fold left the range of an i64 and nothing promoted it
+                    // to a real, so it has to fail. `exact` cannot be the test:
+                    // it is None both here and after a promotion, and only
+                    // `saw_float` says which happened.
+                    Err(integer_overflow())
                 } else {
-                    match exact {
+                    Ok(match exact {
                         Some(e) => Value::Integer(*e),
                         None => Value::real(*total),
-                    }
+                    })
                 }
             }
-            Acc::Total { n, total } => {
-                if *n == 0 {
-                    Value::Null
-                } else {
-                    Value::real(*total)
-                }
-            }
-            Acc::Avg { total, n } => {
-                if *n == 0 {
-                    Value::Null
-                } else {
-                    Value::real(total / *n as f64)
-                }
-            }
-            Acc::Min { best } | Acc::Max { best } => best.clone().unwrap_or(Value::Null),
-            Acc::Concat { sep, parts, .. } => {
-                if parts.is_empty() {
-                    Value::Null
-                } else {
-                    Value::Text(parts.join(sep))
-                }
-            }
-            Acc::Product { acc, n } => {
-                if *n == 0 {
-                    Value::Null
-                } else {
-                    Value::real(*acc)
-                }
-            }
+            Acc::Total { total, .. } => Ok(Value::real(*total)),
+            Acc::Avg { total, n } => Ok(if *n == 0 {
+                Value::Null
+            } else {
+                Value::real(total / *n as f64)
+            }),
+            Acc::Min { best } | Acc::Max { best } => Ok(best.clone().unwrap_or(Value::Null)),
+            Acc::Concat { sep, parts, .. } => Ok(if parts.is_empty() {
+                Value::Null
+            } else {
+                Value::Text(parts.join(sep))
+            }),
+            Acc::Product { acc, n } => Ok(if *n == 0 {
+                Value::Null
+            } else {
+                Value::real(*acc)
+            }),
         }
     }
 }
@@ -320,14 +481,11 @@ pub struct Aggregate {
 #[derive(Debug, Clone, Default)]
 pub struct RowInputs {
     pub values: Vec<Value>,
-    /// The text of each value, for the DISTINCT check.
-    pub keys: Vec<String>,
 }
 
 impl RowInputs {
     pub fn new(values: Vec<Value>) -> RowInputs {
-        let keys = values.iter().map(|v| v.to_string()).collect();
-        RowInputs { values, keys }
+        RowInputs { values }
     }
 }
 
@@ -336,8 +494,11 @@ pub struct Group {
     aggs: Vec<(Aggregate, Acc)>,
     /// The values of the grouping columns, which identify the group.
     pub keys: Vec<Value>,
-    /// The text of the grouping values, for matching a row against a group.
-    key_text: String,
+    /// The grouping values as a [`Value::identity_key`], for matching a row
+    /// against a group. The display string cannot be used: `NULL` and `''` both
+    /// render as the empty string and would share a group that sqlite3 keeps
+    /// apart.
+    key: Vec<u8>,
     /// Whether a non-aggregate column has been seen, and what it was, so a
     /// second, different value can be reported as the error it is.
     first_plain: HashMap<usize, Value>,
@@ -359,37 +520,27 @@ impl Group {
             };
             accs.push((a.clone(), Acc::new(&a.name, &args)?));
         }
-        let key_text = keys
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("\u{1}");
+        let key = crate::value::identity_keys(&keys);
         Ok(Group {
             aggs: accs,
             keys,
-            key_text,
+            key,
             first_plain: HashMap::new(),
             count: 0,
         })
     }
 
     /// Folds one row in.
-    pub fn fold(&mut self, inputs: &RowInputs) {
+    pub fn fold(&mut self, inputs: &RowInputs) -> Result<()> {
         self.count += 1;
         // A DISTINCT aggregate sees a value only the first time it appears.
         let mut seen: Vec<bool> = vec![false; self.aggs.len()];
         for (i, (agg, acc)) in self.aggs.iter_mut().enumerate() {
             if agg.distinct {
-                let key = match inputs.keys.get(agg.output_index) {
-                    Some(k) => k.clone(),
-                    None => continue,
-                };
-                if seen[i] {
-                    // The set is kept per aggregate so two DISTINCT aggregates
-                    // over the same column do not interfere.
+                let Some(v) = inputs.values.get(agg.output_index) else {
                     continue;
-                }
-                let marker = key.clone();
+                };
+                let marker = v.identity_key();
                 if acc.has_seen(&marker) {
                     seen[i] = true;
                     continue;
@@ -397,10 +548,10 @@ impl Group {
                 acc.mark_seen(marker);
             }
             match agg.counting {
-                Counting::Rows => acc.step(&Value::Integer(1)),
+                Counting::Rows => acc.step(&Value::Integer(1))?,
                 Counting::Values => {
                     if let Some(v) = inputs.values.get(agg.output_index) {
-                        acc.step(v);
+                        acc.step(v)?;
                     }
                 }
             }
@@ -408,6 +559,7 @@ impl Group {
                 seen[i] = true;
             }
         }
+        Ok(())
     }
 
     /// Notes a plain column's value, so a second different one is caught.
@@ -432,10 +584,17 @@ impl Group {
     /// The group's output row: the grouping values, then the aggregate
     /// results, with any plain column filled from the first row that had one.
     pub fn finish(&self) -> Vec<Value> {
+        self.try_finish().unwrap_or_default()
+    }
+
+    /// As `finish`, but the fallible one: an integer `sum` that overflowed and
+    /// was never promoted to a real is an error, and it has to surface here
+    /// rather than as a NULL, because "integer overflow" is what sqlite3
+    /// reports for it.
+    pub fn try_finish(&self) -> Result<Vec<Value>> {
         let mut out = self.keys.clone();
-        for (agg, acc) in &self.aggs {
-            out.push(acc.result());
-            let _ = agg;
+        for (_agg, acc) in &self.aggs {
+            out.push(acc.try_result()?);
         }
         for (i, v) in &self.first_plain {
             while out.len() <= *i {
@@ -443,20 +602,20 @@ impl Group {
             }
             out[*i] = v.clone();
         }
-        out
+        Ok(out)
     }
 
-    pub fn key_text(&self) -> &str {
-        &self.key_text
+    pub fn key(&self) -> &[u8] {
+        &self.key
     }
 }
 
 impl Acc {
-    fn has_seen(&self, key: &str) -> bool {
+    fn has_seen(&self, key: &[u8]) -> bool {
         matches!(self, Acc::CountDistinct { seen } if seen.contains_key(key))
     }
 
-    fn mark_seen(&mut self, key: String) {
+    fn mark_seen(&mut self, key: Vec<u8>) {
         if let Acc::CountDistinct { seen } = self {
             seen.insert(key, ());
         }
@@ -474,7 +633,7 @@ pub struct GroupSet {
     aggs: Vec<Aggregate>,
     groups: Vec<Group>,
     /// The key of each group, so a row can find the one it belongs to.
-    index: HashMap<String, usize>,
+    index: HashMap<Vec<u8>, usize>,
     /// Whether the query grouped at all, which decides the key of a row.
     grouped: bool,
     /// How many columns make up the key, so a row can be cut into key and
@@ -501,21 +660,17 @@ impl GroupSet {
         } else {
             (Vec::new(), &inputs.values[..])
         };
-        let key_text = keys
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("\u{1}");
-        let pos = match self.index.get(&key_text) {
+        let key = crate::value::identity_keys(&keys);
+        let pos = match self.index.get(&key) {
             Some(&p) => p,
             None => {
                 self.groups.push(Group::new(self.aggs.clone(), keys)?);
                 let p = self.groups.len() - 1;
-                self.index.insert(key_text, p);
+                self.index.insert(key, p);
                 p
             }
         };
-        self.groups[pos].fold(&RowInputs::new(payload.to_vec()));
+        self.groups[pos].fold(&RowInputs::new(payload.to_vec()))?;
         Ok(())
     }
 
@@ -565,7 +720,7 @@ mod tests {
     fn count_counts_non_null_values() {
         let mut a = acc("count");
         for v in ints(&[1, 2, 3]) {
-            a.step(&v);
+            a.step(&v).unwrap();
         }
         assert_eq!(a.result(), Value::Integer(3));
     }
@@ -573,15 +728,15 @@ mod tests {
     #[test]
     fn count_skips_nulls_but_the_caller_counts_rows() {
         let mut a = acc("count");
-        a.step(&Value::Null);
-        a.step(&Value::Integer(1));
-        a.step(&Value::Null);
+        a.step(&Value::Null).unwrap();
+        a.step(&Value::Integer(1)).unwrap();
+        a.step(&Value::Null).unwrap();
         // A NULL does not count for count(x).
         assert_eq!(a.result(), Value::Integer(1));
         // count(*) feeds one row per row instead, so every row counts.
         let mut b = acc("count");
-        b.step(&Value::Integer(1));
-        b.step(&Value::Integer(1));
+        b.step(&Value::Integer(1)).unwrap();
+        b.step(&Value::Integer(1)).unwrap();
         assert_eq!(b.result(), Value::Integer(2));
     }
 
@@ -589,17 +744,39 @@ mod tests {
     fn sum_stays_an_integer_until_it_would_overflow() {
         let mut a = acc("sum");
         for v in ints(&[1, 2, 3]) {
-            a.step(&v);
+            a.step(&v).unwrap();
         }
         assert_eq!(a.result(), Value::Integer(6));
     }
 
     #[test]
-    fn sum_falls_back_to_a_real_on_overflow() {
+    fn an_integer_sum_that_would_overflow_is_an_error() {
         let mut a = acc("sum");
-        a.step(&Value::Integer(i64::MAX));
-        a.step(&Value::Integer(1));
-        // Wrapping would give i64::MIN, which is silently wrong.
+        a.step(&Value::Integer(i64::MAX)).unwrap();
+        // sqlite3 3.53.4: `SELECT sum(a) FROM s` over (i64::MAX, 1) is
+        // "integer overflow". Wrapping to i64::MIN would be silently wrong and
+        // promoting to a real would lose the information that the inputs were
+        // all integers, so neither is done.
+        //
+        // The error comes out of `try_result` rather than `step`, because a
+        // real arriving later promotes the fold and makes the overflow
+        // irrelevant — so the row that overflows is not necessarily the row
+        // the query fails on.
+        a.step(&Value::Integer(1)).unwrap();
+        let e = a.try_result().unwrap_err();
+        assert_eq!(e.message, "integer overflow");
+    }
+
+    #[test]
+    fn an_integer_sum_promotes_when_a_real_arrives_even_if_it_overflowed() {
+        // A real makes the fold a real, which is a promotion and not an
+        // overflow, so it can no longer be an error. sqlite3 3.53.4 gives
+        // 9.2233720368547758e+18 for sum over (i64::MAX, 1, 0.0), in either
+        // order of the last two rows.
+        let mut a = acc("sum");
+        a.step(&Value::Integer(i64::MAX)).unwrap();
+        a.step(&Value::real(0.0)).unwrap();
+        a.step(&Value::Integer(1)).unwrap();
         match a.result() {
             Value::Real(r) => assert!(r > 0.0, "the sum went negative, which means it wrapped"),
             other => panic!("expected a real, got {other:?}"),
@@ -607,10 +784,56 @@ mod tests {
     }
 
     #[test]
+    fn a_real_arriving_after_the_overflow_rescues_it() {
+        // The overflow is held rather than raised, so the fold recovers if a
+        // real arrives later. sqlite3 3.53.4 gives 9.2233720368547758e+18 for
+        // sum over (i64::MAX, 1, 0.0) in either order of the last two rows, and
+        // "integer overflow" for (i64::MAX, 1) alone.
+        let mut a = acc("sum");
+        a.step(&Value::Integer(i64::MAX)).unwrap();
+        a.step(&Value::Integer(1)).unwrap();
+        a.step(&Value::real(0.0)).unwrap();
+        assert!(a.try_result().is_ok(), "a real promotes the fold");
+    }
+
+    #[test]
+    fn an_integer_spelled_as_text_does_not_promote_the_sum() {
+        // The text '1' is an exact integer, so it adds 1 and leaves the fold an
+        // integer one. sqlite3 3.53.4: `SELECT sum(v), typeof(sum(v))` over
+        // `('1', 1)` is 2 and `integer`. A real among them gives 2.0 and
+        // `real`; a text that is not a number gives 1.0 and `real`.
+        let mut a = acc("sum");
+        a.step(&Value::Text("1".into())).unwrap();
+        a.step(&Value::Integer(1)).unwrap();
+        assert_eq!(a.try_result().unwrap(), Value::Integer(2));
+
+        let mut b = acc("sum");
+        b.step(&Value::Text("1".into())).unwrap();
+        b.step(&Value::real(1.0)).unwrap();
+        assert_eq!(b.try_result().unwrap(), Value::real(2.0));
+
+        let mut c = acc("sum");
+        c.step(&Value::Text("abc".into())).unwrap();
+        c.step(&Value::Integer(1)).unwrap();
+        assert_eq!(c.try_result().unwrap(), Value::real(1.0));
+    }
+
+    #[test]
+    fn total_never_reports_an_overflow() {
+        // `total` is a float fold by definition, so the same two rows that
+        // overflow `sum` are fine here. sqlite3 3.53.4 gives
+        // 9.2233720368547758e+18 for total over (i64::MAX, 1).
+        let mut a = Acc::new("total", &[Value::Null]).unwrap();
+        a.step(&Value::Integer(i64::MAX)).unwrap();
+        a.step(&Value::Integer(1)).unwrap();
+        assert!(matches!(a.result(), Value::Real(_)));
+    }
+
+    #[test]
     fn sum_becomes_a_real_when_any_input_is_one() {
         let mut a = acc("sum");
-        a.step(&Value::Integer(1));
-        a.step(&Value::real(0.5));
+        a.step(&Value::Integer(1)).unwrap();
+        a.step(&Value::real(0.5)).unwrap();
         assert_eq!(a.result(), Value::real(1.5));
     }
 
@@ -633,8 +856,8 @@ mod tests {
             Value::Integer(5),
             Value::Text("a".into()),
         ] {
-            lo.step(&v);
-            hi.step(&v);
+            lo.step(&v).unwrap();
+            hi.step(&v).unwrap();
         }
         // A number sorts below text, so 5 is the smallest and "b" the largest.
         assert_eq!(lo.result(), Value::Integer(5));
@@ -644,9 +867,9 @@ mod tests {
     #[test]
     fn avg_divides_by_the_rows_that_counted() {
         let mut a = acc("avg");
-        a.step(&Value::Integer(2));
-        a.step(&Value::Integer(4));
-        a.step(&Value::Null);
+        a.step(&Value::Integer(2)).unwrap();
+        a.step(&Value::Integer(4)).unwrap();
+        a.step(&Value::Null).unwrap();
         assert_eq!(a.result(), Value::real(3.0));
     }
 
@@ -654,7 +877,7 @@ mod tests {
     fn group_concat_joins_in_arrival_order() {
         let mut a = Acc::new("group_concat", &[Value::Null]).unwrap();
         for v in ["a", "b", "c"] {
-            a.step(&Value::Text(v.into()));
+            a.step(&Value::Text(v.into())).unwrap();
         }
         assert_eq!(a.result(), Value::Text("a,b,c".into()));
     }
@@ -663,7 +886,7 @@ mod tests {
     fn group_concat_takes_a_separator() {
         let mut a = Acc::new("group_concat", &[Value::Null, Value::Text(" | ".into())]).unwrap();
         for v in ["a", "b"] {
-            a.step(&Value::Text(v.into()));
+            a.step(&Value::Text(v.into())).unwrap();
         }
         assert_eq!(a.result(), Value::Text("a | b".into()));
     }
@@ -671,9 +894,9 @@ mod tests {
     #[test]
     fn group_concat_skips_nulls() {
         let mut a = acc("group_concat");
-        a.step(&Value::Text("a".into()));
-        a.step(&Value::Null);
-        a.step(&Value::Text("b".into()));
+        a.step(&Value::Text("a".into())).unwrap();
+        a.step(&Value::Null).unwrap();
+        a.step(&Value::Text("b".into())).unwrap();
         assert_eq!(a.result(), Value::Text("a,b".into()));
     }
 
@@ -722,7 +945,8 @@ mod tests {
         for v in ints(&[1, 2, 3]) {
             // Column 0 is the grouping key, column 1 the value the sum reads,
             // which is the position output_index names.
-            g.fold(&RowInputs::new(vec![Value::Text("x".into()), v]));
+            g.fold(&RowInputs::new(vec![Value::Text("x".into()), v]))
+                .unwrap();
         }
         assert_eq!(g.count(), 3);
         let out = g.finish();

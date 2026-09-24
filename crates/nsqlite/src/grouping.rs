@@ -18,6 +18,14 @@
 //!   arrived. `GROUP BY k` over rows inserted as `m, z, a, m` yields `a, m, z`.
 //!   The ordering is [`Value::compare`]'s, so NULL sorts first, then numbers,
 //!   then text, then blobs.
+//!
+//! Group *identity* is a different question from group *order*, and the two
+//! answers come from the same rules: identity is [`Value::identity_key`]'s and
+//! order is [`Value::compare`]'s, which agree because SQLite decides both with
+//! one comparison. Identity is **not** the display string. `NULL` and `''` both
+//! render as the empty string, `1`, `1.0` and `'1'` all render as `1`, and
+//! `-0.0` renders as `-0` where `0.0` renders as `0`; keying a group on the
+//! display string merges values SQLite keeps apart.
 //! * The output columns are in the order they were **written**. SQLite does not
 //!   hoist the GROUP BY columns to the front: `SELECT sum(a), b FROM t GROUP BY
 //!   b` has `sum(a)` first.
@@ -91,8 +99,9 @@ fn is_aggregate_call(name: &str, argc: usize) -> bool {
 /// it a fold rather than a scalar call.
 #[derive(Debug, Clone)]
 pub struct Aggregate {
-    /// The lowercased name, which selects the accumulator.
-    name: String,
+    /// The lowercased name, which selects the accumulator and which the misuse
+    /// messages quote.
+    pub name: String,
     /// The argument expressions, empty for `count(*)`.
     args: Vec<Expr>,
     distinct: bool,
@@ -190,14 +199,15 @@ impl Aggregate {
     }
 }
 
-/// One aggregate in the query: its definition, and whether it fills an output
-/// column.
+/// One aggregate the query folds.
+///
+/// Which output column it fills is not recorded here: an aggregate is reached
+/// through [`Plan::result_of`], which matches on the call itself, so two
+/// identical calls share one accumulator and one slot however many columns
+/// read it.
 #[derive(Debug, Clone)]
 struct Slot {
     agg: Aggregate,
-    /// The output column this aggregate fills, or `None` when the aggregate
-    /// only appears in a HAVING.
-    output: Option<usize>,
 }
 
 /// One group's result: everything the executor needs to build its output row.
@@ -259,14 +269,26 @@ impl Plan {
         };
         let mut slots: Vec<Slot> = Vec::new();
         let mut output = Vec::with_capacity(columns.len());
-        for (i, rc) in columns.iter().enumerate() {
+        for rc in columns.iter() {
             match Aggregate::of(&rc.expr) {
                 Some(agg) => {
+                    // An aggregate whose own argument folds is refused before it
+                    // is registered: `sum(count(a))` is a misuse, and the check
+                    // has to happen here because this branch does not walk the
+                    // arguments.
+                    let Expr::Function { args, .. } = &rc.expr else {
+                        unreachable!("a recognised aggregate is a function")
+                    };
+                    for a in args {
+                        if let Some(inner) = first_aggregate(a) {
+                            return Err(Error::new(
+                                ResultCode::Error,
+                                format!("misuse of aggregate function {}()", inner.name),
+                            ));
+                        }
+                    }
                     let at = slots.len();
-                    slots.push(Slot {
-                        agg,
-                        output: Some(i),
-                    });
+                    slots.push(Slot { agg });
                     output.push(Output::Aggregate(at));
                 }
                 None => {
@@ -275,10 +297,30 @@ impl Plan {
                     // five rows, not 5. The column stays a bare expression and
                     // its aggregate is substituted in before it is evaluated,
                     // which is what [`Plan::project`] does.
-                    collect_aggregates(&rc.expr, &mut slots, false, Some(i))?;
+                    collect_aggregates(&rc.expr, &mut slots, false)?;
                     output.push(Output::Plain(rc.expr.clone()));
                 }
             }
+        }
+
+        // Whether this is an *aggregate query*, which is what a HAVING
+        // requires. The test is deliberately made before the HAVING's own
+        // aggregates are collected, because a HAVING does not make a query an
+        // aggregate query: `SELECT 1 HAVING count(*)>0` is an error in sqlite3
+        // 3.53.4 ("HAVING clause on a non-aggregate query") even though the
+        // HAVING names an aggregate. Only the result columns and a GROUP BY
+        // can. Testing `slots` afterwards instead would find the HAVING's own
+        // `count()` already collected and so never fire.
+        //
+        // This also runs before the ORDER BY loop below, because where both
+        // misuses are present sqlite3 reports the HAVING one first:
+        // `SELECT 1 FROM t HAVING 1 ORDER BY count(*)` is "HAVING clause on a
+        // non-aggregate query", not "misuse of aggregate: count()".
+        if having.is_some() && slots.is_empty() && group_by.is_empty() {
+            return Err(Error::new(
+                ResultCode::Error,
+                "HAVING clause on a non-aggregate query",
+            ));
         }
 
         // A HAVING folds its own aggregates, appended after the output ones so
@@ -286,25 +328,31 @@ impl Plan {
         // with a result column reuses that column's accumulator, which is why
         // `SELECT count(*) ... HAVING count(*) > 2` folds once.
         if let Some(h) = having {
-            collect_aggregates(h, &mut slots, false, None)?;
+            collect_aggregates(h, &mut slots, false)?;
+        }
+        // The ORDER BY of a grouped query folds too, so `ORDER BY sum(a)` works
+        // even where the projection does not include the sum. On a query with
+        // no group at all it is a misuse, which is what SQLite reports.
+        let grouped = !group_by.is_empty() || !slots.is_empty();
+        for (e, _) in &sel.order_by {
+            if let Some(agg) = first_aggregate(e) {
+                if !grouped {
+                    return Err(Error::new(
+                        ResultCode::Error,
+                        format!("misuse of aggregate: {}()", agg.name),
+                    ));
+                }
+                collect_aggregates(e, &mut slots, false)?;
+            }
         }
 
-        if having.is_some() && slots.is_empty() && group_by.is_empty() {
-            return Err(Error::new(
-                ResultCode::Error,
-                "HAVING clause on a non-aggregate query",
-            ));
-        }
-        // An aggregate in the GROUP BY is refused by name, and the message
-        // quotes the function it found.
+        // An aggregate in the GROUP BY is refused by name. SQLite's message
+        // does not quote the function, so neither does this.
         for e in group_by {
-            if let Some(agg) = Aggregate::of(e) {
+            if Aggregate::of(e).is_some() || first_aggregate(e).is_some() {
                 return Err(Error::new(
                     ResultCode::Error,
-                    format!(
-                        "aggregate functions are not allowed in the GROUP BY clause: {}()",
-                        agg.name
-                    ),
+                    "aggregate functions are not allowed in the GROUP BY clause",
                 ));
             }
         }
@@ -339,29 +387,17 @@ impl Plan {
             .slots
             .iter()
             .position(|s| s.agg.same_as(agg))
-            .ok_or_else(|| Error::new(ResultCode::Error, "misuse of aggregate in HAVING"))?;
-        group
-            .aggs
-            .get(at)
-            .cloned()
-            .ok_or_else(|| Error::new(ResultCode::Error, "misuse of aggregate in HAVING"))
-    }
-
-    /// The group a query with no FROM produces, whose accumulators are fresh.
-    ///
-    /// `SELECT count(*)` with nothing to select from still folds the one empty
-    /// row a SELECT with no FROM evaluates against, so the result is 1 rather
-    /// than an error. `count(1)` reads that row, which is the constant, and
-    /// everything else is the empty-set result.
-    pub fn empty_group(&self) -> Result<GroupOutput> {
-        let none = empty_row();
-        let accs = self.new_accs(&none)?;
-        Ok(GroupOutput {
-            keys: Vec::new(),
-            aggs: accs.iter().map(|a| a.result()).collect(),
-            first: Vec::new(),
-            named: Vec::new(),
-            resolved: Vec::new(),
+            .ok_or_else(|| {
+                Error::new(
+                    ResultCode::Error,
+                    format!("misuse of aggregate function {}()", agg.name),
+                )
+            })?;
+        group.aggs.get(at).cloned().ok_or_else(|| {
+            Error::new(
+                ResultCode::Error,
+                format!("misuse of aggregate function {}()", agg.name),
+            )
         })
     }
 
@@ -403,23 +439,23 @@ impl Plan {
 /// A HAVING nests its aggregates in an ordinary expression, so the whole tree
 /// is walked. An aggregate found *inside* another one is the "misuse of
 /// aggregate function" case SQLite refuses.
-fn collect_aggregates(
-    expr: &Expr,
-    slots: &mut Vec<Slot>,
-    inside: bool,
-    output: Option<usize>,
-) -> Result<()> {
-    for child in children(expr) {
-        if let Some(agg) = Aggregate::of(child) {
-            if inside {
-                return Err(Error::new(
-                    ResultCode::Error,
-                    format!("misuse of aggregate function {}()", agg.name),
-                ));
-            }
-            let Expr::Function { args, .. } = child else {
-                unreachable!("a recognised aggregate is a function")
-            };
+fn collect_aggregates(expr: &Expr, slots: &mut Vec<Slot>, inside: bool) -> Result<()> {
+    // The expression itself is checked before its children, so an ORDER BY that
+    // *is* `sum(a)` is folded rather than only its argument being visited.
+    if let Some(agg) = Aggregate::of(expr) {
+        if inside {
+            return Err(Error::new(
+                ResultCode::Error,
+                format!("misuse of aggregate function {}()", agg.name),
+            ));
+        }
+        let Expr::Function { args, .. } = expr else {
+            unreachable!("a recognised aggregate is a function")
+        };
+        // An identical call already in the plan reuses its accumulator, which
+        // is what makes `SELECT count(*) ... ORDER BY count(*)` fold once and
+        // what makes the same call in a HAVING free.
+        if !slots.iter().any(|s| s.agg.same_as(&agg)) {
             slots.push(Slot {
                 agg: Aggregate {
                     name: agg.name,
@@ -427,15 +463,16 @@ fn collect_aggregates(
                     distinct: agg.distinct,
                     star: agg.star,
                 },
-                output,
             });
-            // The arguments of a fold may not themselves fold.
-            for a in args {
-                collect_aggregates(a, slots, true, None)?;
-            }
-            continue;
         }
-        collect_aggregates(child, slots, inside, output)?;
+        // The arguments of a fold may not themselves fold.
+        for a in args {
+            collect_aggregates(a, slots, true)?;
+        }
+        return Ok(());
+    }
+    for child in children(expr) {
+        collect_aggregates(child, slots, inside)?;
     }
     Ok(())
 }
@@ -448,14 +485,19 @@ fn children(expr: &Expr) -> Vec<&Expr> {
             vec![expr]
         }
         Binary { left, right, .. } => vec![left, right],
-        Between { expr, low, high, .. } => vec![expr, low, high],
+        Between {
+            expr, low, high, ..
+        } => vec![expr, low, high],
         InList { expr, list, .. } => {
             let mut v = vec![expr.as_ref()];
             v.extend(list.iter());
             v
         }
         Like {
-            expr, pattern, escape, ..
+            expr,
+            pattern,
+            escape,
+            ..
         } => {
             let mut v = vec![expr.as_ref(), pattern.as_ref()];
             v.extend(escape.iter().map(|b| b.as_ref()));
@@ -487,14 +529,19 @@ pub fn children_mut(expr: &mut Expr) -> Vec<&mut Expr> {
             vec![expr]
         }
         Binary { left, right, .. } => vec![left, right],
-        Between { expr, low, high, .. } => vec![expr, low, high],
+        Between {
+            expr, low, high, ..
+        } => vec![expr, low, high],
         InList { expr, list, .. } => {
             let mut v: Vec<&mut Expr> = vec![expr];
             v.extend(list.iter_mut());
             v
         }
         Like {
-            expr, pattern, escape, ..
+            expr,
+            pattern,
+            escape,
+            ..
         } => {
             let mut v: Vec<&mut Expr> = vec![expr, pattern];
             v.extend(escape.iter_mut().map(|b| b.as_mut()));
@@ -527,8 +574,9 @@ struct Group {
     /// The row that created the group, which is where the bare columns read.
     /// The group a bare aggregate over no rows produces has no row at all.
     first: Option<Row>,
-    /// The values each DISTINCT aggregate has already seen, per slot.
-    seen: Vec<Vec<String>>,
+    /// The values each DISTINCT aggregate has already seen, per slot, each
+    /// written as a [`Value::identity_key`].
+    seen: Vec<Vec<Vec<u8>>>,
 }
 
 /// One row as the grouping sees it.
@@ -568,7 +616,25 @@ impl Row {
     }
 }
 
-/// A row with no columns, which is what a bare aggregate over no FROM has.
+/// A row of NULLs, which is what a bare aggregate over no rows has.
+///
+/// It is padded to the table's columns when the caller names them, so a bare
+/// column beside the aggregate still resolves — to NULL, because there is no
+/// row for it to read. `SELECT a, count(*)` over an empty table is `(NULL, 0)`.
+/// `shape` is the FROM's columns as (scope, column), of which only the column
+/// name is needed: a name is looked up by what it is called.
+fn empty_row_of(width: usize, shape: &[(String, String)]) -> Row {
+    Row {
+        values: vec![Value::Null; width],
+        named: shape
+            .iter()
+            .map(|(_, col)| (col.clone(), Value::Null))
+            .collect(),
+        resolved: Vec::new(),
+    }
+}
+
+/// A row with no columns, which is what a SELECT with no FROM has.
 fn empty_row() -> Row {
     Row {
         values: Vec::new(),
@@ -579,13 +645,36 @@ fn empty_row() -> Row {
 
 /// Runs a grouped query over `rows`, which are the rows that passed the WHERE.
 ///
-/// One [`GroupOutput`] comes back per group, sorted by the group key. The
-/// executor assembles the output row from it, because a bare column reads
-/// `first` and an aggregate reads `aggs`, and the two are not in one list.
-pub fn run(plan: &Plan, rows: &[Row]) -> Result<Vec<GroupOutput>> {
+/// `shape` names the table's columns, which a group with no row is padded to:
+/// `SELECT a, count(*)` over an empty table is `(NULL, 0)`, and the NULL needs
+/// a name to resolve against. One [`GroupOutput`] comes back per group, sorted
+/// by the group key.
+pub fn run(plan: &Plan, rows: &[Row], shape: &[(String, String)]) -> Result<Vec<GroupOutput>> {
+    fold_rows(plan, rows, shape)
+}
+
+/// Runs a grouped query whose FROM is empty, folding the single empty row.
+///
+/// `SELECT count(*)` is 1 and `SELECT sum(1)` is 1, because the query has one
+/// row to fold even though it has no columns.
+pub fn run_over_no_from(plan: &Plan) -> Result<Vec<GroupOutput>> {
+    if plan.is_grouped() {
+        // A GROUP BY over no rows produces no rows, which is the asymmetry
+        // SQLite keeps against the bare aggregate above.
+        return Ok(Vec::new());
+    }
+    fold_rows(plan, &[empty_row()], &[])
+}
+
+/// The grouping itself, over whatever rows it is given.
+fn fold_rows(plan: &Plan, rows: &[Row], shape: &[(String, String)]) -> Result<Vec<GroupOutput>> {
     let mut groups: Vec<Group> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
     let grouped = plan.is_grouped();
+    // The shape a group with no row is padded to: the table's own columns, or
+    // the first row's when the caller did not say, which is the same thing.
+    let width = shape.len().max(rows.first().map_or(0, |r| r.values.len()));
+    let empty = empty_row_of(width, shape);
 
     for row in rows {
         // The key is each GROUP BY expression evaluated against this row. A
@@ -597,17 +686,15 @@ pub fn run(plan: &Plan, rows: &[Row]) -> Result<Vec<GroupOutput>> {
             .iter()
             .map(|e| eval(e, &ctx))
             .collect::<Result<_>>()?;
-        // The key is the values' text, joined by a byte that cannot occur in
-        // one, which is what tells two groups apart.
-        let key_text = keys
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("\u{1}");
+        // The key is each GROUP BY expression's value written the way SQLite
+        // identifies a value — by storage class and exact contents, not by how
+        // it displays. `NULL` and `''`, and `1` and `'1'`, are different groups;
+        // `1` and `1.0` are the same one.
+        let key = crate::value::identity_keys(&keys);
         // A group's payload is the value of every aggregate's argument, so an
         // aggregate folds its argument rather than the whole result column.
         let payload = plan.evaluate_payload(row)?;
-        let pos = match index.get(&key_text) {
+        let pos = match index.get(&key) {
             Some(&p) => p,
             None => {
                 let accs = plan.new_accs(row)?;
@@ -618,22 +705,29 @@ pub fn run(plan: &Plan, rows: &[Row]) -> Result<Vec<GroupOutput>> {
                     seen: vec![Vec::new(); plan.slots.len()],
                 });
                 let p = groups.len() - 1;
-                index.insert(key_text, p);
+                index.insert(key, p);
                 p
             }
         };
-        fold(plan, &mut groups[pos], &payload);
+        // A fold can fail, and the failure is SQLite's: an integer sum that
+        // leaves the range of an i64 is an "integer overflow" error, not a
+        // real. It surfaces here rather than at the accumulator because the
+        // accumulator is per group, and it surfaces even for a group the HAVING
+        // would have dropped — sqlite3 folds first and filters after.
+        fold(plan, &mut groups[pos], &payload)?;
     }
 
     // A bare aggregate over no rows still has a value: 0 for count, NULL for
     // the rest. A grouped query over no rows has no groups and so no rows,
-    // which is the asymmetry SQLite keeps.
+    // which is the asymmetry SQLite keeps. The group is padded to the table's
+    // columns, so a bare column beside the aggregate reads NULL rather than
+    // failing to resolve.
     if groups.is_empty() && !grouped && !plan.slots.is_empty() {
-        let accs = plan.new_accs(&empty_row())?;
+        let accs = plan.new_accs(&empty)?;
         groups.push(Group {
             keys: Vec::new(),
             accs,
-            first: None,
+            first: Some(empty.clone()),
             seen: vec![Vec::new(); plan.slots.len()],
         });
     }
@@ -649,24 +743,32 @@ pub fn run(plan: &Plan, rows: &[Row]) -> Result<Vec<GroupOutput>> {
     let mut out = Vec::with_capacity(order.len());
     for g in order {
         let group = &groups[g];
+        let first = group.first.as_ref().unwrap_or(&none);
+        let finished = GroupOutput {
+            keys: group.keys.clone(),
+            // The fallible read, not `result`: an integer `sum` that
+            // overflowed and was never promoted to a real is "integer
+            // overflow", and the other read would turn that into a NULL and
+            // report a clean query for a query sqlite3 refuses.
+            aggs: group
+                .accs
+                .iter()
+                .map(|a| a.try_result())
+                .collect::<Result<Vec<Value>>>()?,
+            first: first.values.clone(),
+            named: first.named.clone(),
+            resolved: first.resolved.clone(),
+        };
         // HAVING runs after folding and before the row is built, and sees the
         // finished aggregates, so a group can filter on count(*) the way any
         // other predicate would.
         if let Some(h) = &plan.having {
-            let first = group.first.as_ref().unwrap_or(&none);
             let ctx = first.ctx();
-            if !truthy(plan.eval_having(h, group, &ctx)?) {
+            if !truthy(plan.eval_having(h, &finished, &ctx)?) {
                 continue;
             }
         }
-        let first = group.first.as_ref().unwrap_or(&none);
-        out.push(GroupOutput {
-            keys: group.keys.clone(),
-            aggs: group.accs.iter().map(|a| a.result()).collect(),
-            first: first.values.clone(),
-            named: first.named.clone(),
-            resolved: first.resolved.clone(),
-        });
+        out.push(finished);
     }
     Ok(out)
 }
@@ -705,11 +807,7 @@ impl Plan {
             // A group_concat separator is evaluated once per group, against the
             // group's first row, as SQLite does.
             let sep = if matches!(slot.agg.name.as_str(), "group_concat" | "string_agg") {
-                slot.agg
-                    .args
-                    .get(1)
-                    .map(|e| eval(e, &ctx))
-                    .transpose()?
+                slot.agg.args.get(1).map(|e| eval(e, &ctx)).transpose()?
             } else {
                 None
             };
@@ -722,21 +820,16 @@ impl Plan {
     ///
     /// The substitution is what lets a predicate mention an aggregate at all:
     /// the ordinary evaluator would read it per row, or refuse it as misuse.
-    fn eval_having(&self, expr: &Expr, group: &Group, ctx: &EvalCtx<'_>) -> Result<Value> {
+    fn eval_having(&self, expr: &Expr, group: &GroupOutput, ctx: &EvalCtx<'_>) -> Result<Value> {
         let mut rewritten = expr.clone();
         self.substitute(&mut rewritten, group)?;
         eval(&rewritten, ctx)
     }
 
     /// Replaces every aggregate call in `expr` with a literal of its result.
-    fn substitute(&self, expr: &mut Expr, group: &Group) -> Result<()> {
+    pub fn substitute(&self, expr: &mut Expr, group: &GroupOutput) -> Result<()> {
         if let Some(agg) = Aggregate::of(expr) {
-            let at = self
-                .slots
-                .iter()
-                .position(|s| s.agg.same_as(&agg))
-                .ok_or_else(|| Error::new(ResultCode::Error, "misuse of aggregate in HAVING"))?;
-            *expr = literal_of(group.accs[at].result());
+            *expr = literal_of(self.result_of(&agg, group)?);
             return Ok(());
         }
         for child in children_mut(expr) {
@@ -747,17 +840,18 @@ impl Plan {
 }
 
 /// Folds one row's payload into its group.
-fn fold(plan: &Plan, group: &mut Group, payload: &[Value]) {
+fn fold(plan: &Plan, group: &mut Group, payload: &[Value]) -> Result<()> {
     for (i, slot) in plan.slots.iter().enumerate() {
         if slot.agg.distinct {
             // A DISTINCT aggregate sees a value once. The identity is the
-            // value's text, which puts the integer 1 and the real 1.0 together
-            // and keeps the text '1' separate, as SQLite does.
+            // value's storage class and exact contents, which puts the integer
+            // 1 and the real 1.0 together — one number, two spellings — and
+            // keeps the text '1' and the blob x'31' separate, as SQLite does.
             let Some(v) = payload.get(i) else { continue };
             if v.is_null() {
                 continue;
             }
-            let key = v.to_string();
+            let key = v.identity_key();
             let seen = &mut group.seen[i];
             if seen.contains(&key) {
                 continue;
@@ -771,14 +865,27 @@ fn fold(plan: &Plan, group: &mut Group, payload: &[Value]) {
         // count(*) has no argument to read and counts the row itself; every
         // other aggregate folds the value its argument evaluated to.
         match slot.agg.reading() {
-            Counting::Rows => acc.step(&Value::Integer(1)),
+            Counting::Rows => acc.step(&Value::Integer(1))?,
             Counting::Values => {
                 if let Some(v) = payload.get(i) {
-                    acc.step(v);
+                    acc.step(v)?;
                 }
             }
         }
     }
+    Ok(())
+}
+
+/// The first aggregate call anywhere in an expression, if there is one.
+///
+/// A WHERE may not fold at all, so the executor asks this before scanning and
+/// reports the misuse. A HAVING and an ORDER BY may, because both run where a
+/// group is in scope.
+pub fn first_aggregate(expr: &Expr) -> Option<Aggregate> {
+    if let Some(agg) = Aggregate::of(expr) {
+        return Some(agg);
+    }
+    children(expr).into_iter().find_map(first_aggregate)
 }
 
 /// A value as a literal, which is how a substituted aggregate reaches the
@@ -797,3 +904,11 @@ pub fn literal_of(v: Value) -> Expr {
 #[cfg(test)]
 #[path = "grouping_tests.rs"]
 mod grouping_tests;
+
+#[cfg(test)]
+#[path = "grouping_tests_more.rs"]
+mod grouping_tests_more;
+
+#[cfg(test)]
+#[path = "grouping_identity_tests.rs"]
+mod grouping_identity_tests;

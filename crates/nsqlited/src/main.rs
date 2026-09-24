@@ -67,6 +67,17 @@ fn main() -> ExitCode {
     };
 
     if suite_mode {
+        // The script may be on standard input rather than on the command line.
+        // It has to be able to be: a test's SQL is not bounded, and the
+        // command line is -- Windows caps it at 32767 characters, and createtab
+        // and types both build statements past that. `nsqlited --testsuite DB`
+        // with the script piped in is the form that has no limit.
+        if sql.is_empty() {
+            let mut buf = String::new();
+            if std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).is_ok() {
+                sql = buf;
+            }
+        }
         // The record stream is the shim's only channel, so an error goes on it
         // rather than on stderr: a Tcl error is how do_test learns a statement
         // failed, and it needs the message, not a bare exit status.

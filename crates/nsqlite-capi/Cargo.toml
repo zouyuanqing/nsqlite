@@ -1,0 +1,22 @@
+[package]
+name = "nsqlite-capi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQLite C ABI shim over the nsqlite engine, for the official TCL test suite"
+
+[dependencies]
+nsqlite = { path = "../nsqlite" }
+
+# The ABI test declares every symbol itself, from sqlite3.h, and calls them. The
+# link still has to be satisfied, and only this crate defines them, so the test
+# links the rlib. It is the same library the cdylib is built from -- a test that
+# checked a second build of the shim would not be checking the shim.
+[dev-dependencies]
+nsqlite-capi = { path = "." }
+
+[lib]
+name = "nsqlite_capi"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]

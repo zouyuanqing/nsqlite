@@ -46,12 +46,20 @@ SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 printf 'puts [info patchlevel]\n' > "$SCRATCH/ver.tcl"
 
+# Which tclsh. The ucrt64 build is preferred over a bare `tclsh` on PATH,
+# because on this machine PATH resolves to the mingw64 build (8.6.17) while the
+# project pins ucrt64 (8.6.18), and a suite result that depends on which of two
+# Tcl versions the shell happened to find is not a result. TCLSH overrides.
 TCLSH="${TCLSH:-}"
 if [ -z "$TCLSH" ]; then
-    if command -v tclsh >/dev/null 2>&1; then
+    PINNED="C:/Users/zyq/scoop/apps/msys2/current/ucrt64/bin/tclsh.exe"
+    if [ -x "$PINNED" ]; then
+        TCLSH="$PINNED"
+    elif command -v tclsh >/dev/null 2>&1; then
         TCLSH="$(command -v tclsh)"
     else
-        TCLSH="C:/Users/zyq/scoop/apps/msys2/current/ucrt64/bin/tclsh.exe"
+        echo "error: no tclsh found; set TCLSH" >&2
+        exit 1
     fi
 fi
 if ! "$TCLSH" "$SCRATCH/ver.tcl" > "$SCRATCH/ver.out" 2>&1; then
@@ -63,6 +71,30 @@ NSQLITED="${NSQLITED:-$DIR/target/debug/nsqlited.exe}"
 if [ ! -x "$NSQLITED" ]; then
     echo "error: engine not built: $NSQLITED" >&2
     echo "       run 'cargo build --workspace' first" >&2
+    exit 1
+fi
+
+# The shim drives the engine through `--testsuite`, and a binary built before
+# that mode existed exits 0 without writing a record stream. Every statement
+# then raises "the engine produced no record stream", the test file aborts, and
+# the run reports zero tests -- which reads as a clean run of a file that has
+# hundreds of cases. So the engine is asked for one row and the answer is
+# checked: a `C` record with a value means the protocol is there. A binary
+# without `--testsuite` cannot answer, and the run stops here instead of
+# reporting a vacuous pass.
+printf 'SELECT 1;\n' > "$SCRATCH/probe.sql"
+"$NSQLITED" --testsuite "$SCRATCH/probe.db" < "$SCRATCH/probe.sql" \
+    > "$SCRATCH/probe.out" 2>&1
+if ! grep -qE '^C 1 ' "$SCRATCH/probe.out" || ! grep -qE '^R ' "$SCRATCH/probe.out"; then
+    echo "error: $NSQLITED does not speak --testsuite:" >&2
+    echo "       $(head -1 "$SCRATCH/probe.out" | tr -d '\r')" >&2
+    echo "       run 'cargo build -p nsqlited' first" >&2
+    exit 1
+fi
+# An engine that cannot report its own version is not usable either.
+if ! "$NSQLITED" --version > /dev/null 2>&1; then
+    echo "error: $NSQLITED does not run: '$(head -1 "$SCRATCH/probe.out" | tr -d '\r')'" >&2
+    echo "       run 'cargo build -p nsqlited' first" >&2
     exit 1
 fi
 export NSQLITED
