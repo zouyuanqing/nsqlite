@@ -17,13 +17,14 @@
 #
 # The array is defined by SQLite's own test fixture, in src/test_config.c, in
 # the proc set_options(). It has exactly 128 entries at tag version-3.53.4.
-# The .test files reference 89 of them directly through ifcapable/capable;
-# the rest are read as plain array variables.
+# .test files name 108 of them in an ifcapable/capable expression; 113 are
+# named somewhere in the tree once the harness .tcl files and direct
+# $::sqlite_options(NAME) reads are included.
 #
 # Nothing in the suite ever sets a missing entry. So an engine that leaves one
 # undefined does not get a clean skip, it gets "can't read
 # "::sqlite_options(fts5)": no such variable" and the test file dies. That is
-# why this file defines ALL 127, including the ones nsqlite does not implement.
+# why this file defines ALL 128, including the ones nsqlite does not implement.
 # A test guarded by `ifcapable rbu` should skip because rbu is 0, not because
 # the array lookup blew up.
 #

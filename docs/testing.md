@@ -60,13 +60,26 @@ the algorithm by hash length:
 
 ```
 416  40  -> sha1
-869  64  -> sha3-256
+870  64  -> sha3-256
 ```
 
-`openssl dgst` handles both (`sha3sum` is not present on this machine). All
-1283 files under `test/` plus `VERSION` are checked, and the fetch stamps
-`.fetched-version` only after they all pass. A stamp therefore always means
-"this tree hashes clean".
+Manifest rows are `F <name> <hash> [<perms>]`. Three files in `test/` are marked
+executable and so carry a fourth field, the literal `x`: `test/testrunner.tcl`,
+`test/speedtest.tcl` and `test/json/json-speed-check.sh`. That is why the counts
+above are 416 + 870 rather than 416 + 869 — the two 64-hex rows extra in the raw
+census are those files' *hashes*, not extra files. The verifier reads the fourth
+field explicitly and discards it; reading only three fields folds `x` onto the
+end of the hash, makes the field 42 or 66 characters, and drops the row at the
+length check. That failure is silent, and it would have applied to
+`testrunner.tcl` — the suite's own job scheduler.
+
+All 1286 files under `test/` plus `VERSION` are therefore checked (1285 files in
+`test/` + `VERSION`), and the fetch stamps `.fetched-version` only after they all
+pass. A stamp therefore always means "this tree hashes clean".
+
+The stamp records the count as well as the version, `<version> <count>`, so a
+future drop in coverage shows up rather than passing quietly. `verify_manifest`
+also treats an unrecognised hash-field length as a failure rather than a skip.
 
 This is verified end to end, not assumed:
 
@@ -74,7 +87,7 @@ This is verified end to end, not assumed:
 $ tools/fetch_sqlite_suite.sh
 fetching sqlite/sqlite tag version-3.53.4
   downloaded 13163206 bytes
-  verified 1283 files against manifest (SHA-1 + SHA3-256)
+  verified 1286 files against manifest (SHA-1 + SHA3-256)
 
 sqlite suite 3.53.4 installed at .../test/sqlite-suite
   1190 .test files
@@ -286,18 +299,30 @@ Two consequences follow, and both are load-bearing:
 ### The 128 entries
 
 The array is defined by SQLite's test fixture in `src/test_config.c`, in
-`set_options()`. It has **128** entries at tag `version-3.53.4`. Of these, 105
-are referenced directly by `.test` files through `ifcapable`/`capable`; the
-remaining 23 are read only as plain array variables, or only by `tester.tcl`
-itself.
+`set_options()`. It has **128** entries at tag `version-3.53.4`. Of these, **108**
+are named by `.test` files in an `ifcapable`/`capable` expression, and **113**
+are named somewhere in the tree if the three harness `.tcl` files and direct
+`$::sqlite_options(NAME)` reads are included as well. The remaining 15 are never
+named at all:
 
-(Counting this needs care. `ifcapable` accepts `ifcapable fts5`, `ifcapable
-!fts5` and `ifcapable {fts5 && ...}`, so a regex has to allow an optional `!`
-and brace. A first pass that assumed names begin with a letter silently dropped
-`8_3_names`; a second that allowed digits picked up `database`, `of` and
-`shared_chache` from prose and a comment typo in `e_uri.test`. The 105 figure is
-from a pattern that matches all three call forms and discards non-option tokens
-by checking each against the 128.)
+```
+autoindex between_opt carray complete decltype diskio geopoly localtime
+memdebug multiplex_ext_overwrite ordered_set_funcs rowid32 rtree_int_only
+truncate_opt worker_threads
+```
+
+(Counting this needs care, and the exact figure depends on what is being
+scanned. `ifcapable` accepts `ifcapable fts5`, `ifcapable !fts5` and
+`ifcapable {fts5 && ...}`, and the condition can also sit in the second operand
+of a `||`, as in `crashM.test:19`:
+`ifcapable !crashtest||!8_3_names`. A first pass that assumed names begin with
+a letter silently dropped `8_3_names`; a second that allowed digits also picks
+up `database`, `of` and `shared_chache` — the first two from prose comments
+("is capable of reading and writing databases", "we are not capable of doing an
+integrity check") and the third from a typo in a trailing comment at
+`e_uri.test:434`. Those three are not options and are discarded by checking each
+token against the 128. No `.test` file uses a `$` variable in the condition
+position, so there is no dynamic form to chase.)
 
 `tools/capabilities.tcl` defines all 128 and asserts the count at source time,
 so a drift from the upstream list fails immediately rather than 200 files deep:
@@ -317,9 +342,13 @@ and diffed against `tools/capabilities.tcl`; the two sets are identical.
 One trap worth flagging, since it bit this extraction: `8_3_names` starts with a
 digit. A regex that assumes names begin with a letter or underscore silently
 drops it, and the resulting 127-entry list looks entirely plausible. It is
-referenced by five test files — `8_3_names.test`, `delete_db.test`,
-`mjournal.test`, `multiplex.test` and `multiplex3.test` — which would then die
-on a missing entry.
+named by **six** `.test` files — `8_3_names.test`, `crashM.test`,
+`delete_db.test`, `mjournal.test`, `multiplex.test` and `multiplex3.test` —
+which would then die on a missing entry. Five name it directly and one
+(`crashM.test:19`) reaches it in the second operand of a `||`, which is the
+form a scan that only looks at the first token also misses. (`permutations.test`
+also lists `8_3_names.test` in a `-files` list; that is the file name, not the
+option.)
 
 ### Feature macros per entry
 
@@ -531,10 +560,10 @@ plus suite work, and do not publish a suite pass rate.
 This is worth stating plainly because "what percentage should we expect" has an
 answer that is easy to get wrong by pattern-matching against projects that do
 publish numbers (compilers, parsers, kernels). The TCL suite is not like those.
-It is a 1190-file, roughly 490k-line suite written over 25 years by the person
-who wrote the engine, testing the engine through an API that exposes its
-internals. There is no reference point for "a good from-scratch engine scores
-X%."
+It is a 1190-file suite whose `.test` + `.tcl` tree is 498,973 lines, written
+over 25 years by the person who wrote the engine, testing the engine through an
+API that exposes its internals. There is no reference point for "a good
+from-scratch engine scores X%."
 
 ### Turso describes the TCL suite as ongoing work
 
@@ -633,19 +662,26 @@ A here-doc preflight would therefore pass unconditionally and the script would
 fall through to a raw Tcl error. `run_suite.sh` writes its probes to a temp
 directory for this reason.
 
-`tools/capabilities.tcl` is standalone and can be checked without an engine:
+`tools/capabilities.tcl` is standalone and can be checked without an engine.
+Ship the probe as a **file**, for the same reason as above:
 
 ```sh
-tclsh -c 'source tools/capabilities.tcl; puts [array size ::sqlite_options]'
+printf 'source tools/capabilities.tcl; puts [array size ::sqlite_options]\n' > /tmp/cap.tcl
+tclsh /tmp/cap.tcl
 # 128
 ```
+
+There is no `tclsh -c` on 8.6. `-c` is not a flag, so `tclsh` treats it as a
+script filename, fails to open it, and drops to the interactive REPL — printing
+a bare `%` and then blocking on stdin. It exits 0, so the mistake reads as
+success and the expected `128` never appears at all.
 
 ### Environment
 
 | Variable | Effect |
 | --- | --- |
 | `TCLSH` | Which `tclsh` to use. Defaults to `tclsh` on `PATH`, falling back to the ucrt64 build. |
-| `TESTER` | Override the harness path. This is how strategy (b) swaps in a shim. |
+| `TESTER` | Override the **driver** path. Defaults to `test/testrunner.tcl`. |
 | `TCLTEST_PART` | Shard selector, read by `permutations.test` as `A/B`. |
 | `TESTDIR` | Points at the suite's `test/` directory. |
 | `SQLITE_TEST_DIR` | Set to the same value; read by `testrunner.tcl`. |
@@ -653,6 +689,49 @@ tclsh -c 'source tools/capabilities.tcl; puts [array size ::sqlite_options]'
 Note that `TESTDIR` is not how `.test` files find the harness — they use
 `[file dirname $argv0]`. It is set because the harness and several `.test` files
 read it anyway.
+
+### What `run_suite.sh` actually executes
+
+`run_suite.sh` does **not** run `tester.tcl`. `tester.tcl` is a library, not a
+driver: every `.test` file does `set testdir [file dirname $argv0]` and
+`source $testdir/tester.tcl`, then calls `finish_test`. Run directly,
+`tester.tcl` executes its one-time init (`sqlite3_shutdown`,
+`install_malloc_faultsim`, `sqlite3_initialize`, `autoinstall_test_functions`),
+reaches its last line — `set tester_tcl_has_run 1` — and exits **0** without
+running a single test. A pass.
+
+The driver is `testrunner.tcl`, the suite's own entry point, invoked as:
+
+```sh
+tclsh testrunner.tcl <permutation> <path/to/file.test>
+```
+
+That is the suite's documented single-file contract: *"If a PERMUTATION is
+specified and is followed by the path to a Tcl script instead of a list of
+patterns, then that single Tcl test script is run with the specified
+permutation."* The permutation is positional, and an empty string means the
+default. `testrunner.tcl` dispatches on exactly that two-argument shape before
+it does anything else, and it is what `make test` runs upstream.
+
+This is also why a bare `full` passed as a second positional to `tester.tcl`
+would be a real bug and not a cosmetic one: `tester.tcl` has no positional
+permutation handling at all. It collects unrecognised arguments into `leftover`
+and assigns them to `argv`, and `finish_test` then `source`s each entry as an
+additional test file. A bare `full` would be sourced as if it were a `.test`.
+
+The `--start=<perm>:<file>` form is a *different* entry point. It sets
+`::G(start:permutation)` and `::G(start:file)`, but both are only consulted
+inside `slave_test_file` (`tester.tcl:2392`), which is reached solely through
+`permutations.test`'s `run_tests` loop. It filters; it does not apply a
+permutation, because applying one means setting `::G(perm:name)`,
+`::G(perm:prefix)` and `::G(perm:dbconfig)`, and only `testrunner.tcl` and
+`run_tests` do that.
+
+`TCLTEST_PART` is read in exactly one place: `permutations.test:1165`, inside
+`run_tests` — the same file-list driver. The single-file path does not consult
+it. `run_suite.sh` still exports it when `--part` is given, so a shim or a
+driver that wraps `permutations.test` can honour it, but sharding a
+`testrunner.tcl <perm> <file>` invocation does nothing on its own.
 
 ### Current toolchain
 

@@ -19,8 +19,9 @@
 #
 # Environment:
 #   TCLSH        tclsh to use          (default: tclsh on PATH, else ucrt64)
-#   TESTER       tester.tcl override   (default: <suite>/test/tester.tcl)
+#   TESTER       driver override      (default: <suite>/test/testrunner.tcl)
 #   TCLTEST_PART passed through if set in the environment
+###
 set -euo pipefail
 
 SUITE_VERSION_DEFAULT="3.53.4"
@@ -29,7 +30,7 @@ PART=""
 PATTERN=""
 
 usage() {
-    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,/^###$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -56,7 +57,7 @@ if [ $# -gt 0 ] && [ -z "$PATTERN" ]; then PATTERN="$1"; shift; fi
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SUITE="$DIR/test/sqlite-suite"
 TEST_DIR="$SUITE/test"
-TESTER="${TESTER:-$TEST_DIR/tester.tcl}"
+RUNNER="${TESTER:-$TEST_DIR/testrunner.tcl}"
 
 # --- 1. is the suite there? ------------------------------------------------
 if [ ! -d "$TEST_DIR" ]; then
@@ -75,10 +76,10 @@ sqlite/sqlite GitHub mirror and verifies it against the fossil manifest.
 EOF
     exit 1
 fi
-if [ ! -f "$TESTER" ]; then
-    echo "error: harness not found: $TESTER" >&2
-    if [ "$TESTER" != "$TEST_DIR/tester.tcl" ]; then
-        echo "       TESTER is set to $TESTER" >&2
+if [ ! -f "$RUNNER" ]; then
+    echo "error: harness not found: $RUNNER" >&2
+    if [ "$RUNNER" != "$TEST_DIR/testrunner.tcl" ]; then
+        echo "       TESTER is set to $RUNNER" >&2
     fi
     echo "       re-run tools/fetch_sqlite_suite.sh --force" >&2
     exit 1
@@ -140,9 +141,9 @@ echo "nsqlite test runner"
 echo "  suite      $SUITE_VER  ($TEST_DIR)"
 echo "  pattern    $PATTERN  ->  ${#MATCHES[@]} file(s)"
 echo "  tclsh      $TCLSH (Tcl $TCL_VERSION)"
-echo "  harness    $TESTER"
+echo "  harness    $RUNNER"
 echo "  scratch    $DIR/test/sqlite-run"
-[ -n "$PERMUTATION" ] && echo "  permutation $PERMUTATION"
+[ -n "$PERMUTATION" ] && echo "  permutation ${PERMUTATION:-<default>}"
 if [ -n "$PART" ]; then
     echo "  TCLTEST_PART $PART"
 elif [ -n "${TCLTEST_PART:-}" ]; then
@@ -203,7 +204,9 @@ Two ways forward, both described in docs/testing.md:
       at line 102 no matter what else works.
 
   (b) tester.tcl shim driving a CLI binary over exec (the approach Turso takes).
-      That sidesteps every command above, because the shim only shells out:
+      That sidesteps every command above, because the shim only shells out.
+      A shim replaces tester.tcl, not the driver, so point TESTER at it and the
+      invocation contract in section 6 is unchanged:
           TESTER=$DIR/tools/tester_shim.tcl tools/run_suite.sh '$PATTERN'
 
 Until one of those exists, nsqlite cannot be measured against the official
@@ -213,17 +216,48 @@ EOF
 fi
 
 # --- 6. run ----------------------------------------------------------------
+# WHAT IS EXECUTED, AND WHY IT IS NOT tester.tcl
+#
+# tester.tcl is a LIBRARY, not a driver. Every .test file does
+# `set testdir [file dirname $argv0]` + `source $testdir/tester.tcl` and then
+# calls finish_test. Executed directly, tester.tcl runs its one-time init block
+# (sqlite3_shutdown, install_malloc_faultsim, sqlite3_initialize,
+# autoinstall_test_functions) and then hits `set tester_tcl_has_run 1` -- its
+# last line. Zero tests run, and it exits 0, so the result looks like a pass.
+#
+# The driver is testrunner.tcl, which is the suite's own entry point (it is
+# what `make test` runs). For a single file it accepts exactly
+#
+#     tclsh testrunner.tcl <permutation> <path/to/file.test>
+#
+# and that two-argument shape is the documented contract: "If a PERMUTATION is
+# specified and is followed by the path to a Tcl script instead of a list of
+# patterns, then that single Tcl test script is run with the specified
+# permutation." An empty permutation string means the default.
+#
+# The permutation is a POSITIONAL argument here. It is not a bare word that
+# gets appended to a --start= option, and it is not a second .test file.
+#
 # Each file gets its own scratch directory. The suite deletes and reopens
 # test.db constantly; sharing one directory across files makes a result depend
 # on leftovers and makes a crash hard to attribute.
 RUN_ROOT="$DIR/test/sqlite-run"
 mkdir -p "$RUN_ROOT"
 
-# The harness derives its own testdir from the path of the script being run, so
-# these point at the directory holding the .test files, not at the scratch dir.
+# The .test file locates its harness from [file dirname $argv0], which the
+# absolute path below already fixes. These are still exported because the
+# harness itself and several .test files read them.
 export TESTDIR="$TEST_DIR"
 export SQLITE_TEST_DIR="$TEST_DIR"
-[ -n "$PART" ] && export TCLTEST_PART="$PART"
+
+# TCLTEST_PART is read only by permutations.test's run_tests() -- the
+# file-list driver -- and NOT by tester.tcl. So it is only meaningful when a
+# driver that consults it is in play; for the single-file driver used here it
+# is still exported so that a custom TESTER (strategy (b) shim, or a driver
+# wrapping permutations.test) can honour it. See the note printed below.
+if [ -n "$PART" ]; then
+    export TCLTEST_PART="$PART"
+fi
 
 overall=0
 failed=()
@@ -235,11 +269,7 @@ for name in "${MATCHES[@]}"; do
 
     echo "=== $name ==="
     set +e
-    if [ -n "$PERMUTATION" ]; then
-        ( cd "$work" && "$TCLSH" "$TESTER" "$PERMUTATION" "$TEST_DIR/$name" )
-    else
-        ( cd "$work" && "$TCLSH" "$TESTER" "$TEST_DIR/$name" )
-    fi
+    ( cd "$work" && "$TCLSH" "$RUNNER" "$PERMUTATION" "$TEST_DIR/$name" )
     rc=$?
     set -e
 
