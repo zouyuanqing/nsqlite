@@ -13,6 +13,7 @@
 //! * [`pager`] — the page cache over a database file.
 //! * [`connection`] — running statements against a database.
 //! * [`aggregate`] — aggregate functions and grouping.
+//! * [`index`] — index b-trees.
 //! * [`journal`] — the rollback journal.
 //! * [`catalog`] — the tables a connection knows about.
 //! * [`eval`] — expression evaluation and the built-in functions.
@@ -36,6 +37,7 @@ pub mod catalog;
 pub mod connection;
 pub mod error;
 pub mod eval;
+pub mod index;
 pub mod journal;
 pub mod page;
 pub mod pager;
