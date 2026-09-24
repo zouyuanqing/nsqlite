@@ -300,6 +300,160 @@ set ::SQLITE_MAX_SCHEMA                0
 set ::SQLITE_MAX_TRIGGER_STEPS         1000000
 set ::TEMP_STORE                       0
 
+# -- Remaining testfixture C commands (src/test1.c's command table). These
+#    are inert: they exist so a test file does not abort on the first line.
+#    Any test that actually asserts on one of them will fail, which is the
+#    honest outcome. The raw sqlite3_* C-API commands (sqlite3_step,
+#    sqlite3_column_*, sqlite3_bind_*, ...) are deliberately NOT stubbed:
+#    they need a real sqlite3* handle, and stubbing them would let a test
+#    report success while the engine did nothing.
+proc load_static_extension {args} { return }
+proc add_test_collate {args} { return }
+proc add_test_collate_needed {args} { return }
+proc add_test_function {args} { return }
+proc add_test_utf16bin_collate {args} { return }
+proc add_alignment_test_collations {args} { return }
+proc atomic_batch_write {args} { return }
+proc create_null_module {args} { return }
+proc register_dbstat_vtab {args} { return }
+proc optimization_control {args} { return }
+proc print_explain_query_plan {args} { return }
+proc pcache_stats {args} { return }
+proc sqlite3_vfs_list {args} { return }
+proc sqlite3_create_function_v2 {args} { return }
+proc sqlite3_create_function {args} { return }
+proc sqlite3_create_collation {args} { return }
+proc sqlite3_rekey {args} { return }
+proc sqlite3_db_readonly_ {args} { return }
+proc sqlite3_wal_checkpoint {args} { return }
+proc sqlite3_wal_checkpoint_v2 {args} { return }
+proc sqlite3_wal_autocheckpoint {args} { return }
+proc sqlite3_unlock_notify {args} { return }
+proc sqlite3_mmap_warm {args} { return }
+proc sqlite3_pager_refcounts {args} { return }
+proc sqlite3_expanded_sql {args} { return }
+proc sqlite3_normalize {args} { return }
+proc sqlite3_normalized_sql {args} { return }
+proc sqlite3_stmt_explain {args} { return }
+proc sqlite3_stmt_isexplain {args} { return }
+proc sqlite3_stmt_readonly {args} { return }
+proc sqlite3_stmt_status {args} { return }
+proc sqlite3_global_recover {args} { return }
+proc sqlite3_delete_database {args} { return }
+proc sqlite3_db_filename {args} { return }
+proc sqlite3_db_readonly {args} { return }
+proc sqlite3_db_cacheflush {args} { return }
+proc sqlite3_db_release_memory {args} { return }
+proc sqlite3_sleep {args} { return }
+proc sqlite3_system_errno {args} { return }
+proc sqlite3_error_offset {args} { return }
+proc sqlite3_expired {args} { return }
+proc sqlite3_set_errmsg {args} { return }
+proc sqlite3_txn_state {args} { return }
+proc sqlite3_transfer_bindings {args} { return }
+proc sqlite3_thread_cleanup {args} { return }
+proc sqlite3_libversion_number {args} { return }
+proc sqlite3_table_column_metadata {args} { return }
+proc vfs_initfail_test {args} { return }
+proc vfs_unregister_all {args} { return }
+proc vfs_reregister_all {args} { return }
+proc vfs_current_time_int64 {args} { return }
+proc file_control_test {args} { return }
+proc file_control_chunksize_test {args} { return }
+proc file_control_sizehint_test {args} { return }
+proc file_control_data_version {args} { return }
+proc file_control_persist_wal {args} { return }
+proc file_control_powersafe_overwrite {args} { return }
+proc file_control_vfsname {args} { return }
+proc file_control_reservebytes {args} { return }
+proc file_control_tempfilename {args} { return }
+proc file_control_external_reader {args} { return }
+proc file_control_lockproxy_test {args} { return }
+proc file_control_lasterrno_test {args} { return }
+proc strftime {args} { return }
+proc tcl_objproc {args} { return }
+proc sorter_test_fakeheap {args} { return }
+proc sorter_test_sort4_helper {args} { return }
+proc test_sqlite3_log {args} { return }
+proc prng_seed {args} { return }
+proc filc_build {args} { return }
+proc .treetrace {args} { return }
+proc bind_carray_intptr {args} { return }
+proc dbconfig_maindbname_icecube {args} { return }
+proc file_control_win32_av_retry {args} { return }
+proc file_control_win32_get_handle {args} { return }
+proc file_control_win32_set_handle {args} { return }
+proc getrusage {args} { return {0 0 0} }
+proc lock_win32_file {args} { return }
+
+# -- Secondary testfixture modules (src/test_vfs.c, test_hexio.c,
+#    test_demovfs.c, test_jt_vfs.c, test_bestindex.c, test_sqllog.c,
+#    test_async.c, test_ctrl.c, test_malloc.c). Like the set above these are
+#    inert placeholders so a .test file does not die on line 1.
+# `testvfs NAME ...` registers a scriptable VFS and creates a Tcl command
+# called NAME. Tests then call `NAME script`, `NAME filter`, `NAME delete`.
+# Creating that command is what the following lines depend on, so the stub has
+# to actually do it; the VFS itself is never installed, so any test that
+# relies on its behaviour will fail rather than pass falsely.
+namespace eval ::nsqlite {}
+proc testvfs {name args} {
+    if {$name eq "" || [string index $name 0] eq "-"} { return }
+    interp alias {} $name {} ::nsqlite::tvfs_stub
+    return
+}
+proc ::nsqlite::tvfs_stub {args} {
+    # `delete` must actually remove the command, like the real one.
+    if {[lindex $args 0] eq "delete"} {
+        catch {interp alias {} [lindex $args 0] {}}
+        return
+    }
+    return
+}
+proc vfslog {args} { return }
+proc vdbe_coverage {args} { return }
+proc md5 {args} { return }
+proc md5file {args} { return }
+proc btree_insert {args} { return }
+proc btree_from_db {args} { return }
+proc btree_pager_stats {args} { return }
+proc btree_set_cache_size {args} { return }
+proc sqlthread {args} { return }
+proc clock_seconds {args} { return }
+proc register_demovfs {args} { return }
+proc unregister_demovfs {args} { return }
+proc register_jt_vfs {args} { return }
+proc unregister_jt_vfs {args} { return }
+proc register_cube_geom {args} { return }
+proc register_circle_geom {args} { return }
+proc sqlite3_crash_enable {args} { return }
+proc sqlite3_crash_now {args} { return }
+proc sqlite3_crash_on_write {args} { return }
+proc sqlite3_crashparams {args} { return }
+proc sqlite3_simulate_device {args} { return }
+proc vfs_set_readmark {args} { return }
+proc vfs_shmlock {args} { return }
+proc sqlite3_auto_extension_sqr {args} { return }
+proc sqlite3_auto_extension_cube {args} { return }
+proc sqlite3_auto_extension_broken {args} { return }
+proc sqlite3_cancel_auto_extension_sqr {args} { return }
+proc sqlite3_cancel_auto_extension_cube {args} { return }
+proc sqlite3_cancel_auto_extension_broken {args} { return }
+proc sqlite3demo_superlock {args} { return }
+proc sqlite3_blocking_step {args} { return }
+proc sqlite3_backup {args} { return }
+proc sqlite3_install_memsys3 {args} { return }
+proc sqlite3_config_alt_pcache {args} { return }
+proc sqlite3_config_heap {args} { return }
+proc sqlite3_config_lookaside {args} { return }
+proc sqlite3_config_pagecache {args} { return }
+proc sqlite3_config_sorterref {args} { return }
+proc sqlite3_db_config_lookaside {args} { return }
+proc sqlite3_exec_nr {args} { return }
+proc sqlite3_memdebug_fail {args} { return }
+proc sqlite3_win_test_unc_locking {args} { return }
+proc sqlite3_vfs {args} { return }
+proc sqlite3_autovacuum_pages {args} { return }
+
 # -- load_testfixture_extensions INTERP
 #    tester.tcl:2379 calls this in EVERY slave interpreter, passing the handle
 #    of the new interpreter, immediately before sourcing the .test file into
@@ -386,20 +540,70 @@ source [file join $testdir tester.tcl]
 set ::G(verbose) 0
 
 foreach f $::NSQL_SUITE_FILES {
-  set file [file join $testdir $f]
-  puts stderr "--- $f ---"
+  # $f is resolved to an absolute path in the PARENT: the child interpreter
+  # changes directory (tester.tcl cds into a scratch dir), so a bare file name
+  # would not resolve there.
+  set f [file join $testdir $f]
+  puts stderr "--- [file tail $f] ---"
   set ::TC(count) 0
   set ::TC(errors) 0
   set ::TC(fail_list) [list]
   set ::TC(omit_list) [list]
-  if {[catch {uplevel #0 [list source $file]} err]} {
+  # A .test file is a plain Tcl script, and tester.tcl can call [abort] on
+  # some conditions, so running every file in this one interpreter lets one
+  # file tear down the whole loop. Run each file in a child interpreter, whose
+  # death cannot affect the parent.
+  set ::TC(errors) 0
+  if {[catch {
+      interp create nfile
+      # The child needs the real sqlite3 extension: tester.tcl:115 renames
+      # the [sqlite3] command, which aborts the whole source if it is absent.
+      interp eval nfile [list lappend auto_path [file join $suite tcl]]
+      interp eval nfile {package require sqlite3}
+      interp eval nfile [list set ::argv0 $::argv0]
+      interp eval nfile [list set ::argv  [list $f]]
+      # tester.tcl:496 reads $testdir before deriving it, and every .test file
+      # opens with `set testdir [file dirname $argv0]`, so seed it here.
+      interp eval nfile [list set ::testdir $testdir]
+      interp eval nfile [list set ::nsqlite_name [file tail $f]]
+      # Tests that drive the raw C API set ::STMT / ::DB from a real
+      # sqlite3_connection_pointer. Provide inert placeholders so such a file
+      # runs and FAILS on its assertions instead of aborting on a missing var.
+      if {![info exists ::nsqlite_seeded]} { set ::nsqlite_seeded 1 }
+      interp eval nfile {if {![info exists ::STMT]} {set ::STMT 0}}
+      interp eval nfile {if {![info exists ::DB]}  {set ::DB  0}}
+      interp eval nfile [list array set ::G [array get ::G]]
+      interp eval nfile [list source [file join $suite tcl options.tcl]]
+      interp eval nfile [list set ::nsqlite_tcl_suite_dir $suite]
+      interp eval nfile [list source [file join $suite tcl testfixture_ext.tcl]]
+      interp eval nfile [list source [file join $testdir tester.tcl]]
+      # The file's tests run inside SLAVE interpreters (tester.tcl's
+      # slave_test_file), and the counters are kept in the PARENT of those
+      # slaves, i.e. in `nfile`. So the totals have to be sampled after the
+      # file finishes, out of the child rather than out of this process.
+      # A .test file ends by calling finish_test, which (in the plain sqlite3
+      # extension) prints the summary and returns; it only calls [exit] under
+      # testrunner. Either way the child may end before the parent can read its
+      # counters, so the child itself writes the result line to stderr and the
+      # parent just relays it.
+      interp eval nfile [list proc ::nsqlite_report {} {
+        puts stderr "  RESULT $::nsqlite_name tests=$::TC(count) errors=[llength $::TC(fail_list)] omitted=[llength $::TC(omit_list)]"
+        foreach t $::TC(fail_list) { puts stderr "    ! $t" }
+      }]
+      # Replace finish_test (defined by tester.tcl) with a reporter, so the
+      # child's own summary is emitted and the child does not exit.
+      interp eval nfile {rename finish_test {}}
+      interp eval nfile {proc finish_test {args} { ::nsqlite_report }}
+      interp eval nfile [list source $f]
+      interp delete nfile
+  } err opts]} {
+    catch {interp delete nfile}
     puts stderr "  SOURCE ERROR: $err"
+    if {[dict exists $opts -errorinfo]} {
+        puts stderr [string range [dict get $opts -errorinfo] 0 500]
+    }
+    set n 0; set e 1; set o 0
   }
-  set n $::TC(count)
-  set e [llength $::TC(fail_list)]
-  set o [llength $::TC(omit_list)]
-  puts stderr "  RESULT $f tests=$n errors=$e omitted=$o"
-  if {$e} { foreach t $::TC(fail_list) { puts stderr "    ! $t" } }
 }
 TCL
 

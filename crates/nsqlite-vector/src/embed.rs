@@ -7,6 +7,8 @@
 //! by it, and every public method here relies on that, so `embed_batch(&texts)`
 //! returns vectors in exactly the order of `texts`.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::ClientConfig;
@@ -20,6 +22,20 @@ use crate::error::VectorError;
 pub const MAX_BATCH_SIZE: usize = 64;
 
 /// How the vectors are encoded in the response.
+///
+/// The variant name is what a request body carries and what a mismatch report
+/// shows, so the two come from this one enum rather than a hand-written string
+/// in each place.
+///
+/// **On the `Base64` payload.** OpenRouter documents the member as no more than
+/// "a base64 string" and says nothing about element width or byte order, so
+/// this crate has to pick a reading. It assumes the OpenAI-compatible
+/// convention: a little-endian `f32` per element, no length prefix, no header.
+/// A deployment that emits `f64` elements, big-endian elements, or a length
+/// prefix is **not** supported under this encoding, and it decodes to
+/// plausible garbage rather than failing — the byte count is always a multiple
+/// of four, so there is nothing to reject it by. Use [`EncodingFormat::Float`]
+/// against any server whose encoding has not been confirmed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EncodingFormat {
@@ -27,8 +43,19 @@ pub enum EncodingFormat {
     #[default]
     Float,
     /// One base64 string per vector holding little-endian `f32`s. Roughly a
-    /// third of the bytes over the wire, which matters for large batches.
+    /// third of the bytes over the wire, which matters for large batches. See
+    /// the type-level note on what the crate assumes about the payload.
     Base64,
+}
+
+impl fmt::Display for EncodingFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Matches `#[serde(rename_all = "lowercase")]`.
+        f.write_str(match self {
+            EncodingFormat::Float => "float",
+            EncodingFormat::Base64 => "base64",
+        })
+    }
 }
 
 /// The `input` member of an embeddings request: one string or a batch of them.
@@ -99,14 +126,16 @@ impl EmbedRequest {
 
 /// The raw `embedding` member of a response entry.
 ///
-/// OpenRouter documents this as either an array of floats or, when
-/// `encoding_format` is `base64`, a string. Both shapes are accepted regardless
-/// of what was requested, so a server that ignores the parameter still parses.
+/// Either an array of floats or, when `encoding_format` is `base64`, a string.
+/// `Null` is the convention some providers use for an input that was skipped
+/// outright; it is kept as its own variant so the mismatch can be reported
+/// against the entry's `index` instead of failing as a JSON type error.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum RawEmbedding {
     Floats(Vec<f64>),
     Base64(String),
+    Null,
 }
 
 /// One entry of the response `data` array.
@@ -147,16 +176,46 @@ struct RawEmbedResponse {
 /// input, and silently dropping one would put the wrong vector at that
 /// position. Pass `expected` to also require exactly that many vectors, which
 /// is what catches a server that quietly returns fewer than it was given.
+///
+/// `requested_format` is the `encoding_format` that was sent. When it is
+/// `Some`, a vector that arrives in the other representation is a
+/// [`VectorError::Decode`]: the caller selected a wire format as part of the
+/// contract, so a server that ignored the parameter is a bug to surface, not
+/// something to paper over. Pass `None` to accept either representation, which
+/// is only right for a body the caller did not just build.
+///
 /// Returns [`VectorError::Decode`] for anything malformed.
 pub fn parse_embed_response(
     body: &str,
     expected: Option<usize>,
+    requested_format: Option<EncodingFormat>,
 ) -> Result<EmbedResponse, VectorError> {
     let raw: RawEmbedResponse = serde_json::from_str(body)
         .map_err(|e| VectorError::Decode(format!("embeddings response is not valid JSON: {e}")))?;
 
     let mut indexed = Vec::with_capacity(raw.data.len());
     for entry in raw.data {
+        let actual = match &entry.embedding {
+            RawEmbedding::Floats(_) => EncodingFormat::Float,
+            RawEmbedding::Base64(_) => EncodingFormat::Base64,
+            // A `null` embedding is a well-formed answer for an input the server
+            // skipped, not a malformed one, so it is named rather than left to
+            // fail as a JSON type error with no index attached. There is nowhere
+            // in `Vec<Vec<f64>>` to put the hole, so it is still a refusal.
+            RawEmbedding::Null => {
+                return Err(VectorError::Decode(format!(
+                    "embedding at index {} is null; this crate has no place to put a skipped input",
+                    entry.index
+                )));
+            }
+        };
+        if let Some(requested) = requested_format.filter(|requested| *requested != actual) {
+            return Err(VectorError::Decode(format!(
+                "embedding at index {} arrived as {actual} but encoding_format \
+                 \"{requested}\" was requested",
+                entry.index
+            )));
+        }
         let vector = decode_embedding(&entry.embedding).ok_or_else(|| {
             VectorError::Decode(format!(
                 "embedding at index {} could not be decoded",
@@ -203,37 +262,54 @@ pub fn parse_embed_response(
 /// Decodes one `embedding` member into a `Vec<f64>`.
 ///
 /// `Err` means the value is neither a float array nor a base64 string of
-/// whole little-endian `f32`s.
+/// whole little-endian `f32`s, or that the decoded vector holds a value no
+/// similarity search could use. The finiteness check is deliberately outside
+/// the match: a `NaN` or an infinity is as bad arriving as base64 as it is
+/// arriving as a float array, and the two encodings have to agree about that
+/// or the choice of `encoding_format` decides whether a corrupt vector is
+/// caught.
 fn decode_embedding(raw: &RawEmbedding) -> Option<Vec<f64>> {
-    match raw {
-        RawEmbedding::Floats(values) => {
-            if values.iter().any(|v| !v.is_finite()) {
-                return None;
-            }
-            Some(values.clone())
-        }
+    let vector = match raw {
+        RawEmbedding::Floats(values) => values.clone(),
         RawEmbedding::Base64(encoded) => {
             let bytes = base64_decode(encoded)?;
             if bytes.len() % 4 != 0 || bytes.is_empty() {
                 return None;
             }
-            Some(
-                bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
-                    .collect(),
-            )
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+                .collect()
         }
+        RawEmbedding::Null => return None,
+    };
+
+    if vector.iter().any(|v| !v.is_finite()) {
+        return None;
     }
+    Some(vector)
 }
 
-/// Decodes standard base64, with or without padding, ignoring ASCII whitespace.
+/// Decodes standard base64, with or without padding.
+///
+/// ASCII whitespace is skipped **anywhere** in the input, not only at the ends,
+/// so a value that arrived line-wrapped still decodes. The capacity reserves
+/// room for the padded length: a wrapped string carries whitespace that
+/// `len() / 4 * 3` no longer accounts for, and the vector would otherwise
+/// reallocate its way through the payload.
 ///
 /// This is deliberately a dozen lines rather than a dependency: the format is
 /// fixed by the OpenAI-compatible schema OpenRouter implements, and the crate's
 /// dependency list stays at the three the HTTP client actually needs.
+///
+/// Being more permissive than a strict decoder is a deliberate choice, not an
+/// oversight — it only ever sees strings the server produced, and the payloads
+/// that must round-trip are the well-formed ones. The rejection tests in this
+/// module cover the alphabet and the padding rules; embedded whitespace is
+/// accepted by design and is pinned by
+/// `base64_decode_accepts_embedded_whitespace`.
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
     let mut buffer: u32 = 0;
     let mut bits: u32 = 0;
     let mut padding = 0usize;
@@ -382,7 +458,9 @@ impl EmbedClient {
         let body = request.to_json()?;
         let url = self.config.endpoint("embeddings");
         let response = crate::post_json(&self.agent, &url, self.config.api_key(), &body)?;
-        parse_embed_response(&response, expected_inputs)
+        // The requested encoding is part of the contract, so a response in the
+        // other representation is reported rather than quietly accepted.
+        parse_embed_response(&response, expected_inputs, Some(request.encoding_format))
             .map_err(|e| e.redact(self.config.api_key()))
     }
 }
@@ -439,7 +517,7 @@ mod tests {
             ],
             "usage": {"prompt_tokens": 7, "total_tokens": 7}
         }"#;
-        let parsed = parse_embed_response(body, Some(3)).unwrap();
+        let parsed = parse_embed_response(body, Some(3), Some(EncodingFormat::Float)).unwrap();
         assert_eq!(parsed.embeddings, vec![vec![0.1], vec![0.2], vec![0.3]]);
         assert_eq!(parsed.model, MODEL);
         assert_eq!(parsed.usage.unwrap()["prompt_tokens"], 7);
@@ -456,9 +534,54 @@ mod tests {
         );
         let body =
             format!(r#"{{"model":"{MODEL}","data":[{{"index":0,"embedding":"{encoded}"}}]}}"#);
-        let parsed = parse_embed_response(&body, Some(1)).unwrap();
+        let parsed = parse_embed_response(&body, Some(1), Some(EncodingFormat::Base64)).unwrap();
         assert_eq!(parsed.embeddings.len(), 1);
         assert_eq!(parsed.embeddings[0], vec![1.0, -2.0, 0.5]);
+    }
+
+    #[test]
+    fn a_vector_in_the_unrequested_encoding_is_rejected() {
+        // Asked for base64, got a float array: the server ignored the
+        // parameter, and the caller is not getting the format it contracted for.
+        let body = r#"{"model":"m","data":[{"index":0,"embedding":[1.0]}]}"#;
+        let err = parse_embed_response(body, Some(1), Some(EncodingFormat::Base64)).unwrap_err();
+        assert!(err.to_string().contains("arrived as float"), "{err}");
+        assert!(err.to_string().contains("base64"), "{err}");
+
+        // And the mirror image: asked for float, got a string.
+        let encoded = base64_encode(&[1.0f32.to_le_bytes()].concat());
+        let body = format!(r#"{{"model":"m","data":[{{"index":0,"embedding":"{encoded}"}}]}}"#);
+        let err = parse_embed_response(&body, Some(1), Some(EncodingFormat::Float)).unwrap_err();
+        assert!(err.to_string().contains("arrived as base64"), "{err}");
+    }
+
+    #[test]
+    fn a_matching_encoding_is_not_reported() {
+        // The check must not fire on the representation that was asked for.
+        let body = r#"{"model":"m","data":[{"index":0,"embedding":[1.0]}]}"#;
+        assert!(parse_embed_response(body, Some(1), Some(EncodingFormat::Float)).is_ok());
+        assert!(parse_embed_response(body, Some(1), None).is_ok());
+    }
+
+    #[test]
+    fn a_null_embedding_is_named_rather_than_failing_as_a_type_error() {
+        // Some providers skip an input and return `null` for it. There is
+        // nowhere in Vec<Vec<f64>> to put a hole, so it is refused — but the
+        // message says which input was skipped instead of just "invalid type".
+        let body = r#"{"model":"m","data":[
+            {"index":0,"embedding":[1.0]},
+            {"index":1,"embedding":null}
+        ]}"#;
+        let err = parse_embed_response(body, Some(2), Some(EncodingFormat::Float)).unwrap_err();
+        assert!(err.to_string().contains("index 1 is null"), "{err}");
+    }
+
+    #[test]
+    fn encoding_format_renders_the_name_a_request_carries() {
+        // The name in a request body and the name in a mismatch report have to
+        // be the same string, and both come from the one enum.
+        assert_eq!(EncodingFormat::Float.to_string(), "float");
+        assert_eq!(EncodingFormat::Base64.to_string(), "base64");
     }
 
     #[test]
@@ -470,7 +593,9 @@ mod tests {
                 {{"index":0,"embedding":[9.0]}}
             ]}}"#
         );
-        let parsed = parse_embed_response(&body, Some(2)).unwrap();
+        // One vector in each representation, and no format to check against, so
+        // this covers the mixed case the strictness check now has to survive.
+        let parsed = parse_embed_response(&body, Some(2), None).unwrap();
         assert_eq!(parsed.embeddings, vec![vec![9.0], vec![3.5]]);
     }
 
@@ -480,7 +605,7 @@ mod tests {
             {"index":0,"embedding":[1.0]},
             {"index":0,"embedding":[2.0]}
         ]}"#;
-        let err = parse_embed_response(body, None).unwrap_err();
+        let err = parse_embed_response(body, None, None).unwrap_err();
         assert!(matches!(err, VectorError::Decode(_)), "got {err:?}");
         assert!(err.to_string().contains("repeats index 0"));
     }
@@ -493,7 +618,7 @@ mod tests {
             {"index":0,"embedding":[1.0]},
             {"index":1,"embedding":[2.0]}
         ]}"#;
-        let err = parse_embed_response(body, Some(3)).unwrap_err();
+        let err = parse_embed_response(body, Some(3), None).unwrap_err();
         assert!(err.to_string().contains("2 vectors, expected 3"), "{err}");
     }
 
@@ -504,20 +629,20 @@ mod tests {
             {"index":0,"embedding":[1.0]},
             {"index":5,"embedding":[2.0]}
         ]}"#;
-        let err = parse_embed_response(body, Some(2)).unwrap_err();
+        let err = parse_embed_response(body, Some(2), None).unwrap_err();
         assert!(err.to_string().contains("index 5"), "{err}");
     }
 
     #[test]
     fn a_shorter_response_parses_when_no_count_is_expected() {
         let body = r#"{"model":"m","data":[{"index":0,"embedding":[1.0]}]}"#;
-        let parsed = parse_embed_response(body, None).unwrap();
+        let parsed = parse_embed_response(body, None, None).unwrap();
         assert_eq!(parsed.embeddings, vec![vec![1.0]]);
     }
 
     #[test]
     fn malformed_json_is_a_decode_error() {
-        let err = parse_embed_response("not json at all", None).unwrap_err();
+        let err = parse_embed_response("not json at all", None, None).unwrap_err();
         assert!(matches!(err, VectorError::Decode(_)), "got {err:?}");
     }
 
@@ -527,29 +652,53 @@ mod tests {
         let encoded = base64_encode(&[1, 2, 3]);
         let body = format!(r#"{{"model":"m","data":[{{"index":0,"embedding":"{encoded}"}}]}}"#);
         assert!(matches!(
-            parse_embed_response(&body, None),
+            parse_embed_response(&body, None, Some(EncodingFormat::Base64)),
             Err(VectorError::Decode(_))
         ));
     }
 
     #[test]
     fn non_finite_floats_are_rejected() {
+        // The array form, and then the same value as base64. Both must be
+        // refused: a NaN reaching a similarity search produces meaningless
+        // scores, and which encoding the server used is not a reason to let one
+        // through that the other catches.
         let body = r#"{"model":"m","data":[{"index":0,"embedding":[1.0,null]}]}"#;
         assert!(matches!(
-            parse_embed_response(body, None),
+            parse_embed_response(body, None, Some(EncodingFormat::Float)),
             Err(VectorError::Decode(_))
         ));
+
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let encoded = base64_encode(&value.to_le_bytes());
+            let body = format!(r#"{{"model":"m","data":[{{"index":0,"embedding":"{encoded}"}}]}}"#);
+            let err = parse_embed_response(&body, None, Some(EncodingFormat::Base64)).unwrap_err();
+            assert!(
+                matches!(err, VectorError::Decode(_)),
+                "base64 {value} was accepted: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn base64_that_decodes_to_a_finite_vector_is_still_accepted() {
+        // The non-finite guard above must not degenerate into "reject all
+        // base64".
+        let ok = base64_encode(&[1.0f32.to_le_bytes()].concat());
+        let body = format!(r#"{{"model":"m","data":[{{"index":0,"embedding":"{ok}"}}]}}"#);
+        let parsed = parse_embed_response(&body, Some(1), Some(EncodingFormat::Base64)).unwrap();
+        assert_eq!(parsed.embeddings, vec![vec![1.0]]);
     }
 
     #[test]
     fn empty_data_parses_to_no_vectors() {
-        let parsed = parse_embed_response(r#"{"model":"m","data":[]}"#, None).unwrap();
+        let parsed = parse_embed_response(r#"{"model":"m","data":[]}"#, None, None).unwrap();
         assert!(parsed.embeddings.is_empty());
     }
 
     #[test]
     fn empty_data_fails_a_count_that_expected_vectors() {
-        let err = parse_embed_response(r#"{"model":"m","data":[]}"#, Some(1)).unwrap_err();
+        let err = parse_embed_response(r#"{"model":"m","data":[]}"#, Some(1), None).unwrap_err();
         assert!(err.to_string().contains("0 vectors, expected 1"), "{err}");
     }
 
@@ -558,6 +707,31 @@ mod tests {
         assert!(base64_decode("****").is_none());
         assert!(base64_decode("A=BC").is_none());
         assert!(base64_decode("AB").is_none(), "6 leftover bits");
+    }
+
+    #[test]
+    fn base64_decode_accepts_embedded_whitespace() {
+        // A wrapped payload is what a gateway that folds long lines produces.
+        // Interior whitespace is skipped, and the extra capacity it needs is
+        // reserved up front, so a value the strict size heuristic would have
+        // under-counted still decodes.
+        let case: Vec<u8> = (0..=255u8).collect();
+        let encoded = base64_encode(&case);
+        assert!(encoded.len() > 80, "test payload should wrap");
+        let wrapped: String = encoded
+            .as_bytes()
+            .chunks(16)
+            .map(|line| format!("{}\n", std::str::from_utf8(line).unwrap()))
+            .collect();
+        assert!(wrapped.contains('\n'));
+        assert_eq!(base64_decode(&wrapped).unwrap(), case);
+
+        // A stray space inside a single group must not become data: it is
+        // skipped, so the value still decodes to what the group spells.
+        assert_eq!(
+            base64_decode("aYM O").unwrap(),
+            base64_decode("aYMO").unwrap()
+        );
     }
 
     #[test]

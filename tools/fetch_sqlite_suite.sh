@@ -19,6 +19,7 @@
 #   tools/fetch_sqlite_suite.sh              # fetch, or verify an existing copy
 #   tools/fetch_sqlite_suite.sh --force      # discard and re-download
 #   tools/fetch_sqlite_suite.sh --verify     # verify only, never download
+###
 set -euo pipefail
 
 SQLITE_VERSION="${SQLITE_VERSION:-3.53.4}"
@@ -38,7 +39,9 @@ case "${1:-}" in
     --verify) MODE=verify ;;
     "")       MODE=fetch ;;
     -h|--help)
-        sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+        # The ### sentinel above terminates the usage block, so this can never
+        # drift the way a hard-coded line range did.
+        sed -n '2,/^###$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *)
@@ -68,12 +71,19 @@ have_openssl() { command -v openssl >/dev/null 2>&1; }
 # The manifest also covers the whole repository, but we only extract test/, so
 # we check the test/ subtree plus VERSION and ignore every other row.
 #
+# Row format is `F <name> <hash> [<perms>]`. Files marked executable carry a
+# 4th field (the literal `x`); at 3.53.4 that is exactly three files in test/:
+# testrunner.tcl, speedtest.tcl and json/json-speed-check.sh. Reading only 3
+# fields would fold `x` into the hash, make it 42/66 chars long, and drop the
+# row at the length check below -- silently, and for the harness's own job
+# scheduler among them. So the 4th field is read and discarded explicitly.
+#
 # Prints the number of files verified on success. On failure prints one line
 # per problem and returns non-zero.
 verify_manifest() {
     local manifest="$1" root="$2" nbad=0 nfile=0
     [ -f "$manifest" ] || { echo "manifest missing: $manifest"; return 1; }
-    while read -r ftype name hash; do
+    while read -r ftype name hash perms _rest; do
         case "$ftype" in F) ;; *) continue ;; esac
         [ -n "${name:-}" ] && [ -n "${hash:-}" ] || continue
         case "$name" in
@@ -84,7 +94,9 @@ verify_manifest() {
         case "${#hash}" in
             40) algo=sha1 ;;
             64) algo=sha3-256 ;;
-            *)  continue ;;
+            *)  echo "unrecognised hash field (${#hash} chars): $name" >&2
+                nbad=$((nbad + 1))
+                continue ;;
         esac
         nfile=$((nfile + 1))
         if [ ! -f "$path" ]; then
@@ -104,9 +116,18 @@ verify_manifest() {
 }
 
 # Already fetched at the right version? Verify and stop.
+#
+# The stamp is "<version> <verified-file-count>". An older stamp written by a
+# previous revision of this script is accepted as present (the manifest check
+# below still runs), but is reported as stale so it gets rewritten on the next
+# --force rather than trusted forever.
+STAMP_VERSION=""
+STAMP_COUNT=""
+read -r STAMP_VERSION STAMP_COUNT < "$STAMP" 2>/dev/null || true
+
 already_present() {
     [ -f "$STAMP" ] || return 1
-    [ "$(cat "$STAMP")" = "$SQLITE_VERSION" ] || return 1
+    [ "$STAMP_VERSION" = "$SQLITE_VERSION" ] || return 1
     [ -f "$TEST_SUBDIR/tester.tcl" ] || return 1
     return 0
 }
@@ -117,13 +138,16 @@ if already_present && [ "$MODE" != force ]; then
         n="$(verify_manifest "$OUT/manifest" "$OUT" | tail -1)" \
             && echo "verified ${n} files against manifest" \
             || { echo "manifest verification FAILED" >&2; exit 1; }
+        if [ -z "$STAMP_COUNT" ]; then
+            echo "note: stamp predates counted stamps; re-run with --force to rewrite it" >&2
+        fi
     fi
     exit 0
 fi
 
 if [ "$MODE" = verify ]; then
     already_present || die "suite not fetched at $OUT (run tools/fetch_sqlite_suite.sh)"
-    echo "sqlite suite $(cat "$STAMP") present at $OUT"
+    echo "sqlite suite ${STAMP_VERSION} present at $OUT"
     have_openssl || die "openssl not found; cannot verify manifest hashes"
     n="$(verify_manifest "$OUT/manifest" "$OUT")" \
         || die "manifest verification failed"
@@ -184,7 +208,16 @@ else
 fi
 
 touch "$MARKER"
-printf '%s\n' "$SQLITE_VERSION" > "$STAMP"
+
+# The stamp records the verified count as well as the version, so that a future
+# drop in coverage (a manifest row shape this parser stops understanding) shows
+# up as a mismatch instead of passing quietly. 1286 is the real row count for
+# test/ + VERSION at 3.53.4; see verify_manifest() for why it is not 1283.
+VERIFIED_COUNT=0
+if have_openssl; then
+    VERIFIED_COUNT="$n"
+fi
+printf '%s %s\n' "$SQLITE_VERSION" "$VERIFIED_COUNT" > "$STAMP"
 
 N_TEST=$(find "$TEST_SUBDIR" -maxdepth 1 -name '*.test' | wc -l | tr -d ' ')
 N_HARNESS=$(find "$TEST_SUBDIR" -maxdepth 1 -name '*.tcl' | wc -l | tr -d ' ')

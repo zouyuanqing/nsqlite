@@ -56,7 +56,9 @@ pub use embed::{
     MAX_BATCH_SIZE,
 };
 pub use error::{ApiErrorDetail, ApiErrorEnvelope, VectorError};
-pub use rerank::{parse_rerank_response, RerankClient, RerankRequest, RerankResult};
+pub use rerank::{
+    parse_rerank_response, parse_rerank_response_bounded, RerankClient, RerankRequest, RerankResult,
+};
 
 use std::time::Duration;
 

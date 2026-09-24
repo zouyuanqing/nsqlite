@@ -113,10 +113,32 @@ pub struct RerankResult {
 /// **descending score**, as the API contract for this client promises. Ties
 /// break on the original index so the ordering is deterministic.
 ///
-/// An out-of-range or duplicated `index` is rejected as [`VectorError::Decode`]
-/// rather than clamped, because either means the response cannot be mapped back
-/// to the caller's documents.
+/// The parser has no idea how many documents the caller sent, so it cannot
+/// tell a legitimate index from one that points past the end of the caller's
+/// slice. [`parse_rerank_response_bounded`] can: it takes the document count
+/// and rejects both an out-of-range and a duplicated `index`, which is what
+/// makes a hit safe to use as `&documents[result.original_index]`.
+/// [`RerankClient::rerank`] always goes through it.
 pub fn parse_rerank_response(body: &str) -> Result<Vec<RerankResult>, VectorError> {
+    parse_rerank_response_bounded(body, None)
+}
+
+/// [`parse_rerank_response`] with a document count to validate against.
+///
+/// `documents_len` is the length of the `documents` slice the caller sent, and
+/// is `None` only when the body came from somewhere other than a request this
+/// process made — a stored fixture, say — and no such bound is known.
+///
+/// A response that breaches the bound is rejected as [`VectorError::Decode`]
+/// rather than clamped, because either fault means the response cannot be
+/// mapped back to the caller's documents: an out-of-range index would have the
+/// caller index past the end of its own slice, and a duplicate means two
+/// entries claim one document, so taking the first would silently drop the
+/// other.
+pub fn parse_rerank_response_bounded(
+    body: &str,
+    documents_len: Option<usize>,
+) -> Result<Vec<RerankResult>, VectorError> {
     let raw: RawRerankResponse = serde_json::from_str(body)
         .map_err(|e| VectorError::Decode(format!("rerank response is not valid JSON: {e}")))?;
 
@@ -128,17 +150,35 @@ pub fn parse_rerank_response(body: &str) -> Result<Vec<RerankResult>, VectorErro
                 result.index
             )));
         }
+        if let Some(documents_len) = documents_len {
+            if result.index >= documents_len {
+                return Err(VectorError::Decode(format!(
+                    "rerank response holds index {}, outside the {documents_len} documents sent",
+                    result.index
+                )));
+            }
+        }
         results.push(RerankResult {
             original_index: result.index,
             score: result.relevance_score,
         });
     }
 
+    // Sorting by score also groups equal indices next to each other, so the
+    // duplicate check is a single scan of adjacent pairs.
     results.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
             .then(a.original_index.cmp(&b.original_index))
     });
+    for pair in results.windows(2) {
+        if pair[0].original_index == pair[1].original_index {
+            return Err(VectorError::Decode(format!(
+                "rerank response repeats index {}",
+                pair[0].original_index
+            )));
+        }
+    }
 
     Ok(results)
 }
@@ -168,9 +208,13 @@ impl RerankClient {
 
     /// Reranks `documents` against `query`.
     ///
-    /// `top_n` is passed straight through; `None` lets the server choose. The
-    /// returned vector is ordered by descending `relevance_score`, each entry
-    /// carrying the index the document had in `documents`.
+    /// `top_n` is both sent in the request and enforced on the response: the
+    /// result is never longer than `top_n`, and a server that answers with more
+    /// documents than were sent, or with an index outside them, is reported as a
+    /// [`VectorError::Decode`] rather than passed on. That is what makes it safe
+    /// to index the caller's own `documents` slice with
+    /// [`RerankResult::original_index`]. Pass `None` to get every document back
+    /// and let the server choose how many to return.
     ///
     /// An empty `documents` slice is a [`VectorError::Config`] error rather
     /// than a request: there is nothing to rank, and the server's behaviour for
@@ -202,8 +246,31 @@ impl RerankClient {
         let body = request.to_json()?;
         let url = self.config.endpoint("rerank");
         let response = crate::post_json(&self.agent, &url, self.config.api_key(), &body)?;
-        parse_rerank_response(&response).map_err(|e| e.redact(self.config.api_key()))
+        let parsed = parse_rerank_response_bounded(&response, Some(documents.len()))
+            .map_err(|e| e.redact(self.config.api_key()))?;
+        enforce_top_n(parsed.len(), documents.len(), top_n)?;
+        Ok(parsed)
     }
+}
+
+/// Rejects a response that returned more results than the caller asked for.
+///
+/// A `top_n` larger than the document count is not a fault — there are only
+/// `documents_len` documents to return — so the effective limit is the smaller
+/// of the two. `top_n: None` means every document, which the index bounds in
+/// the parser have already guaranteed.
+fn enforce_top_n(
+    results_len: usize,
+    documents_len: usize,
+    top_n: Option<usize>,
+) -> Result<(), VectorError> {
+    let limit = top_n.unwrap_or(documents_len).min(documents_len);
+    if results_len > limit {
+        return Err(VectorError::Decode(format!(
+            "rerank response holds {results_len} results, more than the {limit} asked for"
+        )));
+    }
+    Ok(())
 }
 
 /// Redacts the key; see the note on [`ClientConfig`]'s `Debug` impl.
@@ -326,6 +393,122 @@ mod tests {
         assert!(parse_rerank_response(r#"{"results":[]}"#)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn an_index_outside_the_documents_sent_is_rejected() {
+        // Four documents were sent; index 9999 does not name one of them, and
+        // the caller pattern `&documents[result.original_index]` would panic.
+        let body = r#"{"results":[
+            {"index":0,"relevance_score":0.9},
+            {"index":9999,"relevance_score":0.1}
+        ]}"#;
+        let err = parse_rerank_response_bounded(body, Some(4)).unwrap_err();
+        assert!(matches!(err, VectorError::Decode(_)), "got {err:?}");
+        assert!(err.to_string().contains("outside the 4 documents"), "{err}");
+    }
+
+    #[test]
+    fn a_duplicated_index_is_rejected() {
+        let body = r#"{"results":[
+            {"index":0,"relevance_score":0.9},
+            {"index":0,"relevance_score":0.1}
+        ]}"#;
+        let err = parse_rerank_response_bounded(body, Some(4)).unwrap_err();
+        assert!(matches!(err, VectorError::Decode(_)), "got {err:?}");
+        assert!(err.to_string().contains("repeats index 0"), "{err}");
+    }
+
+    #[test]
+    fn a_bounded_parse_accepts_indices_inside_the_documents_sent() {
+        let body = r#"{"results":[
+            {"index":0,"relevance_score":0.1},
+            {"index":3,"relevance_score":0.9}
+        ]}"#;
+        let parsed = parse_rerank_response_bounded(body, Some(4)).unwrap();
+        assert_eq!(
+            parsed.iter().map(|r| r.original_index).collect::<Vec<_>>(),
+            vec![3, 0]
+        );
+    }
+
+    #[test]
+    fn the_unbounded_parser_keeps_its_original_permissive_behaviour() {
+        // It has no document count, so the checks above cannot apply. What it
+        // still guarantees — sorting, tie order, and the non-finite rejection —
+        // is unchanged.
+        let body = r#"{"results":[
+            {"index":0,"relevance_score":0.1},
+            {"index":9999,"relevance_score":0.9}
+        ]}"#;
+        let parsed = parse_rerank_response(body).unwrap();
+        assert_eq!(parsed[0].original_index, 9999);
+
+        let err = parse_rerank_response(r#"{"results":[{"index":0,"relevance_score":1e400}]}"#)
+            .unwrap_err();
+        assert!(matches!(err, VectorError::Decode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_duplicate_is_rejected_whatever_order_it_arrives_in() {
+        // Sorting groups equal indices together whatever the scores are, so
+        // neither mode can be tricked by putting the repeat out of order, and
+        // a duplicate is refused even without a bound to check against.
+        let body = r#"{"results":[
+            {"index":1,"relevance_score":0.1},
+            {"index":1,"relevance_score":0.9}
+        ]}"#;
+        assert!(matches!(
+            parse_rerank_response_bounded(body, Some(4)),
+            Err(VectorError::Decode(_))
+        ));
+        assert!(matches!(
+            parse_rerank_response(body),
+            Err(VectorError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn every_hit_indexes_one_of_the_callers_documents() {
+        // The whole point of the bound: a hit is safe to use as
+        // `&documents[result.original_index]`.
+        let documents = ["a".to_string(), "b".to_string(), "c".to_string()];
+        let body = r#"{"results":[
+            {"index":0,"relevance_score":0.9},
+            {"index":3,"relevance_score":0.8}
+        ]}"#;
+        let err = parse_rerank_response_bounded(body, Some(documents.len())).unwrap_err();
+        assert!(matches!(err, VectorError::Decode(_)), "got {err:?}");
+
+        // And the result the caller is promised is always indexable.
+        let body = r#"{"results":[
+            {"index":0,"relevance_score":0.1},
+            {"index":2,"relevance_score":0.9}
+        ]}"#;
+        let parsed = parse_rerank_response_bounded(body, Some(documents.len())).unwrap();
+        for hit in &parsed {
+            assert!(
+                documents.get(hit.original_index).is_some(),
+                "hit {} is not a document",
+                hit.original_index
+            );
+        }
+    }
+
+    #[test]
+    fn more_results_than_top_n_is_a_decode_error() {
+        // A server that ignored `top_n` and returned every document used to
+        // hand back a longer vector than the caller asked for, with no error.
+        let err = enforce_top_n(4, 4, Some(2)).unwrap_err();
+        assert!(matches!(err, VectorError::Decode(_)), "got {err:?}");
+        assert!(err.to_string().contains("4 results"), "{err}");
+
+        // Asking for exactly what came back is fine, and a `top_n` above the
+        // document count is not a fault: there are only four documents to
+        // return, so four results is the answer.
+        assert!(enforce_top_n(2, 4, Some(2)).is_ok());
+        assert!(enforce_top_n(4, 4, None).is_ok());
+        assert!(enforce_top_n(4, 4, Some(99)).is_ok());
     }
 
     #[test]
