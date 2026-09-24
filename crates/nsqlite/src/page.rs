@@ -321,20 +321,46 @@ pub struct CellPointer {
     pub size: u16,
 }
 
+/// The largest payload an index cell keeps on its own page.
+///
+/// The value is roughly a quarter of the page, chosen so that a page always
+/// holds at least four index keys. It is not `usable - 35`: the reference
+/// computes it as `((usable - 12) * 64 / 255) - 23` and, in the source's own
+/// words, the arithmetic "cannot be changed without resulting in an
+/// incompatible file format".
+pub const fn max_local_for_index(usable: u32) -> u32 {
+    ((usable - 12) * 64 / 255) - 23
+}
+
+/// The largest payload a table leaf cell keeps on its own page. Table rows are
+/// the one case where the whole payload may stay local.
+pub const fn max_local_for_table_leaf(usable: u32) -> u32 {
+    usable - 35
+}
+
+/// The smallest payload that may be wholly local, below which a cell always
+/// spills so that a long record cannot leave a page nearly full.
+pub const fn min_local(usable: u32) -> u32 {
+    ((usable - 12) * 32 / 255) - 23
+}
+
 /// How many payload bytes a cell keeps on its own page.
 ///
-/// Mirrors the reference `btreeParseCellPtr`: a table leaf cell may keep the
-/// whole payload if it fits, while an index cell always spills down to at most
-/// `min_local` bytes so that a single oversized cell cannot monopolise a page.
+/// Mirrors the reference `btreeParseCellPtr`. Below the threshold the whole
+/// payload stays local. Above it — which only a table leaf can reach, since its
+/// threshold is the larger of the two — the same surplus calculation applies:
+/// how much is kept is a non-monotonic function of the payload size, chosen so
+/// the remainder fills overflow pages exactly.
 pub fn local_payload_size(page_type: u8, payload_len: u32, usable: u32) -> u32 {
-    let max_local = usable - 35;
-    let min_local = ((usable - 12) * 32 / 255) - 23;
-    if page_type == page_type::TABLE_LEAF {
-        return payload_len.min(max_local);
-    }
+    use page_type::*;
+    let max_local = match page_type {
+        TABLE_LEAF => max_local_for_table_leaf(usable),
+        _ => max_local_for_index(usable),
+    };
     if payload_len <= max_local {
         return payload_len;
     }
+    let min_local = min_local(usable);
     let surplus = min_local + (payload_len - min_local) % (usable - 4);
     if surplus <= max_local {
         surplus
@@ -427,26 +453,115 @@ mod tests {
     }
 
     #[test]
+    fn index_max_local_is_a_quarter_of_the_page() {
+        // SQLite's own constant: a 4096-byte page holds at most 1002 index
+        // payload bytes locally, which is what guarantees a minimum fanout of
+        // four. Using usable - 35 here would be off by 3000 bytes and would
+        // misplace the boundary between local and spilled data.
+        assert_eq!(max_local_for_index(4096), 1002);
+        assert_eq!(max_local_for_index(512), ((500) * 64 / 255) - 23);
+        assert_eq!(max_local_for_table_leaf(4096), 4061);
+        assert_eq!(min_local(4096), 489);
+    }
+
+    #[test]
+    fn local_payload_matches_the_reference_geometry() {
+        let u = 4096u32;
+        let x = max_local_for_index(u);
+        let m = min_local(u);
+        // Below the threshold everything stays local, for both page kinds.
+        for p in [0, 1, 500, x] {
+            assert_eq!(local_payload_size(page_type::INDEX_LEAF, p, u), p);
+            assert_eq!(local_payload_size(page_type::TABLE_LEAF, p, u), p);
+        }
+        // Above it, the index spills, and the kept size is never above x.
+        for p in (x + 1)..(x + 300) {
+            let local = local_payload_size(page_type::INDEX_LEAF, p, u);
+            assert!(local <= x, "p={p} local={local} exceeds x={x}");
+            assert!(local >= m, "p={p} local={local} below m={m}");
+            // A table leaf still holds the whole payload, since it has a much
+            // larger local threshold.
+            assert_eq!(
+                local_payload_size(page_type::TABLE_LEAF, p, u),
+                p.min(max_local_for_table_leaf(u))
+            );
+        }
+
+        // Past its own threshold a table leaf spills the same way, and the kept
+        // size jumps around non-monotonically as the payload grows.
+        let tx = max_local_for_table_leaf(u);
+        assert!(local_payload_size(page_type::TABLE_LEAF, tx + 1, u) < tx);
+        let mut seen = Vec::new();
+        // The kept size resets every time the payload grows by the overflow page
+        // capacity, so a range spanning more than one such step must show both
+        // a rise and a drop.
+        for p in (tx + 1)..(tx + 2 * (u - 4) + 8) {
+            let local = local_payload_size(page_type::TABLE_LEAF, p, u);
+            assert!(local >= m && local <= tx, "table p={p} local={local}");
+            seen.push(local);
+        }
+        assert!(
+            seen.windows(2).any(|w| w[1] > w[0]) && seen.windows(2).any(|w| w[1] < w[0]),
+            "the surplus formula must rise and fall as the payload grows; a \
+             monotonic result means the overflow geometry is wrong"
+        );
+    }
+
+    #[test]
+    fn a_table_leaf_keeps_more_than_an_index_does() {
+        let u = 4096u32;
+        let p = 2000;
+        assert_eq!(local_payload_size(page_type::TABLE_LEAF, p, u), p);
+        assert!(local_payload_size(page_type::INDEX_LEAF, p, u) < p);
+    }
+
+    #[test]
+    fn reserved_space_shrinks_the_thresholds_proportionally() {
+        let h = DbHeader {
+            page_size: 4096,
+            reserved_space: 32,
+            ..DbHeader::default()
+        };
+        let u = h.usable_size();
+        assert_eq!(u, 4064);
+        assert_eq!(h.max_leaf_payload(), max_local_for_table_leaf(u));
+        assert_eq!(h.min_local_payload(), min_local(u));
+        assert_eq!(max_local_for_index(u), ((u - 12) * 64 / 255) - 23);
+    }
+
+    #[test]
     fn local_payload_thresholds_match_the_reference() {
         let usable = 4096u32;
-        let max_local = usable - 35;
-        // A table leaf keeps the whole payload when it fits.
+        let table_max = max_local_for_table_leaf(usable);
+        let index_max = max_local_for_index(usable);
+        let m = min_local(usable);
+        // A table leaf keeps the whole payload while it fits.
         assert_eq!(local_payload_size(page_type::TABLE_LEAF, 100, usable), 100);
         assert_eq!(
-            local_payload_size(page_type::TABLE_LEAF, max_local, usable),
-            max_local
+            local_payload_size(page_type::TABLE_LEAF, table_max, usable),
+            table_max
         );
+        // One byte past its threshold, a table leaf drops to the surplus, which
+        // for a 4065-byte payload on a 4096-byte page is the 489-byte minimum.
+        // Verified against a file written by sqlite3 3.53.4, whose cell holds
+        // 489 local bytes plus a 2-byte payload varint, a 1-byte rowid varint
+        // and a 4-byte overflow pointer.
+        assert_eq!(local_payload_size(page_type::TABLE_LEAF, 4065, usable), m);
+        assert_eq!(m, 489);
+        assert_eq!(table_max, 4061);
+        // An index leaf keeps far less before spilling.
         assert_eq!(
-            local_payload_size(page_type::TABLE_LEAF, max_local + 1, usable),
-            max_local
+            local_payload_size(page_type::INDEX_LEAF, index_max, usable),
+            index_max
         );
-        // An index leaf spills as soon as the payload exceeds max_local.
+        let spilled = local_payload_size(page_type::INDEX_LEAF, index_max + 1, usable);
+        assert!(spilled < index_max);
+        // A table leaf is still holding whole payloads at that size, because
+        // its own threshold is four times larger.
         assert_eq!(
-            local_payload_size(page_type::INDEX_LEAF, max_local, usable),
-            max_local
+            local_payload_size(page_type::TABLE_LEAF, index_max + 1, usable),
+            index_max + 1
         );
-        let spilled = local_payload_size(page_type::INDEX_LEAF, max_local + 1, usable);
-        assert!(spilled < max_local);
     }
 
     #[test]

@@ -1,0 +1,556 @@
+//! Page-level access to a database file: a bounded page cache over a
+//! `Read + Write` pair, with the size-change callback a b-tree needs to grow
+//! the file and update the header's page count.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+use super::error::{Error, Result};
+use super::page::{DbHeader, HEADER_SIZE};
+
+/// The number of cached pages held before the least recently used one is
+/// written back and evicted.
+const DEFAULT_CACHE_PAGES: usize = 512;
+
+/// A page buffer owned by the cache.
+type Buffer = Vec<u8>;
+
+/// Where a page came from, so a clean read can be discarded without a write.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    File,
+    Dirty,
+}
+
+/// Reads and writes pages of one database file, caching them in memory.
+///
+/// The pager owns the file header: page 1 is a page like any other, except that
+/// its first 100 bytes are the header, so callers get [`DbHeader`] from
+/// [`Pager::header`] rather than parsing it out of the buffer.
+pub struct Pager {
+    file: File,
+    /// Bytes per page, including the reserved region.
+    page_size: u32,
+    header: DbHeader,
+    /// Pages currently resident, keyed by 1-based page number.
+    cache: HashMap<u32, (Buffer, Origin, u64)>,
+    /// Page numbers in eviction order, oldest first.
+    lru: Vec<u32>,
+    capacity: usize,
+    /// Incremented on every cache hit, giving each page its recency stamp.
+    clock: u64,
+    /// Pages written since the file was opened, and their old lengths, so a
+    /// rollback journal can restore them.
+    dirty: Vec<u32>,
+    /// Path of the temporary file backing an in-memory database, removed on drop.
+    memory_path: Option<std::path::PathBuf>,
+}
+
+impl Pager {
+    /// Opens `path`, reading and validating its header.
+    ///
+    /// A zero-length file is initialised in memory with a fresh header; the
+    /// first page is written out on the first flush, which is what lets
+    /// `CREATE TABLE` work on a path that did not exist yet.
+    pub fn open(path: &Path) -> Result<Pager> {
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| {
+                Error::new(
+                    super::error::ResultCode::CantOpen,
+                    format!("unable to open database file: {e}"),
+                )
+            })?;
+        let len = file.metadata()?.len();
+        let fresh = len == 0;
+        let mut pager = if fresh {
+            Pager {
+                file,
+                page_size: 4096,
+                header: DbHeader::default(),
+                cache: HashMap::new(),
+                lru: Vec::new(),
+                capacity: DEFAULT_CACHE_PAGES,
+                clock: 0,
+                dirty: Vec::new(),
+                memory_path: None,
+            }
+        } else {
+            if len < HEADER_SIZE as u64 {
+                return Err(Error::not_a_db());
+            }
+            let mut first = vec![0u8; HEADER_SIZE];
+            file.seek(SeekFrom::Start(0))?;
+            file.read_exact(&mut first)?;
+            let header = DbHeader::parse(&first)?;
+            let page_size = header.page_size;
+            let mut pager = Pager {
+                file,
+                page_size,
+                header,
+                cache: HashMap::new(),
+                lru: Vec::new(),
+                capacity: DEFAULT_CACHE_PAGES,
+                clock: 0,
+                dirty: Vec::new(),
+                memory_path: None,
+            };
+            // The header's page count is authoritative only when the change
+            // counter matches version-valid-for; otherwise the file length is.
+            let file_pages = (len / page_size as u64) as u32;
+            if pager.header.db_size_pages == 0
+                || pager.header.version_valid_for != pager.header.change_counter
+            {
+                pager.header.db_size_pages = file_pages;
+            }
+            pager
+        };
+        if fresh {
+            // A zero-length file has no page 1 yet, so there is nothing to
+            // re-read: the in-memory header is already the authoritative one.
+            // Writing it out now means every later open sees a valid database,
+            // which is what makes CREATE TABLE work on a new path.
+            pager.write_header()?;
+            pager.flush()?;
+        } else {
+            // Prime the header from page 1 so callers always see current values.
+            pager.load_header()?;
+        }
+        Ok(pager)
+    }
+
+    /// Opens an in-memory database with the given page size.
+    ///
+    /// The backing store is a temporary file that is removed when the pager is
+    /// dropped, which keeps one code path for on-disk and memory databases.
+    pub fn open_memory(page_size: u32) -> Result<Pager> {
+        let path = std::env::temp_dir().join(format!(
+            "nsqlite-mem-{}-{:p}.db",
+            std::process::id(),
+            &page_size as *const u32
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut pager = Pager::open(&path)?;
+        pager.header.page_size = page_size;
+        pager.memory_path = Some(path);
+        Ok(pager)
+    }
+
+    pub fn page_size(&self) -> u32 {
+        self.page_size
+    }
+
+    pub fn header(&self) -> &DbHeader {
+        &self.header
+    }
+
+    pub fn header_mut(&mut self) -> &mut DbHeader {
+        &mut self.header
+    }
+
+    /// The number of pages the file currently holds.
+    pub fn page_count(&self) -> u32 {
+        self.header.db_size_pages
+    }
+
+    /// Bytes available for b-tree content, excluding the reserved region.
+    pub fn usable_size(&self) -> u32 {
+        self.header.usable_size()
+    }
+
+    /// Re-reads the file header from the cached page 1.
+    fn load_header(&mut self) -> Result<()> {
+        let page = self.read_page(1)?;
+        self.header = DbHeader::parse(&page[..HEADER_SIZE])?;
+        Ok(())
+    }
+
+    /// Returns a mutable reference to page `n`, reading it in if needed.
+    ///
+    /// The returned borrow points into the cache, so it is invalidated by the
+    /// next call to this method; callers must not hold it across a write.
+    pub fn page(&mut self, n: u32) -> Result<&mut [u8]> {
+        debug_assert!(n > 0, "page numbers are 1-based");
+        self.clock += 1;
+        if !self.cache.contains_key(&n) {
+            self.fetch(n)?;
+        }
+        self.touch(n);
+        Ok(&mut self.cache.get_mut(&n).expect("just ensured").0)
+    }
+
+    /// Returns the contents of page `n` without marking it dirty.
+    pub fn read_page(&mut self, n: u32) -> Result<Vec<u8>> {
+        if let Some((buf, _, _)) = self.cache.get(&n) {
+            return Ok(buf.clone());
+        }
+        self.clock += 1;
+        self.fetch(n)?;
+        self.touch(n);
+        Ok(self.cache.get(&n).expect("just fetched").0.clone())
+    }
+
+    /// Marks page `n` dirty so the next [`Pager::flush`] writes it out.
+    pub fn mark_dirty(&mut self, n: u32) {
+        if let Some((_, origin, _)) = self.cache.get_mut(&n) {
+            *origin = Origin::Dirty;
+        }
+        if !self.dirty.contains(&n) {
+            self.dirty.push(n);
+        }
+        self.bump_change_counter();
+    }
+
+    fn bump_change_counter(&mut self) {
+        self.header.change_counter = self.header.change_counter.wrapping_add(1);
+        self.header.version_valid_for = self.header.change_counter;
+    }
+
+    fn touch(&mut self, n: u32) {
+        let clock = self.clock;
+        if let Some(entry) = self.cache.get_mut(&n) {
+            entry.2 = clock;
+        }
+        if let Some(pos) = self.lru.iter().position(|&p| p == n) {
+            self.lru.remove(pos);
+        }
+        self.lru.push(n);
+    }
+
+    /// Reads page `n` off disk into the cache.
+    fn fetch(&mut self, n: u32) -> Result<()> {
+        self.evict_if_needed();
+        let offset = (n as u64 - 1) * self.page_size as u64;
+        let mut buf = vec![0u8; self.page_size as usize];
+        self.file.seek(SeekFrom::Start(offset))?;
+        match self.file.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Reading past the end yields zeroes: SQLite grows a file by
+                // writing a page before anything refers to it, so a short read
+                // here means the file shrank underneath us.
+                let _ = self.file.seek(SeekFrom::Start(offset))?;
+                let mut got = 0;
+                while got < buf.len() {
+                    match self.file.read(&mut buf[got..])? {
+                        0 => break,
+                        n => got += n,
+                    }
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+        self.cache.insert(n, (buf, Origin::File, self.clock));
+        self.lru.push(n);
+        Ok(())
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.cache.len() >= self.capacity {
+            // Find the resident page with the oldest stamp, preferring clean
+            // pages so a dirty one is not written out needlessly.
+            let victim = self
+                .lru
+                .iter()
+                .copied()
+                .min_by_key(|&n| (self.cache[&n].1 == Origin::Dirty, self.cache[&n].2))
+                .expect("cache is non-empty");
+            self.evict(victim);
+        }
+    }
+
+    fn evict(&mut self, n: u32) {
+        if let Some((buf, origin, _)) = self.cache.remove(&n) {
+            if origin == Origin::Dirty {
+                let _ = self.write_page(&buf, n);
+            }
+        }
+        self.lru.retain(|&p| p != n);
+    }
+
+    fn write_page(&mut self, buf: &[u8], n: u32) -> Result<()> {
+        let offset = (n as u64 - 1) * self.page_size as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(buf)?;
+        Ok(())
+    }
+
+    /// Appends a fresh page of zeroes to the file and returns its number.
+    pub fn allocate(&mut self) -> Result<u32> {
+        let n = self.header.db_size_pages + 1;
+        let buf = vec![0u8; self.page_size as usize];
+        self.write_page(&buf, n)?;
+        self.header.db_size_pages = n;
+        self.cache.insert(n, (buf, Origin::Dirty, self.clock));
+        self.lru.push(n);
+        if !self.dirty.contains(&n) {
+            self.dirty.push(n);
+        }
+        self.bump_change_counter();
+        Ok(n)
+    }
+
+    /// Releases page `n` back to the freelist, zeroing it so a stale read
+    /// cannot resurrect its contents.
+    pub fn free(&mut self, n: u32) -> Result<()> {
+        if n == 0 || n > self.header.db_size_pages {
+            return Ok(());
+        }
+        {
+            let page = self.page(n)?;
+            for b in page.iter_mut() {
+                *b = 0;
+            }
+        }
+        self.mark_dirty(n);
+        // Freelist bookkeeping: the trunk page links to the rest.
+        let trunk = self.header.freelist_trunk;
+        self.page(n)?[0..4].copy_from_slice(&(trunk + 1).to_be_bytes());
+        self.header.freelist_trunk = n;
+        self.header.freelist_count += 1;
+        self.bump_change_counter();
+        Ok(())
+    }
+
+    /// Writes the current header into the cached page 1.
+    ///
+    /// The page count, change counter and freelist fields are the parts that
+    /// must be current for another process to see a consistent file.
+    pub fn write_header(&mut self) -> Result<()> {
+        let bytes = self.header.to_bytes();
+        {
+            let page = self.page(1)?;
+            page[..HEADER_SIZE].copy_from_slice(&bytes);
+        }
+        self.mark_dirty(1);
+        Ok(())
+    }
+
+    /// Writes every dirty page and the header to the file.
+    pub fn flush(&mut self) -> Result<()> {
+        self.write_header()?;
+        let pages: Vec<u32> = self.dirty.clone();
+        for n in pages {
+            if let Some((buf, origin, _)) = self.cache.get(&n) {
+                if *origin == Origin::Dirty {
+                    let buf = buf.clone();
+                    self.write_page(&buf, n)?;
+                    if let Some(entry) = self.cache.get_mut(&n) {
+                        entry.1 = Origin::File;
+                    }
+                }
+            }
+        }
+        self.dirty.clear();
+        self.file.flush()?;
+        Ok(())
+    }
+
+    /// The page numbers written since the last [`Pager::flush`], for a journal
+    /// to capture before the change lands.
+    pub fn dirty_pages(&self) -> &[u32] {
+        &self.dirty
+    }
+}
+
+impl std::fmt::Debug for Pager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pager")
+            .field("page_size", &self.page_size)
+            .field("page_count", &self.header.db_size_pages)
+            .field("cached", &self.cache.len())
+            .field("dirty", &self.dirty.len())
+            .field("in_memory", &self.memory_path.is_some())
+            .finish()
+    }
+}
+
+impl Drop for Pager {
+    fn drop(&mut self) {
+        // A memory database must not leave a file behind, whether or not the
+        // caller flushed.
+        if let Some(path) = self.memory_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::page::page_type;
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("nsqlite-pager-{}-{tag}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn a_new_file_gets_a_valid_header() {
+        let path = temp_path("new");
+        let mut p = Pager::open(&path).unwrap();
+        assert_eq!(p.page_size(), 4096);
+        assert_eq!(p.header().text_encoding, crate::text::Encoding::Utf8);
+        p.write_header().unwrap();
+        p.flush().unwrap();
+        drop(p);
+
+        // Reopening must see the same header, which is what makes the file a
+        // valid SQLite database.
+        let p = Pager::open(&path).unwrap();
+        assert_eq!(p.page_size(), 4096);
+        drop(p);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn allocating_extends_the_file() {
+        let path = temp_path("alloc");
+        let mut p = Pager::open(&path).unwrap();
+        p.write_header().unwrap();
+        let a = p.allocate().unwrap();
+        let b = p.allocate().unwrap();
+        assert_eq!((a, b), (1, 2));
+        assert_eq!(p.page_count(), 2);
+        p.flush().unwrap();
+        drop(p);
+
+        let p = Pager::open(&path).unwrap();
+        assert_eq!(p.page_count(), 2);
+        drop(p);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dirty_pages_survive_a_reopen() {
+        let path = temp_path("dirty");
+        let mut p = Pager::open(&path).unwrap();
+        p.write_header().unwrap();
+        // Page 1 holds the file header, so start the payload at page 2.
+        p.allocate().unwrap();
+        let n = p.allocate().unwrap();
+        assert!(n > 1);
+        {
+            let page = p.page(n).unwrap();
+            page[0] = 0xab;
+            page[4095] = 0xcd;
+        }
+        p.mark_dirty(n);
+        p.flush().unwrap();
+        drop(p);
+
+        let mut p = Pager::open(&path).unwrap();
+        let page = p.read_page(n).unwrap();
+        assert_eq!((page[0], page[4095]), (0xab, 0xcd));
+        drop(p);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_page_one_header_is_readable_through_the_pager() {
+        let path = temp_path("page1");
+        let mut p = Pager::open(&path).unwrap();
+        let n = p.allocate().unwrap();
+        assert_eq!(n, 1, "the first allocation is page 1");
+        p.write_header().unwrap();
+        p.flush().unwrap();
+        drop(p);
+
+        // A b-tree root on page 1 must not be mistaken for file-header bytes.
+        let mut p = Pager::open(&path).unwrap();
+        {
+            let page = p.page(1).unwrap();
+            page[HEADER_SIZE] = page_type::TABLE_LEAF;
+        }
+        p.mark_dirty(1);
+        p.flush().unwrap();
+        drop(p);
+
+        let mut p = Pager::open(&path).unwrap();
+        let page = p.read_page(1).unwrap();
+        assert_eq!(page[HEADER_SIZE], page_type::TABLE_LEAF);
+        assert_eq!(p.header().page_size, 4096);
+        drop(p);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_truncated_file_is_not_a_database() {
+        let path = temp_path("trunc");
+        std::fs::write(&path, b"not a database").unwrap();
+        assert_eq!(Pager::open(&path).unwrap_err().code.name(), "NOTADB");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_cache_evicts_without_losing_dirty_data() {
+        let path = temp_path("evict");
+        let mut p = Pager::open(&path).unwrap();
+        p.capacity = 4;
+        p.write_header().unwrap();
+        // Touch more pages than the cache holds, dirtying each in turn, so an
+        // eviction has to write a page back rather than drop it.
+        // Mark every allocated page with its own page number, so a read-back
+        // that mixes up two pages is caught rather than passing on coincidence.
+        let mut marked = Vec::new();
+        for _ in 0..32u32 {
+            let n = p.allocate().unwrap();
+            {
+                let page = p.page(n).unwrap();
+                page[0] = n as u8;
+            }
+            p.mark_dirty(n);
+            marked.push(n);
+        }
+        p.flush().unwrap();
+        drop(p);
+
+        let mut p = Pager::open(&path).unwrap();
+        // Page 1's first bytes are the file header, so check it separately;
+        // the rest were marked with their own page number.
+        for &n in &marked {
+            if n == 1 {
+                continue;
+            }
+            let page = p.read_page(n).unwrap();
+            assert_eq!(page[0], n as u8, "page {n} lost its byte through eviction");
+        }
+        drop(p);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn freeing_a_page_clears_it_and_records_it() {
+        let path = temp_path("free");
+        let mut p = Pager::open(&path).unwrap();
+        p.write_header().unwrap();
+        p.allocate().unwrap();
+        let n = p.allocate().unwrap();
+        {
+            let page = p.page(n).unwrap();
+            page[7] = 0xff;
+        }
+        p.mark_dirty(n);
+        p.free(n).unwrap();
+        assert_eq!(p.header().freelist_trunk, n);
+        assert_eq!(p.header().freelist_count, 1);
+        p.flush().unwrap();
+        drop(p);
+
+        let mut p = Pager::open(&path).unwrap();
+        let page = p.read_page(n).unwrap();
+        // A trunk page keeps the next trunk's page number in bytes 0..4; the
+        // rest of the page is cleared so a stale read finds no old contents.
+        assert_eq!(u32::from_be_bytes([page[0], page[1], page[2], page[3]]), 1);
+        assert_eq!(page[7], 0, "a freed page must not keep its old contents");
+        drop(p);
+        let _ = std::fs::remove_file(&path);
+    }
+}

@@ -10,14 +10,18 @@
 //! * [`record`] — the serial-type record format used inside b-tree cells.
 //! * [`page`] — the database header, b-tree page headers, and the payload
 //!   overflow thresholds.
+//! * [`pager`] — the page cache over a database file.
+//! * [`btree`] — reading table b-trees, including overflow chains.
 //! * [`text`] — the text encodings a file can declare.
 //! * [`value`] / [`error`] — the runtime value and error types.
 //!
 //! Higher layers (tokenizer, SQL parser, b-tree, pager, VDBE) are built on top
 //! of these and live in their own modules as they land.
 
+pub mod btree;
 pub mod error;
 pub mod page;
+pub mod pager;
 pub mod record;
 pub mod text;
 pub mod value;
