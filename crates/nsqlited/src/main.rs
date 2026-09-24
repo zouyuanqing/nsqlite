@@ -85,8 +85,8 @@ fn main() -> ExitCode {
 /// Whether an argument reads as a statement rather than a file name.
 fn looks_like_sql(s: &str) -> bool {
     const STARTERS: &[&str] = &[
-        "select", "insert", "update", "delete", "create", "drop", "alter", "begin",
-        "commit", "rollback", "pragma", "explain", "with", "values", "replace",
+        "select", "insert", "update", "delete", "create", "drop", "alter", "begin", "commit",
+        "rollback", "pragma", "explain", "with", "values", "replace",
     ];
     let lower = s.trim().to_ascii_lowercase();
     STARTERS.iter().any(|k| lower.starts_with(k))

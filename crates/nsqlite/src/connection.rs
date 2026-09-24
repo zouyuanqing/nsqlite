@@ -27,6 +27,48 @@ use crate::parser::{
 use crate::table_tree::TableTree;
 use crate::value::Value;
 
+/// Rebuilds a table's definition by re-parsing the statement the schema stores.
+fn rebuild_table(name: &str, sql_text: &str, root: u32) -> Result<Table> {
+    let Stmt::CreateTable {
+        name: parsed,
+        columns,
+        constraints,
+        without_rowid,
+        ..
+    } = crate::parser::parse_one(sql_text).map_err(|e| {
+        Error::new(
+            ResultCode::Corrupt,
+            format!("malformed database schema ({name}): {e}"),
+        )
+    })?
+    else {
+        return Err(Error::new(
+            ResultCode::Corrupt,
+            format!("malformed database schema ({name})"),
+        ));
+    };
+    let mut table = Catalog::new().table_from_create(&parsed, &columns, &constraints);
+    table.without_rowid = without_rowid;
+    table.root_page = root;
+    Ok(table)
+}
+
+/// The page the schema b-tree is rooted at. SQLite fixes it at 1, and a reader
+/// finds the schema there without a lookup, so a table never takes that page.
+const SCHEMA_ROOT: u32 = 1;
+
+/// Reserves page 1 for the schema if the database has no pages yet.
+///
+/// A fresh database has none, so the first allocation would be page 1 and a
+/// table would be handed the schema's own page. Allocating it here reserves it
+/// once.
+fn ensure_schema_page(pager: &mut Pager) -> Result<()> {
+    if pager.page_count() < SCHEMA_ROOT {
+        pager.allocate()?;
+    }
+    Ok(())
+}
+
 /// One row of a result set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -72,22 +114,23 @@ pub struct Connection {
 impl Connection {
     /// Opens a database file, creating it if it does not exist.
     pub fn open(path: &Path) -> Result<Connection> {
-        let pager = Pager::open(path)?;
-        Ok(Connection {
-            pager,
+        let mut conn = Connection {
+            pager: Pager::open(path)?,
             path: Some(path.to_owned()),
             catalog: Catalog::new(),
             tx: TxState::None,
             changes: 0,
             last_insert_rowid: 0,
             auto_rowid: 0,
-        })
+        };
+        conn.load_schema()?;
+        Ok(conn)
     }
 
     /// Opens an in-memory database.
     pub fn open_memory() -> Result<Connection> {
         let pager = Pager::open_memory(4096)?;
-        Ok(Connection {
+        let mut conn = Connection {
             pager,
             path: None,
             catalog: Catalog::new(),
@@ -95,11 +138,95 @@ impl Connection {
             changes: 0,
             last_insert_rowid: 0,
             auto_rowid: 0,
-        })
+        };
+        conn.load_schema()?;
+        Ok(conn)
     }
 
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Reads `sqlite_schema` and rebuilds the catalog from it.
+    ///
+    /// A stored table is a row of (type, name, tbl_name, rootpage, sql), and the
+    /// definition comes from the sql text rather than from anything cached, so a
+    /// file written by a previous connection, or by the real sqlite3, opens with
+    /// the right shape.
+    fn load_schema(&mut self) -> Result<()> {
+        ensure_schema_page(&mut self.pager)?;
+        let mut tree = TableTree::open(&mut self.pager, SCHEMA_ROOT)?;
+        let rows = tree.scan(&mut self.pager)?;
+        for row in rows {
+            // A schema row has five columns; anything shorter is not one.
+            if row.values.len() < 5 || row.values[0].as_str() != Some("table") {
+                continue;
+            }
+            let (Some(name), Some(sql_text)) = (row.values[1].as_str(), row.values[4].as_str())
+            else {
+                continue;
+            };
+            let root = row.values[3].as_i64().unwrap_or(0) as u32;
+            let table = rebuild_table(name, sql_text, root)?;
+            self.catalog.put(table);
+        }
+        Ok(())
+    }
+
+    /// Writes a table's schema row into `sqlite_schema`.
+    fn write_schema_row(&mut self, name: &str, root: u32, sql_text: &str) -> Result<()> {
+        ensure_schema_page(&mut self.pager)?;
+        let values = vec![
+            Value::Text("table".into()),
+            Value::Text(name.to_owned()),
+            Value::Text(name.to_owned()),
+            Value::Integer(root as i64),
+            Value::Text(sql_text.to_owned()),
+        ];
+        // The schema's own rowid moves on, which is how a reader notices the
+        // change even before the cookie is consulted.
+        let rowid = {
+            let mut tree = TableTree::open(&mut self.pager, SCHEMA_ROOT)?;
+            tree.max_rowid(&mut self.pager)? + 1
+        };
+        let mut tree = TableTree::open(&mut self.pager, SCHEMA_ROOT)?;
+        tree.insert(&mut self.pager, &crate::table_tree::Row { rowid, values })?;
+        // The cookie makes a connection holding a cached schema re-read it.
+        let c = self.pager.header().schema_cookie.wrapping_add(1);
+        self.pager.header_mut().schema_cookie = c;
+        Ok(())
+    }
+
+    /// Rewrites a table's root page in the schema, keeping the rest of the row.
+    fn update_schema_root(&mut self, name: &str, root: u32) -> Result<()> {
+        let mut tree = TableTree::open(&mut self.pager, SCHEMA_ROOT)?;
+        let rows = tree.scan(&mut self.pager)?;
+        for row in rows {
+            if row.values.len() < 5 || row.values[1].as_str() != Some(name) {
+                continue;
+            }
+            let mut values = row.values.clone();
+            values[3] = Value::Integer(root as i64);
+            let rowid = row.rowid;
+            tree.remove(&mut self.pager, rowid)?;
+            tree.insert(&mut self.pager, &crate::table_tree::Row { rowid, values })?;
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    /// Removes a table's schema row.
+    fn remove_schema_row(&mut self, name: &str) -> Result<()> {
+        let mut tree = TableTree::open(&mut self.pager, SCHEMA_ROOT)?;
+        let rows = tree.scan(&mut self.pager)?;
+        for row in rows {
+            if row.values.len() >= 2 && row.values[1].as_str() == Some(name) {
+                tree.remove(&mut self.pager, row.rowid)?;
+            }
+        }
+        let c = self.pager.header().schema_cookie.wrapping_add(1);
+        self.pager.header_mut().schema_cookie = c;
+        Ok(())
     }
 
     /// Whether a transaction is open.
@@ -142,8 +269,16 @@ impl Connection {
                 columns,
                 constraints,
                 without_rowid,
+                sql,
                 ..
-            } => self.create_table(name, *if_not_exists, columns, constraints, *without_rowid),
+            } => self.create_table(
+                name,
+                *if_not_exists,
+                columns,
+                constraints,
+                *without_rowid,
+                sql,
+            ),
             Stmt::DropTable { name, if_exists } => self.drop_table(name, *if_exists),
             Stmt::Insert {
                 table,
@@ -213,6 +348,7 @@ impl Connection {
         columns: &[ColumnDef],
         constraints: &[Constraint],
         without_rowid: bool,
+        sql_text: &str,
     ) -> Result<Outcome> {
         if self.catalog.contains(name) {
             if if_not_exists {
@@ -237,7 +373,9 @@ impl Connection {
         }
         let mut table = self.catalog.table_from_create(name, columns, constraints);
         // The root page is allocated now, and a fresh leaf is written so the
-        // file has a real table rather than a dangling page number.
+        // file has a real table rather than a dangling page number. Page 1 is
+        // the schema's, so a table never takes it.
+        ensure_schema_page(&mut self.pager)?;
         let root = self.pager.allocate()?;
         table.root_page = root;
         {
@@ -246,6 +384,7 @@ impl Connection {
         }
         self.pager.mark_dirty(root);
         self.catalog.put(table);
+        self.write_schema_row(name, root, sql_text)?;
         self.pager.flush()?;
         Ok(Outcome::Changed(0))
     }
@@ -270,6 +409,8 @@ impl Connection {
                     }
                     self.pager.free(t.root_page)?;
                 }
+                let name = t.name.clone();
+                self.remove_schema_row(&name)?;
                 self.pager.flush()?;
                 Ok(Outcome::Changed(0))
             }
@@ -448,10 +589,23 @@ impl Connection {
     fn insert_row(&mut self, table: &Table, rowid: i64, values: Vec<Value>) -> Result<()> {
         let mut tree =
             TableTree::open(&mut self.pager, table.root_page)?.with_rowid_alias(table.rowid_alias);
-        // The rowid alias slot is stored as NULL and recovered from the key.
-        let payload = crate::btree_write::LeafPage::encode_payload(&values, table.rowid_alias);
         tree.insert(&mut self.pager, &crate::table_tree::Row { rowid, values })?;
-        let _ = payload;
+        // A split that reaches the root allocates a new one, so the root page in
+        // the schema has to be brought up to date. Leaving it stale means the
+        // next statement, which opens the tree from the schema, writes to a page
+        // the tree no longer reaches.
+        self.write_table_root(table, tree.root())
+    }
+
+    /// Records a table's current root page in the schema.
+    fn write_table_root(&mut self, table: &Table, root: u32) -> Result<()> {
+        if root == table.root_page {
+            return Ok(());
+        }
+        self.update_schema_root(&table.name, root)?;
+        if let Some(t) = self.catalog.get_mut(&table.name) {
+            t.root_page = root;
+        }
         Ok(())
     }
 
@@ -533,12 +687,20 @@ impl Connection {
 
         let mut out = Vec::new();
         for row in &source_rows {
-            let bound: Vec<(String, Value)> = table
+            let mut bound: Vec<(String, Value)> = table
                 .columns
                 .iter()
                 .zip(row.values.iter())
                 .map(|(c, v)| (c.name.clone(), v.clone()))
                 .collect();
+            // A rowid alias is stored as NULL and recovered from the key, so
+            // the bound row carries the rowid before any expression sees it.
+            // Doing it once here covers the predicate and the projection.
+            if let Some(i) = table.rowid_alias {
+                if let Some((_, slot)) = bound.get_mut(i) {
+                    *slot = Value::Integer(row.rowid);
+                }
+            }
             let params: Vec<Value> = Vec::new();
             let ctx = EvalCtx {
                 params: &params,
@@ -1174,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn many_rows_survive_a_reopen() {
+    fn a_table_and_its_rows_survive_a_reopen() {
         let path = std::env::temp_dir().join(format!("nsqlite-exec-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
@@ -1185,10 +1347,25 @@ mod tests {
                     .unwrap();
             }
         }
-        // The schema lives in the connection, not the file, so a reopen starts
-        // empty; that is the gap CREATE TABLE writing its schema row closes.
+        // The schema is stored in sqlite_schema, so a new connection reads the
+        // table's definition back out of the file rather than starting empty.
+        // Five hundred rows is past the point where the tree grows a second
+        // level, so this also covers the root moving and the schema following.
         let mut c = Connection::open(&path).unwrap();
-        assert!(c.table_names().is_empty());
+        assert_eq!(c.table_names(), vec!["t"]);
+        for rowid in [1i64, 250, 500] {
+            let o = run(&mut c, &format!("SELECT id FROM t WHERE id = {rowid}"));
+            assert_eq!(
+                rows_of(&o)[0].values[0],
+                Value::Integer(rowid),
+                "row {rowid} lost"
+            );
+        }
+        // A row that was never inserted is not there, which is what tells the
+        // rows really came back rather than a lookup inventing them.
+        let o = run(&mut c, "SELECT id FROM t WHERE id = 501");
+        assert!(rows_of(&o).is_empty());
+        drop(c);
         let _ = std::fs::remove_file(&path);
     }
 

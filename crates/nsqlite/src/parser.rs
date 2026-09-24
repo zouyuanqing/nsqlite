@@ -289,6 +289,10 @@ pub enum Stmt {
         without_rowid: bool,
         strict: bool,
         temp: bool,
+        /// The statement's own source text, which is what sqlite_schema stores.
+        /// A reopened connection reads the table's definition back from it, so
+        /// the text has to be the original rather than a reconstruction.
+        sql: String,
     },
     DropTable {
         name: String,
@@ -1720,6 +1724,15 @@ impl<'a> Parser<'a> {
     }
 
     fn create_table(&mut self, temp: bool) -> Result<Stmt> {
+        // The statement's text starts at CREATE, which is the token before the
+        // one the caller consumed.
+        let start = self
+            .tokens
+            .get(self.pos.saturating_sub(2))
+            .map(|(t, s)| match t {
+                Token::Keyword(Keyword::Create) => s.start,
+                _ => s.start,
+            });
         let if_not_exists = self.if_not_exists()?;
         let name = self.name("after CREATE TABLE")?;
         let mut full = name;
@@ -1772,6 +1785,19 @@ impl<'a> Parser<'a> {
             }
             break;
         }
+        // The stored text is the original statement, which is what SQLite keeps
+        // in sqlite_schema and what a reopened connection reads the table back
+        // from. Reconstructing it from the parsed form would lose the original
+        // spelling, which is what a schema dump is expected to show.
+        let end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|(_, s)| s.end)
+            .unwrap_or(0);
+        let sql = match start {
+            Some(a) if a <= end && end <= self.sql.len() => self.sql[a..end].trim().to_string(),
+            _ => String::new(),
+        };
         Ok(Stmt::CreateTable {
             name: full,
             if_not_exists,
@@ -1780,6 +1806,7 @@ impl<'a> Parser<'a> {
             without_rowid,
             strict,
             temp,
+            sql,
         })
     }
 
