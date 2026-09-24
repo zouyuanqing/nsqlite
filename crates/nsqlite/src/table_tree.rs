@@ -46,7 +46,12 @@ impl TableTree {
     pub fn open(pager: &mut Pager, root: u32) -> Result<TableTree> {
         let page_size = pager.page_size();
         let usable = pager.usable_size();
-        let tree = TableTree { root, page_size, usable, rowid_alias: None };
+        let tree = TableTree {
+            root,
+            page_size,
+            usable,
+            rowid_alias: None,
+        };
         let blank = pager.read_page(root)?.iter().all(|&b| b == 0);
         if blank {
             // A page that has never been written becomes an empty leaf.
@@ -85,7 +90,10 @@ impl TableTree {
 
     /// Inserts a row, allocating and splitting pages as needed.
     pub fn insert(&mut self, pager: &mut Pager, row: &Row) -> Result<()> {
-        let cell = Cell { rowid: row.rowid, payload: self.payload_of(row) };
+        let cell = Cell {
+            rowid: row.rowid,
+            payload: self.payload_of(row),
+        };
         // Walk down, remembering the path so a split can propagate upward.
         let mut path: Vec<u32> = Vec::new();
         let mut page_no = self.root;
@@ -121,7 +129,11 @@ impl TableTree {
         // the new right child hanging off a parent that does not yet know about
         // it, then insert into whichever half the key belongs to.
         let split = split_leaf(pager, &leaf, self.usable)?;
-        let target = if cell.rowid <= split.separator { split.left } else { split.right };
+        let target = if cell.rowid <= split.separator {
+            split.left
+        } else {
+            split.right
+        };
         let mut half = LeafPage::read(pager, target)?;
         let inserted = half.insert(cell, self.usable)?;
         if !inserted {
@@ -163,7 +175,10 @@ impl TableTree {
             let new_root = pager.allocate()?;
             let interior = InteriorPage {
                 page_no: new_root,
-                cells: vec![InteriorCell { left_child, key: separator }],
+                cells: vec![InteriorCell {
+                    left_child,
+                    key: separator,
+                }],
                 rightmost: new_rightmost,
                 page_size: self.page_size,
                 header_offset: 0,
@@ -173,7 +188,6 @@ impl TableTree {
             return Ok(());
         };
 
-        let mut interior = InteriorPage::read(pager, parent)?;
         // A split reuses the original page for its left half, so the page that
         // split is still the parent's child and now has to be represented by
         // two entries: one for each half. Where that happens depends on whether
@@ -182,7 +196,10 @@ impl TableTree {
         if interior.rightmost == left_child {
             // The split page was the rightmost child, so it becomes a cell and
             // the new page takes over as the rightmost.
-            interior.cells.push(InteriorCell { left_child, key: separator });
+            interior.cells.push(InteriorCell {
+                left_child,
+                key: separator,
+            });
             interior.rightmost = new_rightmost;
         } else {
             let pos = interior
@@ -198,9 +215,18 @@ impl TableTree {
             // this subtree, and now points at the right half. The new cell
             // takes its place in the ordering, covering the left half.
             interior.cells[pos].left_child = new_rightmost;
-            interior.cells.insert(pos, InteriorCell { left_child, key: separator });
+            interior.cells.insert(
+                pos,
+                InteriorCell {
+                    left_child,
+                    key: separator,
+                },
+            );
         }
-        let probe = InteriorPage { cells: interior.cells.clone(), ..interior_ref(&interior) };
+        let probe = InteriorPage {
+            cells: interior.cells.clone(),
+            ..interior_ref(&interior)
+        };
         if probe.can_write() {
             write_interior(pager, &probe)?;
             return Ok(());
@@ -246,12 +272,13 @@ impl TableTree {
         for page_no in self.leaf_pages(pager)? {
             let leaf = LeafPage::read(pager, page_no)?;
             for cell in &leaf.cells {
-                let values = super::record::decode_record(
-                    &cell.payload,
-                    pager.header().text_encoding,
-                )?
-                .values;
-                out.push(Row { rowid: cell.rowid, values });
+                let values =
+                    super::record::decode_record(&cell.payload, pager.header().text_encoding)?
+                        .values;
+                out.push(Row {
+                    rowid: cell.rowid,
+                    values,
+                });
             }
         }
         Ok(out)
@@ -292,11 +319,9 @@ impl TableTree {
                     let Some(cell) = leaf.cells.iter().find(|c| c.rowid == rowid) else {
                         return Ok(None);
                     };
-                    let values = super::record::decode_record(
-                        &cell.payload,
-                        pager.header().text_encoding,
-                    )?
-                    .values;
+                    let values =
+                        super::record::decode_record(&cell.payload, pager.header().text_encoding)?
+                            .values;
                     return Ok(Some(Row { rowid, values }));
                 }
                 PageKind::Interior => {
@@ -310,7 +335,9 @@ impl TableTree {
     /// The largest rowid in the tree, or 0 when it is empty.
     pub fn max_rowid(&mut self, pager: &mut Pager) -> Result<i64> {
         let pages = self.leaf_pages(pager)?;
-        let Some(&last) = pages.last() else { return Ok(0) };
+        let Some(&last) = pages.last() else {
+            return Ok(0);
+        };
         let leaf = LeafPage::read(pager, last)?;
         Ok(leaf.cells.last().map_or(0, |c| c.rowid))
     }
@@ -318,7 +345,9 @@ impl TableTree {
     /// The smallest rowid in the tree, or 0 when it is empty.
     pub fn min_rowid(&mut self, pager: &mut Pager) -> Result<i64> {
         let pages = self.leaf_pages(pager)?;
-        let Some(&first) = pages.first() else { return Ok(0) };
+        let Some(&first) = pages.first() else {
+            return Ok(0);
+        };
         let leaf = LeafPage::read(pager, first)?;
         Ok(leaf.cells.first().map_or(0, |c| c.rowid))
     }
@@ -549,7 +578,10 @@ mod tests {
             tree.insert(&mut pager, &row(i, 80)).unwrap();
         }
         assert!(tree.remove(&mut pager, 15).unwrap());
-        assert!(!tree.remove(&mut pager, 15).unwrap(), "removing twice is a no-op");
+        assert!(
+            !tree.remove(&mut pager, 15).unwrap(),
+            "removing twice is a no-op"
+        );
         assert!(!tree.remove(&mut pager, 9999).unwrap());
         let rows = tree.scan(&mut pager).unwrap();
         assert_eq!(rows.len(), 29);
@@ -562,19 +594,24 @@ mod tests {
         let mut pager = Pager::open(&path).unwrap();
         pager.allocate().unwrap();
         let root = pager.allocate().unwrap();
-        let mut tree = TableTree::open(&mut pager, root).unwrap().with_rowid_alias(Some(0));
+        let mut tree = TableTree::open(&mut pager, root)
+            .unwrap()
+            .with_rowid_alias(Some(0));
         for i in 1..=5 {
             tree.insert(
                 &mut pager,
-                &Row { rowid: i, values: vec![Value::Integer(i), Value::Text("t".into())] },
+                &Row {
+                    rowid: i,
+                    values: vec![Value::Integer(i), Value::Text("t".into())],
+                },
             )
             .unwrap();
         }
         // On disk the alias slot is NULL, so reading the raw record shows NULL
         // while the rowid key carries the value.
         let leaf = LeafPage::read(&mut pager, root).unwrap();
-        let decoded = super::super::record::decode_record(&leaf.cells[0].payload, Encoding::Utf8)
-            .unwrap();
+        let decoded =
+            super::super::record::decode_record(&leaf.cells[0].payload, Encoding::Utf8).unwrap();
         assert_eq!(decoded.values[0], Value::Null);
         assert_eq!(leaf.cells[0].rowid, 1);
         drop(tree);
@@ -606,7 +643,11 @@ mod tests {
         let rows = tree.scan(&mut pager).unwrap();
         assert_eq!(rows.len(), 500);
         for (i, r) in rows.iter().enumerate() {
-            assert_eq!(r.rowid, i as i64 + 1, "a reopened tree must stay in key order");
+            assert_eq!(
+                r.rowid,
+                i as i64 + 1,
+                "a reopened tree must stay in key order"
+            );
         }
         drop(tree);
         drop(pager);

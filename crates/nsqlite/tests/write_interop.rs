@@ -107,7 +107,8 @@ fn write_spilling_leaf(
     {
         let dst = pager.page(page_no).unwrap();
         let mut next = chains.into_iter();
-        page.write(dst, usable, |_| Ok(next.next().unwrap_or(0))).expect("writing the leaf");
+        page.write(dst, usable, |_| Ok(next.next().unwrap_or(0)))
+            .expect("writing the leaf");
     }
     pager.mark_dirty(page_no);
 }
@@ -152,8 +153,12 @@ fn set_schema_root(pager: &mut nsqlite::pager::Pager, table: &str, root: u32) {
 
     let usable = pager.usable_size();
     let mut cells = schema.cells.clone();
-    cells[schema.cells.iter().position(|c| c.rowid == cell.rowid).unwrap()].payload =
-        new_payload;
+    cells[schema
+        .cells
+        .iter()
+        .position(|c| c.rowid == cell.rowid)
+        .unwrap()]
+    .payload = new_payload;
     let page = LeafPage { cells, ..schema };
     write_spilling_leaf(pager, &page, usable);
     // The schema cookie has to advance, or a reader keeps using its cached copy.
@@ -410,7 +415,10 @@ fn sqlite3_reads_a_tree_that_grew_through_many_splits() {
                 &mut pager,
                 &Row {
                     rowid: i,
-                    values: vec![Value::Text(format!("value-{i}")), Value::Text("y".repeat(60))],
+                    values: vec![
+                        Value::Text(format!("value-{i}")),
+                        Value::Text("y".repeat(60)),
+                    ],
                 },
             )
             .expect("inserting a row");
@@ -423,7 +431,11 @@ fn sqlite3_reads_a_tree_that_grew_through_many_splits() {
     }
 
     let count = run(&path, "SELECT count(*) FROM t;");
-    assert_eq!(count.trim(), N.to_string(), "sqlite3 lost rows across a split");
+    assert_eq!(
+        count.trim(),
+        N.to_string(),
+        "sqlite3 lost rows across a split"
+    );
     let first = run(&path, "SELECT c0 FROM t WHERE rowid=1;");
     assert_eq!(first.trim(), "value-1");
     let last = run(&path, "SELECT c0 FROM t WHERE rowid=3000;");
@@ -432,10 +444,17 @@ fn sqlite3_reads_a_tree_that_grew_through_many_splits() {
     assert_eq!(middle.trim(), "value-1500");
     // A scan must come back in rowid order, which is what the interior
     // separators encode.
-    let ordered = run(&path, "SELECT count(*) FROM (SELECT rowid FROM t ORDER BY rowid);");
+    let ordered = run(
+        &path,
+        "SELECT count(*) FROM (SELECT rowid FROM t ORDER BY rowid);",
+    );
     assert_eq!(ordered.trim(), N.to_string());
     let integrity = run(&path, "PRAGMA integrity_check;");
-    assert_eq!(integrity.trim(), "ok", "the grown tree failed integrity_check");
+    assert_eq!(
+        integrity.trim(),
+        "ok",
+        "the grown tree failed integrity_check"
+    );
 }
 
 /// The same, with negative rowids, which use the nine-byte varint form and so
@@ -464,7 +483,10 @@ fn sqlite3_reads_a_tree_with_negative_rowids() {
         for k in &keys {
             tree.insert(
                 &mut pager,
-                &Row { rowid: *k, values: vec![Value::Text(format!("k{k}"))] },
+                &Row {
+                    rowid: *k,
+                    values: vec![Value::Text(format!("k{k}"))],
+                },
             )
             .expect("inserting a row");
         }
@@ -484,5 +506,9 @@ fn sqlite3_reads_a_tree_with_negative_rowids() {
     let max = run(&path, "SELECT max(rowid) FROM t;");
     assert_eq!(max.trim(), "800");
     let integrity = run(&path, "PRAGMA integrity_check;");
-    assert_eq!(integrity.trim(), "ok", "the negative-rowid tree failed integrity_check");
+    assert_eq!(
+        integrity.trim(),
+        "ok",
+        "the negative-rowid tree failed integrity_check"
+    );
 }

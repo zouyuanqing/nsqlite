@@ -231,6 +231,7 @@ pub enum Keyword {
     Where,
     Window,
     With,
+    Within,
     Without,
 }
 
@@ -383,6 +384,7 @@ impl Keyword {
         Keyword::Where,
         Keyword::Window,
         Keyword::With,
+        Keyword::Within,
         Keyword::Without,
     ];
 
@@ -535,6 +537,7 @@ impl Keyword {
             Keyword::Where => "where",
             Keyword::Window => "window",
             Keyword::With => "with",
+            Keyword::Within => "within",
             Keyword::Without => "without",
         }
     }
@@ -664,6 +667,7 @@ static KEYWORDS: &[(&str, Keyword)] = &[
     ("vacuum", Keyword::Vacuum),
     ("values", Keyword::Values),
     ("window", Keyword::Window),
+    ("within", Keyword::Within),
     ("analyze", Keyword::Analyze),
     ("between", Keyword::Between),
     ("cascade", Keyword::Cascade),
@@ -1207,8 +1211,14 @@ impl<'a> Tokenizer<'a> {
     ///
     /// A digit right after the sigil makes it an index, matching SQLite's
     /// `:1`; otherwise a name is read. A `?` with neither is an anonymous
-    /// parameter, and a bare sigil on any of the other three is an error, so a
-    /// lone `$` cannot be mistaken for a name.
+    /// parameter. A sigil followed by nothing that can be part of a name is an
+    /// error on all four, so a lone `$` is not mistaken for a parameter.
+    ///
+    /// The name may start with a digit or a `$`, because SQLite's test is
+    /// `IdChar` (anything alphanumeric, `_`, `$` or non-ASCII) rather than the
+    /// stricter "identifier start" test. That is what makes `SELECT :$`,
+    /// `SELECT :0` and `SELECT $$` legal, with the whole run from the
+    /// character after the sigil as the name.
     fn scan_parameter(&mut self, start: usize) -> Result<Token> {
         let sigil = self.bump().unwrap_or('?');
         if self.peek().is_some_and(|c| c.is_ascii_digit()) {
@@ -1225,13 +1235,13 @@ impl<'a> Tokenizer<'a> {
                 name: None,
             });
         }
-        if sigil == '?' && !self.peek().is_some_and(is_id_start) {
+        if sigil == '?' && !self.peek().is_some_and(is_id_continue) {
             return Ok(Token::Parameter {
                 index: None,
                 name: None,
             });
         }
-        if !self.peek().is_some_and(is_id_start) {
+        if !self.peek().is_some_and(is_id_continue) {
             return Err(unrecognized(self.src, start, self.pos));
         }
         let name_start = self.pos;
@@ -1325,12 +1335,19 @@ impl<'a> Tokenizer<'a> {
             // The sign belongs to the exponent only when digits follow it;
             // otherwise SQLite stops the token at the `e` and leaves the sign
             // for the next token, which is why `1e+` reports just `1e`.
-            let before_sign = self.pos;
+            //
+            // All three counters are saved and restored, not just `pos`:
+            // `bump` advances `col` too, so rewinding `pos` alone would leave
+            // the column permanently one ahead and every later token in the
+            // stream would report a column that is too large.
+            let before_sign = (self.pos, self.line, self.col);
             if matches!(self.peek(), Some('+' | '-')) {
                 self.bump();
             }
             if !self.digits(false) {
-                self.pos = before_sign;
+                self.pos = before_sign.0;
+                self.line = before_sign.1;
+                self.col = before_sign.2;
                 return Err(unrecognized(self.src, start, self.pos));
             }
         }
@@ -1471,6 +1488,15 @@ mod tests {
         assert_eq!(kw("select"), Token::Keyword(Keyword::Select));
         assert_eq!(one("wItHoUt"), kw("without"));
         assert_eq!(one("CuRrEnT_tImEsTaMp"), kw("current_timestamp"));
+    }
+
+    #[test]
+    fn the_keyword_table_matches_sqlites() {
+        // `WITHIN` is in SQLite's `aKeywordTable` (TK_WITHIN, ORDERSET), so it
+        // is a keyword here too; it is the one word a first pass leaves out.
+        assert_eq!(one("WiThIn"), Token::Keyword(Keyword::Within));
+        assert_eq!(Keyword::from_name("within"), Some(Keyword::Within));
+        assert_eq!(Keyword::Within.as_ident(), "within");
     }
 
     #[test]
@@ -1729,6 +1755,32 @@ mod tests {
         assert_eq!(err("1.5e+").message, "unrecognized token: \"1.5e\"");
     }
 
+    #[test]
+    fn a_dangling_exponent_leaves_the_column_counter_in_step() {
+        // The rewind on the exponent error path must restore the column along
+        // with the position, or every later token reports a column that is too
+        // large. The column is 1-based, so it is the count of characters before
+        // the token's first byte.
+        for src in ["1e+ 2", "1e- 2", "1e+1_ 2", "1e+ ;", "1e+1_ 2 3"] {
+            let mut t = Tokenizer::new(src);
+            let mut seen_error = false;
+            loop {
+                match t.next_token() {
+                    Ok(Some((token, span))) => {
+                        let col = src[..span.start].chars().count() as u32 + 1;
+                        assert_eq!(span.col, col, "wrong col for {token:?} in {src:?}");
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        seen_error = true;
+                        break;
+                    }
+                }
+            }
+            assert!(seen_error, "{src:?} was expected to fail somewhere");
+        }
+    }
+
     // ---- parameters --------------------------------------------------------
 
     #[test]
@@ -1793,6 +1845,62 @@ mod tests {
         assert_eq!(err("$").message, "unrecognized token: \"$\"");
         assert_eq!(err(":").message, "unrecognized token: \":\"");
         assert_eq!(err("@").message, "unrecognized token: \"@\"");
+        // A sigil followed by something that cannot be in a name is the same
+        // error, still naming only the sigil.
+        assert_eq!(err("$(").message, "unrecognized token: \"$\"");
+        assert_eq!(err(": ").message, "unrecognized token: \":\"");
+        assert_eq!(err("@;").message, "unrecognized token: \"@\"");
+    }
+
+    #[test]
+    fn a_sigil_name_may_start_with_a_digit_or_dollar() {
+        // SQLite tests the first name character with `IdChar`, which admits
+        // digits and `$`, not just alphabetic ones. Checked against
+        // `sqlite3 3.53.4`, which accepts every one of these.
+        for src in [":$", "@$", "$$", ":0", "@0", "$0", ":$x", "$$abc", ":_a"] {
+            assert!(
+                Tokenizer::tokenize_all(src).is_ok(),
+                "{src:?} should tokenize"
+            );
+        }
+        assert_eq!(
+            one(":$"),
+            Token::Parameter {
+                index: None,
+                name: Some("$".into())
+            }
+        );
+        assert_eq!(
+            one("$$abc"),
+            Token::Parameter {
+                index: None,
+                name: Some("$abc".into())
+            }
+        );
+        // A digit run right after the sigil is still an index, not a name.
+        assert_eq!(
+            one(":0"),
+            Token::Parameter {
+                index: Some(0),
+                name: None
+            }
+        );
+    }
+
+    #[test]
+    fn an_anonymous_question_mark_needs_no_name() {
+        // `?` alone is fine, but a `?` followed by a `$` is not: SQLite reads
+        // a name after `?` only when an `IdChar` comes next, and `$` is one,
+        // so the name is `$` here and the run simply ends.
+        assert_eq!(
+            one("?"),
+            Token::Parameter {
+                index: None,
+                name: None
+            }
+        );
+        assert!(Tokenizer::tokenize_all("?x").is_ok());
+        assert!(Tokenizer::tokenize_all("?1").is_ok());
     }
 
     // ---- punctuation -------------------------------------------------------
@@ -2199,5 +2307,156 @@ mod tests {
         // Too many digits for any index, so it cannot be represented.
         let src = format!("?{}", "9".repeat(30));
         assert!(Tokenizer::tokenize_all(&src).is_err());
+    }
+}
+
+impl Keyword {
+    /// Whether the keyword may stand in for an identifier.
+    ///
+    /// SQLite's parser accepts a keyword as a name wherever a name is
+    /// grammatically required and defers the decision to name resolution: if
+    /// the schema has a column by that name, it is a column, and otherwise the
+    /// statement is an error. Rejecting keywords here would break every table
+    /// with a column called `key` or one named `values`.
+    pub fn as_identable(self) -> bool {
+        use Keyword::*;
+        !matches!(
+            self,
+            Select
+                | From
+                | Where
+                | Group
+                | Having
+                | Order
+                | Limit
+                | Offset
+                | Join
+                | Inner
+                | Left
+                | Right
+                | Full
+                | Cross
+                | Natural
+                | On
+                | Using
+                | Union
+                | Intersect
+                | Except
+                | Insert
+                | Update
+                | Delete
+                | Create
+                | Drop
+                | Alter
+                | Set
+                | Values
+                | Into
+                | And
+                | Or
+                | Not
+                | Is
+                | In
+                | Like
+                | Glob
+                | Match
+                | Regexp
+                | Between
+                | Case
+                | When
+                | Then
+                | Else
+                | End
+                | Distinct
+                | All
+                | As
+                | With
+                | Recursive
+                | Primary
+                | Key
+                | Unique
+                | Check
+                | Default
+                | References
+                | Foreign
+                | Constraint
+                | Collate
+                | Escape
+                | Exists
+                | Cast
+                | Begin
+                | Commit
+                | Rollback
+                | Savepoint
+                | Release
+                | To
+                | Transaction
+                | Explain
+                | Pragma
+                | Vacuum
+                | Attach
+                | Detach
+                | Indexed
+                | By
+                | Temp
+                | Temporary
+                | If
+        )
+    }
+
+    /// Whether the keyword begins a clause, so it cannot be a bare alias.
+    pub fn starts_clause(self) -> bool {
+        use Keyword::*;
+        matches!(
+            self,
+            From | Where
+                | Group
+                | Having
+                | Order
+                | Limit
+                | Offset
+                | Join
+                | Inner
+                | Left
+                | Right
+                | Full
+                | Cross
+                | Natural
+                | On
+                | Using
+                | Union
+                | Intersect
+                | Except
+                | When
+                | Then
+                | Else
+                | End
+                | Set
+                | Values
+                | Into
+                | And
+                | Or
+                | Not
+                | Is
+                | In
+                | Like
+                | Glob
+                | Match
+                | Regexp
+                | Between
+                | Collate
+                | Window
+        )
+    }
+
+    /// Whether the keyword names a type, so it belongs to a column definition
+    /// rather than starting a constraint.
+    ///
+    /// This is always false, and deliberately so: SQLite does not reserve any
+    /// type name. `TEXT`, `BLOB` and `INTEGER` are ordinary identifiers, and
+    /// SQLite accepts any word as a declared type, so a column definition reads
+    /// its type as identifiers rather than keywords. The method exists so the
+    /// parser can ask the question without assuming a fixed set of type names.
+    pub fn is_type_word(self) -> bool {
+        false
     }
 }

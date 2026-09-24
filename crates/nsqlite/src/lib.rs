@@ -27,6 +27,7 @@ pub mod btree_write;
 pub mod error;
 pub mod page;
 pub mod pager;
+pub mod parser;
 pub mod record;
 pub mod table_tree;
 pub mod text;
