@@ -12,6 +12,7 @@
 //!   overflow thresholds.
 //! * [`pager`] — the page cache over a database file.
 //! * [`btree`] — reading table b-trees, including overflow chains.
+//! * [`btree_write`] — writing table leaf pages.
 //! * [`text`] — the text encodings a file can declare.
 //! * [`value`] / [`error`] — the runtime value and error types.
 //!
@@ -19,6 +20,7 @@
 //! of these and live in their own modules as they land.
 
 pub mod btree;
+pub mod btree_write;
 pub mod error;
 pub mod page;
 pub mod pager;
