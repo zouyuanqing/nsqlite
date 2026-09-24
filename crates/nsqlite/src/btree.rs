@@ -551,8 +551,10 @@ mod tests {
     fn a_page_one_root_is_read_through_the_file_header_offset() {
         let path = temp("page1root");
         let mut pager = Pager::open(&path).unwrap();
-        let root = pager.allocate().unwrap();
-        assert_eq!(root, 1);
+        // A b-tree on page 1 starts at offset 100, past the file header. The
+        // page is placed there directly because allocation never hands out 1.
+        let root = 1u32;
+        pager.claim_page(root).unwrap();
         build_leaf(&mut pager, root, &[(7, vec![Value::Integer(7)])]);
         pager.flush().unwrap();
         drop(pager);

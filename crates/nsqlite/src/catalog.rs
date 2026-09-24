@@ -69,10 +69,72 @@ impl Table {
     }
 }
 
+/// One secondary index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Index {
+    pub name: String,
+    pub table: String,
+    /// The indexed columns, in key order.
+    pub columns: Vec<String>,
+    /// Whether each key column is ascending. A descending one stores its
+    /// values reversed so the entries stay in ascending order on the page, which
+    /// is what lets one page layout serve both directions.
+    pub ascending: Vec<bool>,
+    pub unique: bool,
+    pub root_page: u32,
+}
+
+impl Index {
+    /// How many leading columns make up the key.
+    pub fn key_len(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// The value a column's key takes in an index entry.
+    ///
+    /// A descending column stores the value unchanged and reverses the order
+    /// the cells are laid out in, which is what a real file shows: an ascending
+    /// and a descending index over the same column hold byte-identical keys and
+    /// differ only in the order the cells appear. Inverting the value instead
+    /// would produce a file SQLite reads with the wrong ordering.
+    pub fn key_value(&self, col: usize, v: &crate::value::Value) -> crate::value::Value {
+        let _ = col;
+        v.clone()
+    }
+
+    /// Whether a comparison of two keys should be reversed, which is the case
+    /// for a descending column.
+    pub fn reversed_at(&self, col: usize) -> bool {
+        !self.ascending.get(col).copied().unwrap_or(true)
+    }
+
+    /// The order two keys are in under this index's column directions.
+    pub fn compare_keys(
+        &self,
+        a: &[crate::value::Value],
+        b: &[crate::value::Value],
+    ) -> std::cmp::Ordering {
+        for i in 0..self.key_len() {
+            let (Some(x), Some(y)) = (a.get(i), b.get(i)) else {
+                continue;
+            };
+            let mut ord = x.compare(y);
+            if self.reversed_at(i) {
+                ord = ord.reverse();
+            }
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
 /// Every table the connection knows about.
 #[derive(Debug, Default)]
 pub struct Catalog {
     tables: HashMap<String, Table>,
+    indexes: HashMap<String, Index>,
 }
 
 impl Catalog {
@@ -100,6 +162,50 @@ impl Catalog {
 
     pub fn contains(&self, name: &str) -> bool {
         self.tables.contains_key(&name.to_ascii_lowercase())
+    }
+
+    /// Adds or replaces an index.
+    pub fn put_index(&mut self, index: Index) {
+        self.indexes.insert(index.name.to_ascii_lowercase(), index);
+    }
+
+    pub fn index(&self, name: &str) -> Option<&Index> {
+        self.indexes.get(&name.to_ascii_lowercase())
+    }
+
+    pub fn remove_index(&mut self, name: &str) -> Option<Index> {
+        self.indexes.remove(&name.to_ascii_lowercase())
+    }
+
+    /// The indexes defined on a table, in the order their names sort, which is
+    /// what a schema listing shows.
+    pub fn indexes_on(&self, table: &str) -> Vec<&Index> {
+        let mut v: Vec<&Index> = self
+            .indexes
+            .values()
+            .filter(|i| i.table.eq_ignore_ascii_case(table))
+            .collect();
+        v.sort_by(|a, b| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        });
+        v
+    }
+
+    /// The index whose leading column is exactly this one, which is the one a
+    /// lookup on that column can use.
+    pub fn index_on_column(&self, table: &str, column: &str) -> Option<&Index> {
+        self.indexes_on(table).into_iter().find(|i| {
+            i.columns
+                .first()
+                .map(|c| c.eq_ignore_ascii_case(column))
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn index_count(&self) -> usize {
+        self.indexes.len()
     }
 
     pub fn len(&self) -> usize {

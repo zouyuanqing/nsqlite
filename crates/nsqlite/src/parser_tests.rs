@@ -57,8 +57,9 @@ fn a_star_expands_later() {
         FromItem::Table(TableRef {
             name: "t".into(),
             alias: None,
-            join: JoinKind::Inner,
+            join: None,
             on: None,
+            using: vec![],
             indexed_by: None,
         })
     );
@@ -473,4 +474,187 @@ fn the_stress_inputs_never_panic() {
     // A nesting far past the limit, which must be refused rather than crash.
     let deep = format!("SELECT {}1", "(".repeat(5000));
     let _ = parse_script(&deep);
+}
+
+// --- FROM clause joins -------------------------------------------------
+//
+// Every expectation below was taken from the sqlite3 in this repository's
+// toolchain (3.53.4) rather than from recollection: the shapes and the error
+// wording both come from asking it.
+
+/// The FROM items of a SELECT, as compact text, so a test can assert the
+/// operator and constraint each table carries.
+fn from_items(sql: &str) -> Vec<String> {
+    match select_body(sql) {
+        SelectBody::Simple { from, .. } => from
+            .iter()
+            .map(|f| match f {
+                FromItem::Table(t) => format!(
+                    "{}{} join={:?} on={} using={:?}",
+                    t.name,
+                    t.alias
+                        .as_ref()
+                        .map(|a| format!(" AS {a}"))
+                        .unwrap_or_default(),
+                    t.join,
+                    if t.on.is_some() { "y" } else { "n" },
+                    t.using
+                ),
+                FromItem::Subquery { alias, .. } => format!("subquery alias={alias:?}"),
+            })
+            .collect(),
+        other => panic!("expected a simple body, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_comma_from_carries_no_join_operator() {
+    // sqlite3 parses `a, b` as two items with no operator on either, because a
+    // comma is not a join type; whether the pair is a cross product or an inner
+    // join depends on whether a constraint follows.
+    assert_eq!(
+        from_items("SELECT * FROM a, b"),
+        vec!["a join=None on=n using=[]", "b join=None on=n using=[]"]
+    );
+    assert_eq!(from_items("SELECT * FROM a, b, c").len(), 3);
+}
+
+#[test]
+fn a_bare_join_is_an_inner_join() {
+    assert_eq!(
+        from_items("SELECT * FROM a JOIN b ON a.x = b.x"),
+        vec![
+            "a join=None on=n using=[]",
+            "b join=Some(Inner) on=y using=[]"
+        ]
+    );
+    // A JOIN with no constraint is a cross join in effect, but the operator is
+    // still recorded as INNER because that is what was written.
+    assert_eq!(
+        from_items("SELECT * FROM a JOIN b"),
+        vec![
+            "a join=None on=n using=[]",
+            "b join=Some(Inner) on=n using=[]"
+        ]
+    );
+}
+
+#[test]
+fn the_join_type_is_recorded_as_written() {
+    for (sql, kind) in [
+        ("SELECT * FROM a LEFT JOIN b ON 1", "Some(Left)"),
+        ("SELECT * FROM a LEFT OUTER JOIN b ON 1", "Some(Left)"),
+        ("SELECT * FROM a RIGHT JOIN b ON 1", "Some(Right)"),
+        ("SELECT * FROM a FULL OUTER JOIN b ON 1", "Some(Full)"),
+        ("SELECT * FROM a CROSS JOIN b", "Some(Cross)"),
+        ("SELECT * FROM a INNER JOIN b ON 1", "Some(Inner)"),
+    ] {
+        let items = from_items(sql);
+        assert!(
+            items[1].contains(&format!("join={kind}")),
+            "{sql}: got {items:?}"
+        );
+    }
+}
+
+#[test]
+fn a_constraint_may_follow_a_comma() {
+    // sqlite3 accepts `a, b ON ...`; the ON attaches to `b` and makes the pair an
+    // inner join. The operator stays absent, and the executor decides from the
+    // constraint.
+    assert_eq!(
+        from_items("SELECT * FROM a, b ON a.x = b.x"),
+        vec!["a join=None on=n using=[]", "b join=None on=y using=[]"]
+    );
+}
+
+#[test]
+fn a_using_clause_becomes_a_column_list_not_an_on_expression() {
+    assert_eq!(
+        from_items("SELECT * FROM a JOIN b USING (x)"),
+        vec![
+            "a join=None on=n using=[]",
+            "b join=Some(Inner) on=n using=[\"x\"]"
+        ]
+    );
+    assert_eq!(
+        from_items("SELECT * FROM a JOIN b USING (x, y)")[1],
+        "b join=Some(Inner) on=n using=[\"x\", \"y\"]"
+    );
+}
+
+#[test]
+fn a_join_chain_records_each_operator() {
+    // Each table after the first carries the operator that attached it, so the
+    // executor can fold the list in from the left.
+    assert_eq!(
+        from_items("SELECT * FROM a JOIN b ON a.x=b.x JOIN c ON b.x=c.x"),
+        vec![
+            "a join=None on=n using=[]",
+            "b join=Some(Inner) on=y using=[]",
+            "c join=Some(Inner) on=y using=[]"
+        ]
+    );
+}
+
+#[test]
+fn a_table_alias_is_recorded_with_or_without_as() {
+    assert_eq!(
+        from_items("SELECT * FROM a AS p")[0],
+        "a AS p join=None on=n using=[]"
+    );
+    assert_eq!(
+        from_items("SELECT * FROM a p")[0],
+        "a AS p join=None on=n using=[]"
+    );
+    assert_eq!(
+        from_items("SELECT * FROM a p JOIN b q ON p.x = q.y"),
+        vec![
+            "a AS p join=None on=n using=[]",
+            "b AS q join=Some(Inner) on=y using=[]"
+        ]
+    );
+}
+
+#[test]
+fn an_unknown_join_type_says_so() {
+    // The wording is sqlite3's, which names the two words it rejected.
+    for (sql, msg) in [
+        (
+            "SELECT * FROM a INNER OUTER JOIN b ON 1",
+            "unknown join type: INNER OUTER",
+        ),
+        (
+            "SELECT * FROM a CROSS OUTER JOIN b",
+            "unknown join type: CROSS OUTER",
+        ),
+        ("SELECT * FROM a OUTER JOIN b", "unknown join type: OUTER"),
+    ] {
+        assert_eq!(err(sql).message, msg, "for {sql}");
+    }
+}
+
+#[test]
+fn a_natural_join_is_recognised_and_refused() {
+    // sqlite3 parses NATURAL; this engine does not execute it, so the failure has
+    // to name the feature rather than report a syntax error the user cannot act
+    // on.
+    assert_eq!(
+        err("SELECT * FROM a NATURAL JOIN b").message,
+        "NATURAL JOIN is not supported yet"
+    );
+}
+
+#[test]
+fn a_keyword_that_is_only_a_join_word_is_still_a_table_name() {
+    // `left` on its own is not a join, so it is read as the table it names. This
+    // is why the operator is only consumed once a JOIN is confirmed.
+    assert_eq!(
+        from_items("SELECT * FROM left")[0],
+        "left join=None on=n using=[]"
+    );
+    assert_eq!(
+        from_items("SELECT * FROM a AS outer")[0],
+        "a AS outer join=None on=n using=[]"
+    );
 }

@@ -175,6 +175,18 @@ impl Pager {
     }
 
     /// The number of pages the file currently holds.
+    /// Records that page `n` is part of the file.
+    ///
+    /// Page 1 holds the file header and is never allocated, so a caller that
+    /// puts a b-tree there has to say the file is at least that long or the
+    /// page is never flushed.
+    pub fn claim_page(&mut self, n: u32) -> Result<()> {
+        if n > self.header.db_size_pages {
+            self.header.db_size_pages = n;
+        }
+        Ok(())
+    }
+
     pub fn page_count(&self) -> u32 {
         self.header.db_size_pages
     }
@@ -309,8 +321,13 @@ impl Pager {
     }
 
     /// Appends a fresh page of zeroes to the file and returns its number.
+    ///
+    /// Page 1 holds the file header and is never handed out here: a fresh
+    /// database starts with a page count of zero, so the next page would come
+    /// back as page 1 and overwrite the header `open` just wrote, leaving an
+    /// all-zero file that no later open can read.
     pub fn allocate(&mut self) -> Result<u32> {
-        let n = self.header.db_size_pages + 1;
+        let n = (self.header.db_size_pages + 1).max(2);
         let buf = vec![0u8; self.page_size as usize];
         self.write_page(&buf, n)?;
         self.header.db_size_pages = n;
@@ -586,13 +603,15 @@ mod tests {
         p.write_header().unwrap();
         let a = p.allocate().unwrap();
         let b = p.allocate().unwrap();
-        assert_eq!((a, b), (1, 2));
-        assert_eq!(p.page_count(), 2);
+        // Page 1 holds the file header, so allocation starts at 2 and keeps
+        // counting up from there.
+        assert_eq!((a, b), (2, 3));
+        assert_eq!(p.page_count(), 3);
         p.flush().unwrap();
         drop(p);
 
         let p = Pager::open(&path).unwrap();
-        assert_eq!(p.page_count(), 2);
+        assert_eq!(p.page_count(), 3);
         drop(p);
         let _ = std::fs::remove_file(&path);
     }
@@ -626,8 +645,10 @@ mod tests {
     fn a_page_one_header_is_readable_through_the_pager() {
         let path = temp_path("page1");
         let mut p = Pager::open(&path).unwrap();
-        let n = p.allocate().unwrap();
-        assert_eq!(n, 1, "the first allocation is page 1");
+        // Page 1 is the file header and is never allocated, so the b-tree that
+        // shares it is placed there directly.
+        let n = 1u32;
+        p.claim_page(n).unwrap();
         p.write_header().unwrap();
         p.flush().unwrap();
         drop(p);

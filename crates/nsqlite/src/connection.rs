@@ -57,18 +57,6 @@ fn rebuild_table(name: &str, sql_text: &str, root: u32) -> Result<Table> {
 /// finds the schema there without a lookup, so a table never takes that page.
 const SCHEMA_ROOT: u32 = 1;
 
-/// Reserves page 1 for the schema if the database has no pages yet.
-///
-/// A fresh database has none, so the first allocation would be page 1 and a
-/// table would be handed the schema's own page. Allocating it here reserves it
-/// once.
-fn ensure_schema_page(pager: &mut Pager) -> Result<()> {
-    if pager.page_count() < SCHEMA_ROOT {
-        pager.allocate()?;
-    }
-    Ok(())
-}
-
 /// One row of a result set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -154,7 +142,7 @@ impl Connection {
     /// file written by a previous connection, or by the real sqlite3, opens with
     /// the right shape.
     fn load_schema(&mut self) -> Result<()> {
-        ensure_schema_page(&mut self.pager)?;
+        self.init_schema_page()?;
         let mut tree = TableTree::open(&mut self.pager, SCHEMA_ROOT)?;
         let rows = tree.scan(&mut self.pager)?;
         for row in rows {
@@ -173,9 +161,26 @@ impl Connection {
         Ok(())
     }
 
+    /// Makes sure page 1 exists as an empty leaf.
+    ///
+    /// The pager never hands out page 1, because it holds the file header, so
+    /// on a fresh database nothing has written it and a read of it would see
+    /// zeroes, which look like a freelist trunk page.
+    fn init_schema_page(&mut self) -> Result<()> {
+        if self.pager.page_count() >= SCHEMA_ROOT {
+            return Ok(());
+        }
+        // Page 1 is the file header, so the schema's leaf shares it: the b-tree
+        // header starts at offset 100 and the page has to count towards the
+        // file, or a flush would never write it.
+        let leaf = crate::btree_write::LeafPage::empty(SCHEMA_ROOT, self.pager.page_size());
+        leaf.write_to(&mut self.pager)?;
+        self.pager.claim_page(SCHEMA_ROOT)?;
+        Ok(())
+    }
+
     /// Writes a table's schema row into `sqlite_schema`.
     fn write_schema_row(&mut self, name: &str, root: u32, sql_text: &str) -> Result<()> {
-        ensure_schema_page(&mut self.pager)?;
         let values = vec![
             Value::Text("table".into()),
             Value::Text(name.to_owned()),
@@ -385,7 +390,6 @@ impl Connection {
         // The root page is allocated now, and a fresh leaf is written so the
         // file has a real table rather than a dangling page number. Page 1 is
         // the schema's, so a table never takes it.
-        ensure_schema_page(&mut self.pager)?;
         let root = self.pager.allocate()?;
         table.root_page = root;
         {

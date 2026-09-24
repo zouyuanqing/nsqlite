@@ -172,6 +172,8 @@ pub struct ResultColumn {
 pub enum JoinKind {
     Inner,
     Left,
+    Right,
+    Full,
     Cross,
 }
 
@@ -180,10 +182,12 @@ pub enum JoinKind {
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
-    /// How this table joins to everything to its left. A comma-separated FROM
-    /// is a CROSS join, which the parser records as `Cross` so the executor does
-    /// not have to infer it from a missing operator.
-    pub join: JoinKind,
+    /// How this table joins to everything to its left, or `None` when a comma
+    /// introduced it and no operator was written. A comma is not a cross join on
+    /// its own: a constraint may still follow, and a constraint makes the join an
+    /// inner one whatever the operator said, so "no operator" has to stay
+    /// distinguishable from `Cross`.
+    pub join: Option<JoinKind>,
     /// The ON constraint, if the join had one. A USING clause is not an ON
     /// expression: it is a column list the resolver turns into equality tests,
     /// and it changes what `*` expands to.
@@ -813,18 +817,28 @@ impl<'a> Parser<'a> {
         out.push(self.from_item()?);
         loop {
             // A comma and a join operator are the two ways another table can
-            // follow. A comma has no constraint, so it is a cross join.
-            let (kind, constraint) = if self.eat_punct(Punct::Comma)? {
-                (JoinKind::Cross, (None, Vec::new()))
+            // follow. The operator comes first, then the table it attaches, then
+            // the constraint: `a LEFT JOIN b ON ...`.
+            //
+            // A comma records no operator of its own, and a constraint may follow
+            // it anyway: `a, b ON a.x=b.x` is legal, and SQLite executes it as an
+            // inner join. So the operator is only recorded when one was written
+            // and the executor decides the rest from whether a constraint is
+            // present, which is what makes a bare `a JOIN b` a cross join and a
+            // constrained `a CROSS JOIN b ON ...` an inner one. A missing operator
+            // with a table still ahead means a comma was consumed and the next
+            // table simply cross joins.
+            let kind = if self.eat_punct(Punct::Comma)? {
+                None
             } else {
-                let Some(kind) = self.join_operator()? else {
-                    break;
-                };
-                let constraint = self.join_constraint()?;
-                (kind, constraint)
+                match self.join_operator()? {
+                    Some(kind) => Some(kind),
+                    // Neither a comma nor a join operator: the clause is over.
+                    None => break,
+                }
             };
             let mut next = self.from_item()?;
-            let (on, using) = constraint;
+            let (on, using) = self.join_constraint()?;
             set_join(&mut next, kind, on, using)?;
             out.push(next);
         }
@@ -834,31 +848,80 @@ impl<'a> Parser<'a> {
     /// The join operator at the cursor, or `None` if the FROM clause ends here.
     ///
     /// `INNER`, `LEFT` and `CROSS` are all written as an optional modifier in
-    /// front of `JOIN`, and a bare `JOIN` is an inner join. `NATURAL` is a
-    /// modifier this engine does not execute, but it is recognised here so the
-    /// failure names the unsupported feature rather than a bare syntax error.
+    /// front of `JOIN`, and a bare `JOIN` is an inner join. `OUTER` may follow
+    /// `LEFT` or `INNER` and changes nothing. `NATURAL` is a modifier this engine
+    /// does not execute, but it is recognised here so the failure names the
+    /// unsupported feature rather than a bare syntax error.
     fn join_operator(&mut self) -> Result<Option<JoinKind>> {
+        // A join operator is only one if a `JOIN` follows it. A bare `LEFT` with
+        // nothing after it is a table named `left`, which SQLite allows, so
+        // nothing is consumed until the `JOIN` is confirmed.
+        let save = self.pos;
         if self.eat_keyword(Keyword::Natural)? {
-            return Err(Error::parse("NATURAL JOIN is not supported yet"));
+            if self.at_keyword(Keyword::Join) {
+                return Err(Error::new(
+                    crate::error::ResultCode::Error,
+                    "NATURAL JOIN is not supported yet",
+                ));
+            }
+            self.pos = save;
+            return Ok(None);
         }
-        let kind = if self.eat_keyword(Keyword::Left)? {
-            JoinKind::Left
-        } else if self.eat_keyword(Keyword::Cross)? {
-            JoinKind::Cross
-        } else {
-            self.eat_keyword(Keyword::Inner)?;
-            JoinKind::Inner
-        };
-        if !self.eat_keyword(Keyword::Join)? {
-            return Err(Error::parse(&format!(
-                "near \"{}\": syntax error",
-                self.peek_text()
-            )));
+        // The type is spelled out as text rather than collapsed into a kind
+        // first, because SQLite validates the combination of the two words and
+        // names the invalid one: `INNER OUTER` is an error, `LEFT OUTER` is not.
+        let mut spelled = String::new();
+        let mut kind = JoinKind::Inner;
+        // Whether the type written so far is one OUTER may follow. It only
+        // matters once an OUTER is actually seen; a bare `INNER JOIN` is legal.
+        let mut type_allows_outer = false;
+        let mut have_type = false;
+        for (kw, k, allows_outer) in [
+            (Keyword::Left, JoinKind::Left, true),
+            (Keyword::Right, JoinKind::Right, true),
+            (Keyword::Full, JoinKind::Full, true),
+            (Keyword::Inner, JoinKind::Inner, false),
+            (Keyword::Cross, JoinKind::Cross, false),
+        ] {
+            if self.eat_keyword(kw)? {
+                spelled.push_str(kw.as_str().to_ascii_uppercase().as_str());
+                kind = k;
+                type_allows_outer = allows_outer;
+                have_type = true;
+                break;
+            }
+        }
+        // `OUTER` is only valid after a type that is already an outer join. With
+        // no type in front of it, or after a type that is not, the two words
+        // together are not a join SQLite knows.
+        let mut bad_outer = false;
+        if self.at_keyword(Keyword::Outer) {
+            if have_type {
+                spelled.push(' ');
+            }
+            spelled.push_str("OUTER");
+            self.advance();
+            bad_outer = !(have_type && type_allows_outer);
+        }
+        if !self.at_keyword(Keyword::Join) {
+            self.pos = save;
+            return Ok(None);
+        }
+        self.advance();
+        if bad_outer {
+            return Err(Error::new(
+                crate::error::ResultCode::Error,
+                format!("unknown join type: {spelled}"),
+            ));
         }
         Ok(Some(kind))
     }
 
-    /// The ON or USING constraint that closes a join.
+    /// The ON or USING constraint that closes a join, if it has one.
+    ///
+    /// A constraint is optional after a comma or a bare `JOIN`, and required
+    /// after nothing else, so this reports its absence and lets the executor
+    /// decide what an unconstrained join means.
     fn join_constraint(&mut self) -> Result<(Option<Expr>, Vec<String>)> {
         if self.eat_keyword(Keyword::On)? {
             return Ok((Some(self.expr()?), Vec::new()));
@@ -875,21 +938,7 @@ impl<'a> Parser<'a> {
             self.expect_punct(Punct::RParen, "closing a USING clause")?;
             return Ok((None, cols));
         }
-        // A comma or another join operator may follow, and a clause keyword may
-        // follow, but a bare `JOIN b` with nothing between is a syntax error in
-        // SQLite, and so is one with a second constraint.
-        Err(Error::parse(&format!(
-            "near \"{}\": syntax error",
-            self.peek_text()
-        )))
-    }
-
-    /// The text of the token at the cursor, for a syntax-error message.
-    fn peek_text(&self) -> String {
-        match self.peek() {
-            Some(t) => t.text().to_string(),
-            None => String::new(),
-        }
+        Ok((None, Vec::new()))
     }
 
     /// Parses one table reference. The join operator and constraint belong to
@@ -927,7 +976,7 @@ impl<'a> Parser<'a> {
         Ok(FromItem::Table(TableRef {
             name: full,
             alias,
-            join: JoinKind::Cross,
+            join: None,
             on: None,
             using: Vec::new(),
             indexed_by,
@@ -937,6 +986,13 @@ impl<'a> Parser<'a> {
     fn optional_alias(&mut self) -> Result<Option<String>> {
         if self.eat_keyword(Keyword::As)? {
             return Ok(Some(self.name("after AS")?));
+        }
+        // `OUTER` is a valid alias but also the second word of a join type, so
+        // `a outer JOIN b` is a join and `a outer` is an alias. A `JOIN` after
+        // the word is what tells them apart, so the alias is only taken when
+        // none follows.
+        if self.at_keyword(Keyword::Outer) && self.token_after_is(Keyword::Join) {
+            return Ok(None);
         }
         match self.peek() {
             Some(Token::Identifier(_)) => Ok(Some(
@@ -954,6 +1010,11 @@ impl<'a> Parser<'a> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Whether the token after the one at the cursor is `kw`.
+    fn token_after_is(&self, kw: Keyword) -> bool {
+        matches!(self.tokens.get(self.pos + 1), Some((Token::Keyword(k), _)) if *k == kw)
     }
 
     fn group_by_clause(&mut self) -> Result<Vec<Expr>> {
@@ -2285,6 +2346,32 @@ impl<'a> Parser<'a> {
             .unwrap_or_else(|| "object".to_string());
         self.skip_to_semicolon()?;
         Ok(Stmt::Unsupported(format!("drop {kind}")))
+    }
+}
+
+/// Records the join operator and constraint on a freshly parsed FROM item.
+///
+/// The operator and the constraint are both written *after* the table they
+/// belong to, so they are read once the table is known and written back here.
+/// A subquery in FROM is not joinable yet, and the executor says so with a
+/// better message than this layer can, so the caller's error is left alone.
+fn set_join(
+    item: &mut FromItem,
+    kind: Option<JoinKind>,
+    on: Option<Expr>,
+    using: Vec<String>,
+) -> Result<()> {
+    match item {
+        FromItem::Table(tref) => {
+            tref.join = kind;
+            tref.on = on;
+            tref.using = using;
+            Ok(())
+        }
+        FromItem::Subquery { .. } => Err(Error::new(
+            crate::error::ResultCode::Error,
+            "a subquery in FROM is not supported yet",
+        )),
     }
 }
 

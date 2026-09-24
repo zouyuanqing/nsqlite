@@ -4,17 +4,22 @@
 //! It reads SQL from a file or from standard input and prints rows in the
 //! separator form the official test suite's shim expects, which makes this the
 //! executable the suite would drive.
+//!
+//! There is a second mode, `--testsuite`, which prints the record stream the
+//! TCL shim parses. See the `testsuite` module for why the row format below is
+//! not what that shim reads.
 
-use std::io::Read;
 use std::process::ExitCode;
 
 use nsqlite::connection::{Connection, Outcome};
+
+mod testsuite;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut path: Option<String> = None;
     let mut sql = String::new();
-    let mut read_stdin = false;
+    let mut suite_mode = false;
 
     // Arguments are read left to right. The first bare argument is the
     // database path when one has not been taken and the argument does not look
@@ -28,6 +33,10 @@ fn main() -> ExitCode {
                 // The name matters: a harness checks it to tell engines apart.
                 println!("nsqlite {}", nsqlite::VERSION);
                 return ExitCode::SUCCESS;
+            }
+            "--testsuite" => {
+                suite_mode = true;
+                i += 1;
             }
             "-i" | "--init" | "--batch" | "-bail" | "-echo" => i += 1,
             "-separator" | "-cmd" | "-readonly" | "-newline" | "-nullvalue" => i += 2,
@@ -44,7 +53,6 @@ fn main() -> ExitCode {
             }
         }
     }
-    let _ = read_stdin;
 
     let conn = match path.as_deref() {
         Some(p) if p != ":memory:" => Connection::open(std::path::Path::new(p)),
@@ -57,6 +65,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if suite_mode {
+        // The record stream is the shim's only channel, so an error goes on it
+        // rather than on stderr: a Tcl error is how do_test learns a statement
+        // failed, and it needs the message, not a bare exit status.
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        return if testsuite::run(&mut conn, &sql, &mut out) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
 
     match conn.execute_script(&sql) {
         Ok(outcomes) => {

@@ -640,9 +640,11 @@ mod tests {
     fn a_page_one_root_keeps_the_file_header_intact() {
         let path = temp("page1");
         let mut pager = Pager::open(&path).unwrap();
-        let root = pager.allocate().unwrap();
-        assert_eq!(root, 1, "the first allocation is page 1");
-        let usable = pager.usable_size();
+        // Page 1 is the file header, so the b-tree that shares it is placed
+        // there directly rather than through allocate.
+        let root = 1u32;
+        pager.claim_page(root).unwrap();
+        let usable = pager.page_size();
         let page = LeafPage {
             page_no: 1,
             ..LeafPage::empty(1, 4096)
@@ -650,7 +652,8 @@ mod tests {
         let cells: Vec<Cell> = (1..=3).map(|i| cell(i, &[Value::Integer(i)])).collect();
         let page = LeafPage { cells, ..page };
         // write_to clears the whole page, so the file header has to be put
-        // back: page 1's first 100 bytes are not b-tree space.
+        // back if the b-tree is on page 1. It is on page 2 here, so this
+        // exercises the case where the two share a page.
         let header = pager.header().to_bytes();
         page.write_to(&mut pager).expect("writing the leaf");
         {
