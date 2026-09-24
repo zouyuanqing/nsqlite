@@ -9,3 +9,8 @@ test/interop/*.db
 /test/sqlite-suite/
 /testsuite/
 /.research/
+
+# Scratch probes left by tooling runs; the tests are the durable record.
+**/zzprobe.rs
+parseprobe.log
+crates/nsqlite/parseprobe.log
