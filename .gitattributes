@@ -1,0 +1,18 @@
+# Line endings.
+#
+# core.autocrlf is on, so without this every commit rewrites the files as
+# CRLF and prints a warning per file. The sources are LF in the working tree;
+# only a checkout to a Windows tool that wants CRLF should convert, and nothing
+# in this project does, so the line ending is pinned instead of negotiated.
+* text=auto eol=lf
+
+# A test database or a WAL file is binary whatever its extension says.
+*.db binary
+*.db-wal binary
+*.db-shm binary
+*.db-journal binary
+*.sqlite binary
+
+# The vendored upstream suite keeps whatever it came with, and rewriting it
+# would make a diff against upstream unreadable.
+test/sqlite-suite/** -text
