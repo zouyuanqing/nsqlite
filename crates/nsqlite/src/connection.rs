@@ -1127,8 +1127,11 @@ impl Connection {
             // the last column is an error whether or not the query groups
             // anything, and an alias standing for an aggregate has to be
             // substituted before the expression is evaluated.
-            crate::orderby::resolve_keys(sel, columns, &names, None)?;
-            let mut sorted = apply_group_order_by(sel, columns, &plan, &names, &groups, &out)?;
+            // The FROM is passed so a key naming a column the projection omits,
+            // or an aggregate over one, still resolves: a grouped query can
+            // order by anything the group has, not only what it projects.
+            let spec = crate::orderby::resolve_keys(sel, columns, &names, Some(from))?;
+            let mut sorted = apply_group_order_by(sel, &spec, &plan, &names, &groups, &out)?;
             apply_limit(sel, &mut sorted)?;
             return Ok(Outcome::Query {
                 columns: names,
@@ -1228,19 +1231,19 @@ impl Connection {
             }
             out.push(Row { values });
         }
-        let names = columns
+        let names: Vec<String> = columns
             .iter()
             .map(|rc| match &rc.alias {
                 Some(a) => a.clone(),
                 None => render_expr(&rc.expr),
             })
             .collect();
-        // ORDER BY and LIMIT still apply, with no table to order by.
+        // ORDER BY still applies, and is still resolved. There is one row so
+        // nothing can be reordered, but an unknown name is an error and an
+        // ordinal past the single column is out of range, both decided before
+        // the query runs rather than after it produces its row.
         if !sel.order_by.is_empty() {
-            return Err(Error::new(
-                ResultCode::Error,
-                "ORDER BY without a table is not supported yet",
-            ));
+            crate::orderby::resolve_keys(sel, columns, &names, None)?;
         }
         apply_limit(sel, &mut out)?;
         Ok(Outcome::Query {
@@ -1522,7 +1525,7 @@ fn ordinal(n: usize) -> String {
 /// reads the group's first row the way the projection did.
 fn apply_group_order_by(
     sel: &Select,
-    columns: &[crate::parser::ResultColumn],
+    spec: &[crate::orderby::Key],
     plan: &crate::grouping::Plan,
     names: &[String],
     groups: &[crate::grouping::GroupOutput],
@@ -1530,24 +1533,6 @@ fn apply_group_order_by(
 ) -> Result<Vec<Row>> {
     if sel.order_by.is_empty() {
         return Ok(rows.to_vec());
-    }
-    // An integer ORDER BY term is an ordinal naming a result column, and one
-    // past the last is an error, checked before any group is read so that a
-    // query matching nothing fails the same way as one matching something.
-    for (i, (expr, _)) in sel.order_by.iter().enumerate() {
-        let Expr::Literal(crate::parser::Literal::Integer(n)) = expr else {
-            continue;
-        };
-        if *n < 1 || *n as usize > names.len() {
-            return Err(Error::new(
-                ResultCode::Error,
-                format!(
-                    "{} ORDER BY term out of range - should be between 1 and {}",
-                    ordinal(i + 1),
-                    names.len()
-                ),
-            ));
-        }
     }
     let params: Vec<Value> = Vec::new();
     let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
@@ -1559,19 +1544,30 @@ fn apply_group_order_by(
             resolved: g.resolved.clone(),
             context: None,
         };
-        let mut keys = Vec::with_capacity(sel.order_by.len());
-        for (expr, _) in &sel.order_by {
-            let key = order_key(plan, expr, names, g, &ctx, &rows[i])?;
-            keys.push(key);
+        let mut keys = Vec::with_capacity(spec.len());
+        for key in spec {
+            use crate::orderby::KeyKind;
+            let v = match key.kind {
+                // An ordinal and an output name read a projected value, which
+                // for a grouped query is the value the group produced.
+                KeyKind::Ordinal | KeyKind::OutputName => {
+                    let at = key.at.expect("a column key names its column");
+                    rows[i].values.get(at).cloned().unwrap_or(Value::Null)
+                }
+                KeyKind::Expression => {
+                    let expr = key.expr.as_ref().expect("an expression key carries one");
+                    order_key(plan, expr, names, g, &ctx, &rows[i])?
+                }
+            };
+            keys.push(v);
         }
         keyed.push((keys, rows[i].clone()));
     }
-    let order = &sel.order_by;
     keyed.sort_by(|a, b| {
-        for (i, (_, ascending)) in order.iter().enumerate() {
+        for (i, key) in spec.iter().enumerate() {
             let ord = a.0[i].compare(&b.0[i]);
             if ord != std::cmp::Ordering::Equal {
-                return if *ascending { ord } else { ord.reverse() };
+                return if key.ascending { ord } else { ord.reverse() };
             }
         }
         std::cmp::Ordering::Equal
