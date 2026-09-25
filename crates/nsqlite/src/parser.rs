@@ -2118,46 +2118,60 @@ impl<'a> Parser<'a> {
 
     fn column_def(&mut self) -> Result<ColumnDef> {
         let name = self.name("parsing a column name")?;
-        // A column may be quoted with any of the four forms, and a type may
-        // follow immediately with no space, so the type is read as words until
-        // a constraint keyword or the closing paren.
+        // A declared type is a run of words, optionally followed by a
+        // parenthesised length as in VARCHAR(255) or DECIMAL(10,5). The length
+        // comes after the name, so the words are read first and a paren is only
+        // a length when one follows them; reading the paren first would treat
+        // `b CHAR(10)` as a column with no type at all.
         let mut ty = String::new();
-        if self.eat_punct(Punct::LParen)? {
-            let mut depth = 1;
+        while let Some(word) = self.type_word() {
+            if !ty.is_empty() {
+                ty.push(' ');
+            }
+            ty.push_str(&word);
+        }
+        if self.at_punct(Punct::LParen) {
+            self.advance();
             let mut inner = String::new();
-            while depth > 0 {
+            let mut first = true;
+            loop {
                 match self.advance() {
-                    Some(Token::Punct(Punct::LParen)) => {
-                        depth += 1;
-                        inner.push('(');
+                    Some(Token::Punct(Punct::RParen)) | None => break,
+                    Some(Token::Punct(Punct::Comma)) => {
+                        inner.push(',');
+                        first = true;
                     }
-                    Some(Token::Punct(Punct::RParen)) => {
-                        depth -= 1;
-                        if depth > 0 {
-                            inner.push(')');
+                    Some(Token::Integer(i)) => {
+                        if !first {
+                            inner.push(' ');
                         }
+                        inner.push_str(&i.to_string());
+                        first = false;
                     }
-                    Some(Token::Integer(i)) => inner.push_str(&i.to_string()),
                     Some(Token::Identifier(n)) => {
-                        inner.push(' ');
+                        if !first {
+                            inner.push(' ');
+                        }
                         inner.push_str(&n);
+                        first = false;
                     }
                     Some(Token::Keyword(k)) => {
-                        inner.push(' ');
+                        if !first {
+                            inner.push(' ');
+                        }
                         inner.push_str(k.as_str());
+                        first = false;
                     }
                     Some(Token::Punct(p)) => inner.push_str(punct_text(p)),
-                    _ => break,
+                    Some(other) => {
+                        return Err(Error::new(
+                            crate::error::ResultCode::Error,
+                            format!("near \"{}\": syntax error in a declared type", describe_token(&other)),
+                        ))
+                    }
                 }
             }
             ty = format!("{ty}({inner})");
-        } else {
-            while let Some(word) = self.type_word() {
-                if !ty.is_empty() {
-                    ty.push(' ');
-                }
-                ty.push_str(&word);
-            }
         }
         let mut constraints = Vec::new();
         loop {
@@ -2167,11 +2181,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(ColumnDef {
-            name,
-            ty,
-            constraints,
-        })
+        Ok(ColumnDef { name, ty, constraints })
     }
 
     /// Reads one word of a column type, stopping at anything that starts a
@@ -2524,6 +2534,19 @@ fn set_natural(item: &mut FromItem, kind: Option<JoinKind>) -> Result<()> {
             crate::error::ResultCode::Error,
             "a subquery in FROM is not supported yet",
         )),
+    }
+}
+
+/// A token rendered for an error message.
+fn describe_token(t: &Token) -> String {
+    match t {
+        Token::Identifier(n) => n.clone(),
+        Token::Keyword(k) => k.as_str().to_string(),
+        Token::String(s) => format!("'{s}'"),
+        Token::Integer(i) => i.to_string(),
+        Token::Float(v) => v.to_string(),
+        Token::Punct(_) => "punctuation".to_string(),
+        _ => "token".to_string(),
     }
 }
 
