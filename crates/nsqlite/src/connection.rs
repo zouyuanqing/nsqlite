@@ -1123,7 +1123,12 @@ impl Connection {
             // ORDER BY sorts the groups' rows. An alias or an ordinal reads the
             // projected value, and an aggregate in the ORDER BY of a grouped
             // query is folded per group, which the plan already has.
-            let mut sorted = apply_group_order_by(sel, &plan, &names, &groups, &out)?;
+            // The keys are decided before any group is read: an ordinal past
+            // the last column is an error whether or not the query groups
+            // anything, and an alias standing for an aggregate has to be
+            // substituted before the expression is evaluated.
+            crate::orderby::resolve_keys(sel, columns, &names, None)?;
+            let mut sorted = apply_group_order_by(sel, columns, &plan, &names, &groups, &out)?;
             apply_limit(sel, &mut sorted)?;
             return Ok(Outcome::Query {
                 columns: names,
@@ -1185,7 +1190,8 @@ impl Connection {
         }
 
         let mut projected: Vec<Row> = out.iter().map(|(r, _)| r.clone()).collect();
-        apply_order_by(sel, from, &names, &out, &mut projected)?;
+        crate::orderby::resolve_keys(sel, columns, &names, Some(from))?;
+        apply_order_by(sel, columns, from, &names, &out, &mut projected)?;
         apply_limit(sel, &mut projected)?;
         Ok(Outcome::Query {
             columns: names,
@@ -1422,6 +1428,7 @@ fn render_expr(e: &Expr) -> String {
 /// re-evaluates an expression and the sort itself cannot fail.
 fn apply_order_by(
     sel: &Select,
+    columns: &[crate::parser::ResultColumn],
     from: &crate::join::From,
     names: &[String],
     rows: &[(Row, crate::join::JoinedRow)],
@@ -1430,93 +1437,51 @@ fn apply_order_by(
     if sel.order_by.is_empty() {
         return Ok(());
     }
-    // The references in the ORDER BY are resolved against the FROM, so a key
-    // naming a column of either table works and an unknown one is an error.
+    // The keys are decided once, before any row is read, because two of the
+    // rules do not depend on a row: an ordinal is range-checked even when the
+    // query matches nothing, and a name resolving to neither a column nor an
+    // alias is an error for the same reason.
+    let spec = crate::orderby::resolve_keys(sel, columns, names, Some(from))?;
+
     let mut keys_exprs: Vec<&Expr> = Vec::new();
     for (e, _) in &sel.order_by {
         keys_exprs.push(e);
     }
     let bound = crate::join::bind_all(from, &keys_exprs, names)?;
-    // An integer ORDER BY term is an ordinal naming a result column, and one
-    // past the last is an error. The check is here rather than inside the loop
-    // because it does not depend on a row: `SELECT ... WHERE 0 ORDER BY 9` fails
-    // the same way with no rows to read.
-    for (i, (expr, _)) in sel.order_by.iter().enumerate() {
-        let Expr::Literal(crate::parser::Literal::Integer(n)) = expr else {
-            continue;
-        };
-        if *n < 1 || *n as usize > names.len() {
-            return Err(Error::new(
-                ResultCode::Error,
-                format!(
-                    "{} ORDER BY term out of range - should be between 1 and {}",
-                    ordinal(i + 1),
-                    names.len()
-                ),
-            ));
-        }
-    }
     // Each row carries its sort keys alongside it, computed once, so a
     // comparison never re-evaluates an expression.
     let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
     for (row, jr) in rows.iter() {
-        let mut keys = Vec::with_capacity(sel.order_by.len());
-        for (expr, _) in &sel.order_by {
-            // An ORDER BY term names a column of a table in the FROM if one
-            // matches, and only falls back to an output alias when none does.
-            // A bare `y` in `SELECT a.y, b.y ... ORDER BY y` is `b.y`, the only
-            // source column called `y` once `a.y` has been projected under a
-            // name of its own -- but a key that is only an alias reads the
-            // projected value. This ordering is what SQLite applies, and it is
-            // why `SELECT b.y AS k ... ORDER BY k` sorts on the projection.
-            //
-            // An integer is an ordinal, not a value: `ORDER BY 2` is the second
-            // result column, and `ORDER BY 2 DESC` reverses it. Evaluating the
-            // literal instead would sort every row on the constant, which leaves
-            // the order as the rows arrived and makes the direction invisible.
-            // The range was checked above, before any row was read.
-            if let Expr::Literal(crate::parser::Literal::Integer(n)) = expr {
-                keys.push(row.values[*n as usize - 1].clone());
-                continue;
-            }
-            let is_source_column = match expr {
-                Expr::Column { table, name, .. } => {
-                    crate::join::resolve_ref(from, table.as_deref(), name, false).is_ok()
+        let mut keys = Vec::with_capacity(spec.len());
+        for key in &spec {
+            use crate::orderby::KeyKind;
+            let v = match key.kind {
+                // An ordinal and an output name both read a projected value.
+                // The range and existence checks ran before any row was read,
+                // so the index is in range here.
+                KeyKind::Ordinal | KeyKind::OutputName => {
+                    let at = key.at.expect("a column key names its column");
+                    row.values.get(at).cloned().unwrap_or(Value::Null)
                 }
-                _ => false,
-            };
-            let key = if is_source_column {
-                let ctx = build_ctx(jr, from, &bound);
-                eval(expr, &ctx)?
-            } else {
-                match expr {
-                    Expr::Column {
-                        table: None, name, ..
-                    } if alias_index(names, name).is_some() => {
-                        // An output alias reads the projected value. A qualified
-                        // name is never an alias: `t.c` always names a column of
-                        // the table `t`.
-                        row.values[alias_index(names, name).expect("just checked")].clone()
-                    }
-                    _ => {
-                        let ctx = build_ctx(jr, from, &bound);
-                        eval(expr, &ctx)?
-                    }
+                KeyKind::Expression => {
+                    let expr = key.expr.as_ref().expect("an expression key carries one");
+                    let bound = crate::join::bind_all(from, &[expr], names)?;
+                    let ctx = build_ctx(jr, from, &bound);
+                    eval(expr, &ctx)?
                 }
             };
-            keys.push(key);
+            keys.push(v);
         }
         keyed.push((keys, row.clone()));
     }
     // Each key is compared in turn, and the first that differs decides. The
     // directions are applied per key, and a stable sort keeps equal keys in the
     // order they arrived, which is what SQLite's unspecified order amounts to.
-    let order = &sel.order_by;
     keyed.sort_by(|a, b| {
-        for (i, (_, ascending)) in order.iter().enumerate() {
+        for (i, key) in spec.iter().enumerate() {
             let ord = a.0[i].compare(&b.0[i]);
             if ord != std::cmp::Ordering::Equal {
-                return if *ascending { ord } else { ord.reverse() };
+                return if key.ascending { ord } else { ord.reverse() };
             }
         }
         std::cmp::Ordering::Equal
@@ -1557,6 +1522,7 @@ fn ordinal(n: usize) -> String {
 /// reads the group's first row the way the projection did.
 fn apply_group_order_by(
     sel: &Select,
+    columns: &[crate::parser::ResultColumn],
     plan: &crate::grouping::Plan,
     names: &[String],
     groups: &[crate::grouping::GroupOutput],
