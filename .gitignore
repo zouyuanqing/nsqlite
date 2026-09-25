@@ -24,3 +24,16 @@ test/sqlite-run/
 # the suite's own .test files land here.
 *.test
 *.tcl
+
+# Scratch an agent created by redirecting inside a quoted string, and the
+# databases the ad-hoc checks leave behind.
+c.db
+d.db
+e.db
+e2e2.db
+final.db
+nsql_e2e.db
+e2e2.db
+g.db
+pg.db
+pg2.db
