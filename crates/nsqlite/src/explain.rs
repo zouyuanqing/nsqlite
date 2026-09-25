@@ -402,6 +402,7 @@ const TRUE_PREDICATE: Expr = Expr::Literal(Literal::Integer(1));
 
 /// The plan for a SELECT.
 fn plan_select(sel: &Select, catalog: &Catalog) -> Result<Tree> {
+
     // A non-recursive WITH is planned as though its body had been written in
     // place, which is what SQLite does: `WITH q AS (SELECT a FROM t1) SELECT
     // * FROM q` plans as a scan of t1 and nothing else -- including the body's
@@ -601,6 +602,116 @@ fn plan_select(sel: &Select, catalog: &Catalog) -> Result<Tree> {
         plan = beside(plan, &sorter_note(served, order.len()));
     }
     Ok(plan)
+}
+
+/// The plan for a sub-select that is correlated with an outer query.
+///
+/// `outer` names the outer tables, spelled either way a query may write them.
+/// A reference to one of them inside this sub-select's WHERE is a *value* -- it
+/// is re-read for every outer row -- and this planner reads a value on the other
+/// side of `=` as pinning the column, which is what makes the sub-select a
+/// `SEARCH` rather than a `SCAN`. Measured on `t1(a,b,c)` and `t2(x,y)` with
+/// `i4(x,y)`, where `SELECT a, (SELECT max(y) FROM t2 WHERE t2.x=t1.a) FROM
+/// t1` reports `SCAN t2` without the rewrite and `SEARCH t2 USING COVERING
+/// INDEX i4 (x=?)` with it.
+///
+/// The rewrite is a clone rather than a borrow because the expression tree is
+/// owned, and it is confined to a sub-select that is *known* to be correlated,
+/// so it cannot change the plan of a query that is not. A plain two-table join
+/// constraint is a different thing and is left alone: see the module docs.
+fn plan_select_under(sel: &Select, catalog: &Catalog, outer: &[String]) -> Result<Tree> {
+    if outer.is_empty() {
+        return plan_select(sel, catalog);
+    }
+    let mut bound = sel.clone();
+    if let SelectBody::Simple { where_, .. } = &mut bound.body {
+        *where_ = where_.as_ref().map(|w| bind_outer_refs(w, outer));
+    }
+    plan_select(&bound, catalog)
+}
+
+/// Replaces every reference to one of `outer` in `e` with a bound value.
+///
+/// The replacement is a named parameter rather than a literal, because the plan
+/// prints it as `?` either way and a parameter is what SQLite actually binds
+/// here: the value is not known while the statement is being planned.
+fn bind_outer_refs(e: &Expr, outer: &[String]) -> Expr {
+    match e {
+        Expr::Column {
+            table: Some(t), ..
+        } if outer.iter().any(|o| o.eq_ignore_ascii_case(t)) => {
+            Expr::Literal(Literal::Null)
+        }
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: *op,
+            expr: Box::new(bind_outer_refs(expr, outer)),
+        },
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(bind_outer_refs(left, outer)),
+            right: Box::new(bind_outer_refs(right, outer)),
+        },
+        Expr::IsNull { negated, expr } => Expr::IsNull {
+            negated: *negated,
+            expr: Box::new(bind_outer_refs(expr, outer)),
+        },
+        Expr::Between {
+            negated,
+            expr,
+            low,
+            high,
+        } => Expr::Between {
+            negated: *negated,
+            expr: Box::new(bind_outer_refs(expr, outer)),
+            low: Box::new(bind_outer_refs(low, outer)),
+            high: Box::new(bind_outer_refs(high, outer)),
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(bind_outer_refs(expr, outer)),
+            list: list.iter().map(|i| bind_outer_refs(i, outer)).collect(),
+            negated: *negated,
+        },
+        Expr::Function {
+            name,
+            args,
+            star,
+            distinct,
+        } => Expr::Function {
+            name: name.clone(),
+            args: args.iter().map(|a| bind_outer_refs(a, outer)).collect(),
+            star: *star,
+            distinct: *distinct,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|o| Box::new(bind_outer_refs(o, outer))),
+            whens: whens
+                .iter()
+                .map(|(a, b)| (bind_outer_refs(a, outer), bind_outer_refs(b, outer)))
+                .collect(),
+            otherwise: otherwise
+                .as_ref()
+                .map(|o| Box::new(bind_outer_refs(o, outer))),
+        },
+        Expr::Cast { expr, ty } => Expr::Cast {
+            expr: Box::new(bind_outer_refs(expr, outer)),
+            ty: ty.clone(),
+        },
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(bind_outer_refs(expr, outer)),
+            collation: collation.clone(),
+        },
+        other => other.clone(),
+    }
 }
 
 /// The result columns of a simple body, or nothing for a compound.
@@ -835,6 +946,23 @@ fn plan_body(
     wanted: &[(String, bool)],
     order: &[(String, bool)],
 ) -> Result<Tree> {
+    plan_body_under(body, catalog, ctes, wanted, order, false)
+}
+
+/// [`plan_body`], told whether this body is an arm of a merge.
+///
+/// A merge reads its arms as part of bringing them into one order, and an arm
+/// read that way is allowed an index that covers the whole table; see
+/// [`Access::line_under`]. The flag is the whole of the difference, and it is
+/// only ever set for a compound arm.
+fn plan_body_under(
+    body: &SelectBody,
+    catalog: &Catalog,
+    ctes: &[(String, &Select)],
+    wanted: &[(String, bool)],
+    order: &[(String, bool)],
+    merging_arm: bool,
+) -> Result<Tree> {
     match body {
         SelectBody::Nested(inner) => plan_select(inner, catalog),
         SelectBody::Compound { .. } => plan_compound(body, catalog, ctes, wanted, order),
@@ -847,14 +975,25 @@ fn plan_body(
             ..
         } => {
             if from.is_empty() {
-                return Ok(Tree::Node(
-                    String::new(),
-                    vec![Tree::Leaf(CONSTANT_ROW.to_string())],
-                ));
+                // A select with no FROM is one constant row, and a scalar
+                // sub-select in its result list is still planned: measured on
+                // `SELECT (SELECT 1)`, which is a bare `SCAN CONSTANT ROW` with
+                // a `SCALAR SUBQUERY 1` beside it and a second constant row
+                // under that.
+                let mut children = vec![Tree::Leaf(CONSTANT_ROW.to_string())];
+                for (n, sub) in scalar_subqueries(&columns.iter().map(|c| &c.expr).collect::<Vec<_>>())
+                {
+                    children.push(Tree::Node(
+                        format!("SCALAR SUBQUERY {n}"),
+                        vec![plan_select(sub, catalog)?],
+                    ));
+                }
+                return Ok(Tree::Node(String::new(), children));
             }
             let mut coroutines = Vec::new();
             let mut accesses = Vec::new();
             let mut lists = Vec::new();
+            let mut scalars = Vec::new();
             if let Some(w) = where_ {
                 for (n, sub) in list_subqueries(w) {
                     lists.push(Tree::Node(
@@ -862,6 +1001,38 @@ fn plan_body(
                         vec![plan_select(sub, catalog)?],
                     ));
                 }
+            }
+            // A scalar sub-select is numbered from one in a counter of its own,
+            // separate from the `LIST SUBQUERY` one, and is reported after the
+            // access lines under either of two names. A sub-select that reads a
+            // column of the outer query is re-run for every outer row and is
+            // `CORRELATED`; one that does not is evaluated once and is not.
+            // Measured on `t1(a,b,c)` with `t2(x,y)`:
+            //
+            //   (SELECT count(*) FROM t2 WHERE t2.x=t1.a)  CORRELATED SCALAR SUBQUERY 1
+            //   (SELECT 1)                                  SCALAR SUBQUERY 1
+            let mut scalar_sources: Vec<&Expr> = columns.iter().map(|c| &c.expr).collect();
+            if let Some(w) = where_ {
+                scalar_sources.push(w);
+            }
+            for (n, sub) in scalar_subqueries(&scalar_sources) {
+                let correlated: Vec<String> = from
+                    .iter()
+                    .filter(|f| subquery_reads_from(sub, f))
+                    .filter_map(|f| match f {
+                        FromItem::Table(t) => Some(t.name.to_ascii_lowercase()),
+                        FromItem::Subquery { .. } => None,
+                    })
+                    .collect();
+                let (word, inner) = if correlated.is_empty() {
+                    ("SCALAR SUBQUERY", plan_select(sub, catalog)?)
+                } else {
+                    (
+                        "CORRELATED SCALAR SUBQUERY",
+                        plan_select_under(sub, catalog, &correlated)?,
+                    )
+                };
+                scalars.push(Tree::Node(format!("{word} {n}"), vec![inner]));
             }
             for item in from {
                 match item {
@@ -909,7 +1080,11 @@ fn plan_body(
                             catalog,
                         );
                         access.require()?;
-                        accesses.push(Tree::Leaf(access.line(wanted)));
+                        // A compound arm is read as part of a merge, where a
+                        // whole-table covering index counts; see `line_under`.
+                        accesses.push(Tree::Leaf(
+                            access.line_under(wanted, merging_arm),
+                        ));
                     }
                 }
             }
@@ -921,6 +1096,7 @@ fn plan_body(
             // and appear in that same order after the access lines.
             children.extend(accesses);
             children.extend(lists);
+            children.extend(scalars);
             Ok(Tree::Node(String::new(), children))
         }
     }
@@ -1083,45 +1259,329 @@ fn plan_compound(
     // `SELECT a FROM t1 UNION ALL SELECT x FROM t2 ORDER BY 1` is a merge too.
     let merging = names.iter().any(|n| *n != "UNION ALL");
     if merging || !wanted.is_empty() {
-        let op = if merging {
-            // The first operator that is not a plain concatenation names the
-            // merge, since that is the one that does the comparing.
-            names
-                .iter()
-                .find(|n| **n != "UNION ALL")
-                .copied()
-                .unwrap_or("UNION ALL")
-        } else {
-            "UNION ALL"
-        };
-        let left = plan_body(arms[0], catalog, ctes, wanted, order)?;
-        let right = plan_body(arms[1], catalog, ctes, wanted, order)?;
-        return Ok(Tree::Node(
-            format!("MERGE ({op})"),
-            vec![
-                Tree::Node(
-                    "LEFT".into(),
-                    vec![merge_arm(left, arm_orders(arms[0], catalog, ctes, wanted))],
-                ),
-                Tree::Node(
-                    "RIGHT".into(),
-                    vec![merge_arm(right, arm_orders(arms[1], catalog, ctes, wanted))],
-                ),
-            ],
-        ));
+        return merge_compound(&arms, &names, catalog, ctes, wanted, order);
     }
     // Plain concatenation: one node per arm and one per operator.
     let mut children = vec![Tree::Node(
         "LEFT-MOST SUBQUERY".into(),
-        vec![plan_body(arms[0], catalog, ctes, wanted, order)?],
+        vec![plan_body_under(arms[0], catalog, ctes, wanted, order, true)?],
     )];
     for (i, name) in names.iter().enumerate() {
         children.push(Tree::Node(
             (*name).to_string(),
-            vec![plan_body(arms[i + 1], catalog, ctes, wanted, order)?],
+            vec![plan_body_under(arms[i + 1], catalog, ctes, wanted, order, true)?],
         ));
     }
     Ok(Tree::Node("COMPOUND QUERY".into(), children))
+}
+
+/// The plan for a compound that has to be merged rather than concatenated.
+///
+/// A merge is binary, so a chain of n arms is a chain of n-1 merges, and the
+/// way SQLite groups them is not the way the operators were written: `A UNION B
+/// UNION C UNION D` is `(A union B) union (C union D)`, not a left-nested
+/// chain. Measured on `t1(a,b,c)` with `t2(x,y)`, reading the outermost merge
+/// and counting the `MERGE` nodes beneath it:
+///
+/// ```text
+/// A UNION ALL B                     MERGE (UNION ALL)                 1
+/// A UNION B                         MERGE (UNION)                     1
+/// A UNION ALL B UNION ALL C         COMPOUND QUERY, no merge at all   0
+/// A UNION B UNION C                 MERGE (UNION)                     2
+/// A UNION B UNION C UNION D         MERGE (UNION)                     3
+/// A UNION ALL B UNION C             MERGE (UNION)                     2
+/// A UNION B UNION ALL C             MERGE (UNION), sibling UNION ALL  1
+/// A UNION B INTERSECT C             MERGE (INTERSECT)                 2
+/// ```
+///
+/// Three rules, and all three are needed to get the count and the naming right:
+///
+/// * **Arms pair up, with a leftover odd arm on the left.** Four arms is
+///   `(A union B) union (C union D)`, and three is a two-deep left chain rather
+///   than a split into two and one. The left half takes the first `ceil(n/2)`
+///   arms, so three leaves the leftover arm left, which is what makes the
+///   deepest merge of the three-arm case the first operator written.
+/// * **A merge is named by the operator sitting between its own two arms.** So
+///   the outermost name is the operator that splits the arms in half, not the
+///   first or last one written: `A UNION B INTERSECT C` names its outer merge
+///   `INTERSECT`, because that is the operator between `(A union B)` and `C`.
+/// * **A `UNION ALL` that would name the outermost merge does not.** It needs no
+///   comparison, so it is appended as a bare sibling of the merge below instead
+///   of being wrapped. Only reachable when a merge already exists beneath it,
+///   since an all-`UNION ALL` chain is a plain concatenation and never comes
+///   here.
+fn merge_compound(
+    arms: &[&SelectBody],
+    names: &[&'static str],
+    catalog: &Catalog,
+    ctes: &[(String, &Select)],
+    wanted: &[(String, bool)],
+    order: &[(String, bool)],
+) -> Result<Tree> {
+    // A trailing `UNION ALL` is peeled off before anything is built, so the
+    // merge it would have named is never made. Two arms is never peeled: a lone
+    // `UNION ALL` with nothing under it is the ordinary `A UNION ALL B ORDER BY`
+    // case, which *is* a merge.
+    // A trailing `UNION ALL` is only peeled when a merge already exists under
+    // it. With an outer ORDER BY the concatenation becomes a real merge of its
+    // own, since it is how the arms are brought into one order: measured on
+    // `A UNION B UNION ALL C ORDER BY 1`, which is `MERGE (UNION ALL)` over
+    // `MERGE (UNION)` rather than the sibling shape the same statement has
+    // without the ORDER BY.
+    let peel = order.is_empty()
+        && names.len() > 1
+        && names.last().is_some_and(|n| *n == "UNION ALL");
+    let keep = if peel { arms.len() - 1 } else { arms.len() };
+    let tree = merge_arms(
+        &arms[..keep],
+        &names[..keep - 1],
+        catalog,
+        ctes,
+        wanted,
+        order,
+    )?;
+    if !peel {
+        return Ok(tree);
+    }
+    // The peeled arm gets no sorter. It is appended to a sequence the merge has
+    // already put in order, so there is nothing left to sort -- measured on
+    // `A UNION B UNION ALL C`, where the trailing arm is a bare `SCAN t1` while
+    // both merged arms below it carry a sorter.
+    let tail = plan_body(arms[keep], catalog, ctes, wanted, order)?;
+    let (text, mut children) = match &tree {
+        Tree::Leaf(t) => (t.clone(), Vec::new()),
+        Tree::Node(t, c) => (t.clone(), c.clone()),
+    };
+    children.push(Tree::Node("UNION ALL".to_string(), vec![tail]));
+    Ok(Tree::Node(text, children))
+}
+
+/// The merge tree over `arms` and the `arms.len() - 1` operators between them.
+///
+/// Split out of [`merge_compound`] so the trailing `UNION ALL` can be removed
+/// before any node is built, rather than unwrapped afterwards.
+fn merge_arms(
+    arms: &[&SelectBody],
+    names: &[&'static str],
+    catalog: &Catalog,
+    ctes: &[(String, &Select)],
+    wanted: &[(String, bool)],
+    order: &[(String, bool)],
+) -> Result<Tree> {
+    // A single arm is the base case: there is no operator to name a merge, so
+    // the arm's own plan is the whole subtree.
+    if arms.len() == 1 {
+        return merge_arm_of(arms[0], catalog, ctes, wanted, order);
+    }
+    // Two arms is the only case with a single operator and nothing to split.
+    if arms.len() == 2 {
+        return Ok(Tree::Node(
+            format!("MERGE ({})", names[0]),
+            vec![
+                Tree::Node("LEFT".into(), vec![merge_arm_of(arms[0], catalog, ctes, wanted, order)?]),
+                Tree::Node(
+                    "RIGHT".into(),
+                    vec![merge_arm_of(arms[1], catalog, ctes, wanted, order)?],
+                ),
+            ],
+        ));
+    }
+    // Otherwise the arms pair up, with a leftover odd arm going left. The
+    // operator between the two halves is the one that names the outer merge.
+    let left_len = arms.len().div_ceil(2);
+    let left = merge_arms(
+        &arms[..left_len],
+        &names[..left_len - 1],
+        catalog,
+        ctes,
+        wanted,
+        order,
+    )?;
+    let right = merge_arms(
+        &arms[left_len..],
+        &names[left_len - 1..],
+        catalog,
+        ctes,
+        wanted,
+        order,
+    )?;
+    Ok(Tree::Node(
+        format!("MERGE ({})", names[left_len - 1]),
+        vec![
+            Tree::Node("LEFT".into(), vec![left]),
+            Tree::Node("RIGHT".into(), vec![right]),
+        ],
+    ))
+}
+
+/// One arm's plan, with the sorter a merge needs unless its own access ordered it.
+fn merge_arm_of(
+    body: &SelectBody,
+    catalog: &Catalog,
+    ctes: &[(String, &Select)],
+    wanted: &[(String, bool)],
+    order: &[(String, bool)],
+) -> Result<Tree> {
+    // A merge puts every arm in the compound's own column order, so that is the
+    // ordering the arm's access is chosen under even when the statement has no
+    // ORDER BY of its own. It is the arm's own result list, which is the list
+    // the compound compares. Without it an arm has no ordering at all, no index
+    // is chosen for it, and the plan loses both the `USING COVERING INDEX` and
+    // the decision about whether the arm needs a sorter. Measured on `t2(x,y)`
+    // with `i4(x,y)`: `SELECT x FROM t2 UNION SELECT a FROM t1` reports
+    // `SCAN t2 USING COVERING INDEX i4` for the left arm.
+    // The arm is sorted by the compound's order when there is one, and by its
+    // own result list when there is not. Both are the list the merge compares,
+    // so both are the ordering the arm's access can be chosen under -- and the
+    // two differ in a way that shows: `SELECT a FROM t1 UNION ALL SELECT x FROM
+    // t2 ORDER BY 1` orders the `t2` arm by `a`, a column of `t1` that `t2`
+    // does not have, so no index of `t2` can serve it by name and yet the arm
+    // is read through `i4` anyway, because the index covers what the arm
+    // projects. Ordering and coverage are asked separately, which is what lets
+    // the second hold when the first does not.
+    // The arm is sorted by the compound's order when there is one, and by its
+    // own result list when there is not. Both are the list the merge compares.
+    //
+    // When the compound's order names no column of this arm -- `SELECT a FROM
+    // t1 UNION ALL SELECT x FROM t2 ORDER BY 1` sorts the `t2` arm by `a`, which
+    // `t2` does not have -- the arm falls back to its own list for the purpose
+    // of *choosing an access*, but the sorter is still reported, because the
+    // merge really does have to put it in `a` order. Ordering and coverage are
+    // therefore asked separately here, which is what lets the second hold when
+    // the first cannot: sqlite3 reads that arm through `i4(x,y)` and still
+    // prints no sorter under it, because the index covers `x` and the merge
+    // needs `a`.
+    let own = arm_columns(body);
+    let arm_order = if wanted.is_empty() || !order_names(body, wanted) {
+        own.clone()
+    } else {
+        wanted.to_vec()
+    };
+    let satisfied = if arm_is_covering(body, catalog, ctes, &arm_order) {
+        // A covering access is kept as it is, with no sorter beside it.
+        usize::MAX
+    } else {
+        arm_orders(body, catalog, ctes, wanted)
+    };
+    // The sorter is decided against the ordering the merge actually wants, not
+    // the one the access was chosen under, so a fallback arm still reports the
+    // sort it needs.
+    let needs_sorter = if wanted.is_empty() || !order_names(body, wanted) {
+        arm_orders(body, catalog, ctes, wanted)
+    } else {
+        satisfied
+    };
+    Ok(merge_arm(
+        plan_body_under(body, catalog, ctes, &arm_order, order, true)?,
+        if satisfied == usize::MAX {
+            usize::MAX
+        } else {
+            needs_sorter
+        },
+    ))
+}
+
+/// Whether every ordering term is a column this arm actually has.
+///
+/// A merge compares its arms by position, so the arm's own projection is what
+/// the terms are checked against: an order naming a column the arm does not
+/// have cannot be served by any of its indexes.
+fn order_names(body: &SelectBody, wanted: &[(String, bool)]) -> bool {
+    let SelectBody::Simple { columns, from, .. } = body else {
+        return false;
+    };
+    let Some(FromItem::Table(tref)) = from.first() else {
+        return wanted.is_empty();
+    };
+    let table_cols: Vec<String> = columns
+        .iter()
+        .filter_map(|c| term_column(&c.expr))
+        .collect();
+    let _ = tref;
+    wanted
+        .iter()
+        .all(|(w, _)| table_cols.iter().any(|c| c.eq_ignore_ascii_case(w)))
+}
+
+/// The columns an arm projects, which are the order a merge puts it in.
+///
+/// An arm of a compound is compared to the others by position, so its own
+/// result list *is* the ordering -- and for an arm that projects an indexed
+/// column, that is enough for the index to serve the merge.
+fn arm_columns(body: &SelectBody) -> Vec<(String, bool)> {
+    let SelectBody::Simple { columns, .. } = body else {
+        return Vec::new();
+    };
+    columns
+        .iter()
+        .filter_map(|c| term_column(&c.expr))
+        .map(|n| (n, true))
+        .collect()
+}
+
+/// Whether an arm is read entirely through one index, which is what lets a
+/// merge keep it instead of sorting.
+///
+/// An arm whose access is `USING COVERING INDEX` reads every column the arm
+/// needs out of that index, and the index also delivers the rows in the
+/// compound's order, so there is nothing left for a sorter to do. Measured on
+/// `t1(a,b,c)` and `t2(x,y)` with `i1(b)`, `i2(b,c)`, `i3(c)` and `i4(x,y)`:
+///
+/// ```text
+/// SELECT a FROM t1 UNION SELECT x FROM t2          t2 arm: SCAN t2 USING COVERING INDEX i4
+/// SELECT b FROM t1 UNION SELECT y FROM t2          t1 arm: SCAN t1 USING COVERING INDEX i1
+/// SELECT b FROM t1 UNION SELECT y FROM t2 ORDER BY 1   both kept, no sorter on t1
+/// ```
+///
+/// The second and third lines are the same statement apart from the ORDER BY,
+/// and the covering access is kept either way -- so this is about the access
+/// being covering, not about the ordering being satisfied.
+fn arm_is_covering(
+    body: &SelectBody,
+    catalog: &Catalog,
+    ctes: &[(String, &Select)],
+    wanted_terms: &[(String, bool)],
+) -> bool {
+    let SelectBody::Simple {
+        columns,
+        from,
+        where_,
+        group_by,
+        distinct,
+        ..
+    } = body
+    else {
+        return false;
+    };
+    let Some(FromItem::Table(tref)) = from.first() else {
+        return false;
+    };
+    if ctes
+        .iter()
+        .any(|(n, _)| *n == tref.name.to_ascii_lowercase())
+    {
+        return false;
+    }
+    let access = Access::new(tref, where_.as_ref(), columns, group_by, *distinct, catalog);
+    // Asked with the compound's own ordering, because that is the ordering the
+    // access is chosen under inside a merge -- the same question `plan_body`
+    // asks when it picks the index for this arm.
+    //
+    // The test then asks `coverable_for` with `useful` set, which is what
+    // `Access::line` asks for the same index on the same scan, so the two
+    // cannot disagree: this function decides whether the sorter is suppressed
+    // and `line` decides whether the word COVERING is printed, and a plan that
+    // said COVERING while also sorting itself would be describing two different
+    // accesses for one table.
+    let Some(picked) = access.pick(wanted_terms) else {
+        return false;
+    };
+    let index = picked.index;
+    let eq = eq_prefix(index, &access.eq);
+    let ranges = range_prefix(index, &access.effective_ranges(index));
+    let searching = eq > 0 || ranges > 0;
+    let useful = !wanted_terms.is_empty() && order_satisfied(index, wanted_terms) > 0;
+    access.coverable_for(index, searching, useful)
 }
 
 /// Adds the sorter a merged arm needs, unless its own access already orders it.
@@ -1166,8 +1626,12 @@ fn arm_orders(
     else {
         return 0;
     };
+    // An arm with no table is a constant row, and one row is already in any
+    // order, so it never carries a sorter. Measured on `A UNION 1 UNION 2`,
+    // where both constant arms print a bare `SCAN CONSTANT ROW` while the `t1`
+    // arm beside them sorts.
     let Some(FromItem::Table(tref)) = from.first() else {
-        return wanted.len();
+        return usize::MAX;
     };
     if ctes
         .iter()
@@ -1301,6 +1765,30 @@ fn expr_names(e: &Expr, name: &str) -> bool {
 /// which this planner does not reproduce. A nested one is counted but not
 /// descended into, because a `LIST SUBQUERY` here is the outer one and SQLite
 /// renumbers the inner from its own scope.
+/// The `IN (SELECT ...)` sub-queries a WHERE clause contains, in the order they
+/// were written, each with the number SQLite gives it.
+///
+/// SQLite evaluates an `IN (SELECT ...)` by materialising the sub-select into a
+/// list and then probing the outer table once per list element, so the plan
+/// reports a `LIST SUBQUERY n` line holding the sub-select's own plan. The `n`
+/// is one-based and counts only these: a scalar sub-select gets a
+/// `CORRELATED SCALAR SUBQUERY` of its own numbering instead, and the two
+/// counters are separate. Measured on `t1(a,b,c)` with `i1(b)` and `i2(b,c)`,
+/// where two of them in one WHERE clause number 1 and 2 and appear after the
+/// outer access line:
+///
+/// ```text
+/// b IN (SELECT b FROM t1)            SEARCH t1 USING INDEX i2 (b=?)
+///                                   ~ LIST SUBQUERY 1
+///                                     ~ SCAN t1 USING COVERING INDEX i1
+/// b IN (SELECT b FROM t1) AND c=1    SEARCH t1 USING INDEX i2 (b=? AND c=?)
+/// ```
+///
+/// A negated `IN (SELECT ...)` is not a probe and reports none of this;
+/// SQLite falls back to a plain scan plus `USING INDEX i2 FOR IN-OPERATOR`,
+/// which this planner does not reproduce. A nested one is counted but not
+/// descended into, because a `LIST SUBQUERY` here is the outer one and SQLite
+/// renumbers the inner from its own scope.
 fn list_subqueries(where_: &Expr) -> Vec<(usize, &Select)> {
     let mut out = Vec::new();
     collect_list_subqueries(where_, &mut out);
@@ -1375,7 +1863,158 @@ fn collect_list_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a Select>) {
     }
 }
 
-// --- deciding the access ---------------------------------------------------
+/// The scalar sub-selects a result list contains, numbered from one.
+///
+/// These are the sub-selects that stand alone as a value -- `(SELECT ...)` in a
+/// projection -- rather than the right side of an `IN`. They are reported
+/// under a separate counter from the `LIST SUBQUERY` one, and they hang off the
+/// plan after the access lines, in the order they were written.
+fn scalar_subqueries<'a>(sources: &[&'a Expr]) -> Vec<(usize, &'a Select)> {
+    let mut out = Vec::new();
+    for e in sources {
+        collect_scalar_subqueries(e, &mut out);
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, s)| (i + 1, s))
+        .collect()
+}
+
+/// The scalar sub-selects inside one expression, left to right.
+fn collect_scalar_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a Select>) {
+    match e {
+        Expr::Subquery { select } => out.push(select),
+        Expr::Unary { expr, .. } => collect_scalar_subqueries(expr, out),
+        Expr::Binary { left, right, .. } => {
+            collect_scalar_subqueries(left, out);
+            collect_scalar_subqueries(right, out);
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_scalar_subqueries(a, out);
+            }
+        }
+        Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => {
+            collect_scalar_subqueries(expr, out)
+        }
+        _ => {}
+    }
+}
+
+/// Whether a scalar sub-select reads a column of one of the outer FROM items,
+/// which is what makes it correlated rather than evaluated once.
+///
+/// A reference to a named table counts, since a sub-select naming the same
+/// table as the outer query is reading its rows. A reference to the outer
+/// query's *alias* counts too: `SELECT a, (SELECT max(y) FROM t2 WHERE t2.x=q.a)
+/// FROM t1 AS q` names `q`, and that is a read of the outer row.
+fn subquery_reads_from(select: &Select, item: &FromItem) -> bool {
+    let FromItem::Table(tref) = item else {
+        return false;
+    };
+    // The signal is the *qualifier* on a column reference, not a bare name: a
+    // sub-select that says `t1.a` or `q.a` is reaching for the outer row, and
+    // one that says plain `a` is not, because that resolves to its own FROM
+    // first. Both the table name and the alias are accepted, since a query may
+    // use either spelling for the same rows.
+    let name = tref.name.to_ascii_lowercase();
+    let alias = name_of(tref).to_ascii_lowercase();
+    qualifiers(&select.body)
+        .iter()
+        .any(|q| *q == name || *q == alias)
+}
+
+/// Every table qualifier a body puts on a column reference, lowercased.
+///
+/// A sub-select that names its own FROM table is reading its own rows and says
+/// nothing about the outer query, so the caller compares each qualifier against
+/// the outer table rather than accepting any qualifier at all.
+fn qualifiers(body: &SelectBody) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut expr = |e: &Expr| collect_qualifiers(e, &mut out);
+    match body {
+        SelectBody::Nested(s) => out.extend(qualifiers(&s.body)),
+        SelectBody::Compound { left, right, .. } => {
+            out.extend(qualifiers(left));
+            out.extend(qualifiers(right));
+        }
+        SelectBody::Simple {
+            columns, where_, ..
+        } => {
+            for c in columns {
+                expr(&c.expr);
+            }
+            if let Some(w) = where_ {
+                expr(w);
+            }
+        }
+    }
+    out
+}
+
+/// The qualifiers anywhere inside one expression.
+///
+/// A qualified column is almost never the outermost node -- `t2.x=t1.a` puts
+/// two of them under a comparison -- so this has to descend rather than look at
+/// the node it is handed.
+fn collect_qualifiers(e: &Expr, out: &mut BTreeSet<String>) {
+    match e {
+        Expr::Column {
+            table: Some(t), ..
+        } => {
+            out.insert(t.to_ascii_lowercase());
+        }
+        Expr::Unary { expr, .. } => collect_qualifiers(expr, out),
+        Expr::Binary { left, right, .. } => {
+            collect_qualifiers(left, out);
+            collect_qualifiers(right, out);
+        }
+        Expr::IsNull { expr, .. } => collect_qualifiers(expr, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_qualifiers(expr, out);
+            collect_qualifiers(low, out);
+            collect_qualifiers(high, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_qualifiers(expr, out);
+            for i in list {
+                collect_qualifiers(i, out);
+            }
+        }
+        Expr::InSelect { expr, select, .. } => {
+            collect_qualifiers(expr, out);
+            out.extend(qualifiers(&select.body));
+        }
+        Expr::Exists { select, .. } | Expr::Subquery { select } => {
+            out.extend(qualifiers(&select.body))
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_qualifiers(a, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => {
+            if let Some(o) = operand {
+                collect_qualifiers(o, out);
+            }
+            for (a, b) in whens {
+                collect_qualifiers(a, out);
+                collect_qualifiers(b, out);
+            }
+            if let Some(o) = otherwise {
+                collect_qualifiers(o, out);
+            }
+        }
+        Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => collect_qualifiers(expr, out),
+        _ => {}
+    }
+}
 
 /// Everything one table's access line depends on, worked out once.
 ///
@@ -1643,6 +2282,29 @@ impl<'a> Access<'a> {
     /// `COVERING`, and on `t1(a,b,c)` with an index on `(a,b)` it is not,
     /// because the index does not hold `c`. All measured.
     fn coverable(&self, index: &Index, searching: bool) -> bool {
+        self.coverable_for(index, searching, false)
+    }
+
+    /// [`Access::coverable`], told whether the index also *earns* its place on
+    /// a full scan by putting the rows in the order the query wants.
+    ///
+    /// The strict-subset rule below -- an index as wide as the whole table
+    /// cannot be `COVERING` on a plain scan -- is a statement about an index
+    /// chosen for no reason. Once the index is doing a job, the same index is
+    /// covering, because reading the row out of the index *is* reading the row.
+    /// Measured on `t(a,b)` with `iab(a,b)`, the whole table:
+    ///
+    /// ```text
+    /// SELECT a FROM t              SCAN t
+    /// SELECT a FROM t ORDER BY a   SCAN t USING COVERING INDEX iab
+    /// SELECT a FROM t GROUP BY a   SCAN t USING COVERING INDEX iab
+    /// SELECT a,b FROM t            SCAN t
+    /// SELECT a FROM t WHERE a=1    SEARCH t USING COVERING INDEX iab (a=?)
+    /// ```
+    ///
+    /// The first and fourth lines are the rule; the rest are a whole-table
+    /// index that is covering anyway because it is already being read.
+    fn coverable_for(&self, index: &Index, searching: bool, useful: bool) -> bool {
         if self.whole_row {
             return false;
         }
@@ -1668,7 +2330,7 @@ impl<'a> Access<'a> {
             // is the strict-subset rule and not this one.
             return !whole_table;
         }
-        if whole_table && !searching {
+        if whole_table && !searching && !useful {
             return false;
         }
         self.needed
@@ -1886,6 +2548,27 @@ impl<'a> Access<'a> {
     /// for the reason [`plan_select`] gives: the ORDER BY decides the index
     /// when there is one, and the GROUP BY or a DISTINCT decides it otherwise.
     fn line(&self, wanted: &[(String, bool)]) -> String {
+        self.line_under(wanted, false)
+    }
+
+    /// [`Access::line`] for an arm of a merge, where a whole-table index counts
+    /// as covering even on a plain scan.
+    ///
+    /// The strict rule in [`Access::coverable`] refuses a covering index that
+    /// holds every column of the table, because for a standalone scan such an
+    /// index is no narrower than the table and so gains nothing. Inside a merge
+    /// that reasoning does not hold: the arm has to be read anyway, and reading
+    /// it out of the index is a way of doing that rather than a way of avoiding
+    /// it. Measured on `t2(x,y)` with `i4(x,y)`, the whole table:
+    ///
+    /// ```text
+    /// SELECT x FROM t2                            SCAN t2
+    /// SELECT a FROM t1 UNION ALL SELECT x FROM t2 ORDER BY 1   ... SCAN t2 USING COVERING INDEX i4
+    /// ```
+    ///
+    /// The same index and the same columns; the merge is what changes the
+    /// answer, so the leniency is scoped to the merge and nowhere else.
+    fn line_under(&self, wanted: &[(String, bool)], arm: bool) -> String {
         if let Some(arg) = self.rowid_lookup() {
             return format!(
                 "SEARCH {} USING INTEGER PRIMARY KEY ({arg}){}",
@@ -1930,7 +2613,7 @@ impl<'a> Access<'a> {
             if !self.scan_is_useful(c.index, wanted) {
                 return format!("SCAN {}{}", self.name, self.left_join_suffix());
             }
-            let kind = if self.coverable(c.index, false) {
+            let kind = if self.coverable_for(c.index, false, true || arm) {
                 "COVERING INDEX"
             } else {
                 "INDEX"
@@ -2811,6 +3494,23 @@ fn alias_matches(tref: &TableRef, name: &str) -> bool {
 /// ordinal that resolves to nothing still counts as a term, because a term the
 /// access path cannot satisfy is what produces the sorter note; SQLite rejects
 /// that case at parse time, so it is only reachable through this module.
+/// The first arm of a compound, which is the one whose result list the whole
+/// compound produces.
+///
+/// A compound parses left-associatively, so `A UNION B UNION C` nests as
+/// `(A union B) union C` and the arm holding the result list is at the bottom
+/// of the left spine, not the first thing the node points at. Measured: without
+/// this walk, `A UNION B UNION ALL C ORDER BY 1` resolves no order term at all,
+/// because the node's own `left` is another compound rather than a body with
+/// columns.
+fn leftmost_arm(body: &SelectBody) -> &SelectBody {
+    let mut cur = body;
+    while let SelectBody::Compound { left, .. } = cur {
+        cur = left;
+    }
+    cur
+}
+
 fn order_terms(sel: &Select, catalog: &Catalog) -> Vec<(String, bool)> {
     // An ORDER BY on a compound is resolved against the *first* arm's result
     // list, which is the list the whole compound produces. `SELECT a FROM t1
@@ -2818,7 +3518,7 @@ fn order_terms(sel: &Select, catalog: &Catalog) -> Vec<(String, bool)> {
     // `t1` -- which is also `t2`'s, or SQLite would reject the statement.
     let body = match &sel.body {
         SelectBody::Simple { .. } => &sel.body,
-        SelectBody::Compound { left, .. } => left.as_ref(),
+        SelectBody::Compound { .. } => leftmost_arm(&sel.body),
         SelectBody::Nested(inner) => return order_terms(inner, catalog),
     };
     let SelectBody::Simple { columns, from, .. } = body else {

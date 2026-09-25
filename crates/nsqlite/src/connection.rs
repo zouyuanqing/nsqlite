@@ -15,8 +15,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::affinity::apply as apply_affinity;
 use crate::affinity::Affinity;
+use crate::affinity_rules;
 use crate::catalog::{Catalog, Column, Table};
 use crate::error::{Error, Result, ResultCode};
 use crate::eval::{eval, truthy, EvalCtx};
@@ -26,6 +26,15 @@ use crate::parser::{
 };
 use crate::table_tree::TableTree;
 use crate::value::Value;
+
+/// The `Connection` half of `INSERT ... SELECT`: it implements
+/// `insert_select::InsertTarget` so that the module, which owns every decision
+/// about *what* to write, never has to reach into the pager. It is a child
+/// module so that the impl can use this file's private items. This `mod` line
+/// and the `InsertSource::Select` arm in `Connection::insert` are the whole
+/// integration.
+#[path = "insert_select_hook.rs"]
+mod insert_select_hook;
 
 /// Rebuilds a table's definition by re-parsing the statement the schema stores.
 fn rebuild_table(name: &str, sql_text: &str, root: u32) -> Result<Table> {
@@ -150,7 +159,10 @@ pub struct Connection {
     changes: usize,
     last_insert_rowid: i64,
     auto_rowid: i64,
-    /// Where `select` leaves the outcome of a query it could not return
+    /// `PRAGMA full_column_names` and `short_column_names`, which decide
+    /// whether a result column is named `f1` or `test1.f1`.
+    column_name_flags: crate::pragma::ColumnNameFlags,
+    /// Where \ leaves the outcome of a query it could not return
     /// directly, because reading the schema b-tree needs the pager borrowed
     /// mutably and the SELECT path wants the outcome by value.
     pending_outcome: Option<Outcome>,
@@ -167,6 +179,7 @@ impl Connection {
             changes: 0,
             last_insert_rowid: 0,
             auto_rowid: 0,
+            column_name_flags: Connection::default_column_name_flags(),
             pending_outcome: None,
         };
         conn.load_schema()?;
@@ -184,10 +197,17 @@ impl Connection {
             changes: 0,
             last_insert_rowid: 0,
             auto_rowid: 0,
+            column_name_flags: Connection::default_column_name_flags(),
             pending_outcome: None,
         };
         conn.load_schema()?;
         Ok(conn)
+    }
+
+    /// The column-naming settings, as sqlite3 starts every connection with
+    /// them: short on, full off.
+    pub fn default_column_name_flags() -> crate::pragma::ColumnNameFlags {
+        crate::pragma::ColumnNameFlags { full: false, short: true }
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -336,6 +356,17 @@ impl Connection {
     /// Runs one statement.
     pub fn execute(&mut self, stmt: &Stmt) -> Result<Outcome> {
         self.changes = 0;
+        // The static aggregate checks (arity, scope, nesting, ticket #2526's
+        // aliased-aggregate rule) are a property of the parse tree, decided
+        // with no row read. So they run here, above the dispatch, and not in a
+        // per-arm handler: several of them are the same defect wherever the
+        // aggregate is written — `count(a,b)` is the arity error in a SELECT, an
+        // UPDATE's SET and an INSERT's VALUES alike — and the clause order the
+        // check walks in is what makes a statement with more than one defect
+        // report the one sqlite3 does. Above the dispatch also means before any
+        // statement executes, so a statement that both misuses an aggregate and
+        // would have written rows has written none.
+        crate::aggcheck::Ctx::new().check(stmt)?;
         match stmt {
             Stmt::CreateTable {
                 name,
@@ -591,11 +622,16 @@ impl Connection {
                 }
                 out
             }
-            InsertSource::Select(_) => {
-                return Err(Error::new(
-                    ResultCode::Error,
-                    "INSERT ... SELECT is not supported yet",
-                ))
+            InsertSource::Select(select) => {
+                // Everything that decides *what* to write -- the target
+                // columns, the DEFAULTs, affinity, NOT NULL, the rowid, and
+                // the wording of every error -- belongs to
+                // `insert_select.rs`, which is generic over the `InsertTarget`
+                // trait so that it never has to reach into the pager. The
+                // engine's own SELECT path supplies the rows, the b-tree takes
+                // them, and the `mod` line below is the only other piece the
+                // feature needs.
+                return crate::insert_select::insert_select(self, table_name, columns, select);
             }
         };
 
@@ -662,9 +698,21 @@ impl Connection {
             self.check_not_null(&table, &full)?;
 
             // Affinity is applied on the way in, which is why inserting '123'
-            // into an INTEGER column stores the integer.
+            // into an INTEGER column stores the integer. The conversion is the
+            // measured grid rather than a rule of the thumb, and it is the
+            // whole of what makes the storage class of a stored value
+            // predictable: a REAL column stores a real even for a whole number,
+            // a NUMERIC column narrows one, a blob is never converted, and text
+            // that is not entirely a number is never truncated. Each of those is
+            // a cell of the grid in `docs/affinity-grid.md`, measured rather
+            // than reasoned.
+            //
+            // It goes through `affinity_rules::convert` rather than
+            // `affinity::apply` directly, which is the same conversion; the
+            // module is named here so that the grid and the code that has to
+            // agree with it are the same thing rather than two that can drift.
             for (i, col) in table.columns.iter().enumerate() {
-                full[i] = apply_affinity(&full[i], col.affinity);
+                full[i] = affinity_rules::convert(&full[i], col.affinity);
             }
 
             let rowid = self.next_rowid(&table, &full)?;
@@ -868,6 +916,18 @@ impl Connection {
                     ],
                 }];
                 Ok(Outcome::Query { columns: s(&["seq", "name", "file"]), rows })
+            }
+            "full_column_names" | "short_column_names" => {
+                let on = match &p.body {
+                    PragmaBody::Read => true,
+                    PragmaBody::Set(v) => crate::pragma::parse_bool(v),
+                    PragmaBody::ReadArg(_) => true,
+                };
+                match p.name.as_str() {
+                    "full_column_names" => self.column_name_flags.full = on,
+                    _ => self.column_name_flags.short = on,
+                }
+                Ok(empty())
             }
             // A pragma that reads a single value. An unknown one produces no
             // rows at all, which is how a caller tells it from a pragma that
@@ -1086,7 +1146,7 @@ impl Connection {
                     Some(a) => a.clone(),
                     None => match &rc.expr {
                         Expr::Column { name, .. } => name.clone(),
-                        _ => render_expr(&rc.expr),
+                        _ => column_name_with(self.column_name_flags, rc),
                     },
                 });
             }
@@ -1290,11 +1350,12 @@ impl Connection {
             }
             out.push(Row { values });
         }
+        let flags = self.column_name_flags;
         let names: Vec<String> = columns
             .iter()
             .map(|rc| match &rc.alias {
                 Some(a) => a.clone(),
-                None => render_expr(&rc.expr),
+                None => column_name_with(self.column_name_flags, rc),
             })
             .collect();
         // ORDER BY still applies, and is still resolved. There is one row so
@@ -1363,7 +1424,12 @@ impl Connection {
             let mut new = row.values.clone();
             for (idx, expr) in &targets {
                 new[*idx] = eval(expr, &ctx)?;
-                new[*idx] = apply_affinity(&new[*idx], table.columns[*idx].affinity);
+                // An UPDATE applies the column's affinity on the way in exactly
+                // as an INSERT does, through the same grid: `UPDATE t SET a =
+                // 5` on a REAL column stores the real 5.0, and `UPDATE t SET a
+                // = '12abc'` on an INTEGER column stores the text. Measured
+                // against sqlite3 3.53.4 over every cell of the grid.
+                new[*idx] = affinity_rules::convert(&new[*idx], table.columns[*idx].affinity);
             }
             self.check_not_null(&table, &new)?;
             // An UPDATE that changes the alias column changes the rowid, which
@@ -1438,6 +1504,24 @@ fn is_star(e: &Expr) -> bool {
 
 /// The name SQLite gives a result column with no alias, which is the text of
 /// the expression.
+/// The name a result column reports when it has no alias.
+///
+/// SQLite names it after the expression's own text, so  is called
+/// `1  +  2` and `(1+2)*3` keeps its parentheses. Rebuilding the name from
+/// the parsed tree would print something subtly different, and the suite
+/// compares these names, so the text as written is used.
+fn column_name_with(flags: crate::pragma::ColumnNameFlags, rc: &crate::parser::ResultColumn) -> String {
+    // A direct column reference names itself from the schema, and which spelling
+    // it takes is what the full and short settings decide; the rest fall back to
+    // the text as written.
+    let (table, column) = match &rc.expr {
+        Expr::Column { table, name, .. } => (table.as_deref(), Some(name.as_str())),
+        _ => (None, None),
+    };
+    let source = if rc.source.is_empty() { render_expr(&rc.expr) } else { rc.source.clone() };
+    crate::pragma::column_name(flags, rc.alias.as_deref(), table, column, &source)
+}
+
 fn render_expr(e: &Expr) -> String {
     match e {
         Expr::Literal(Literal::Integer(i)) => i.to_string(),

@@ -165,6 +165,11 @@ pub struct ResultColumn {
     /// explicit alias.
     pub alias: Option<String>,
     pub span: Span,
+    /// The expression's own source text, which is what SQLite uses to name a
+    /// column that has no alias. It is the text as written, not a
+    /// reconstruction: `1  +  2` is named `1  +  2` and `(1+2)*3` keeps its
+    /// parentheses, and a reconstruction would print `1+2` and `((1+2)*3)`.
+    pub source: String,
 }
 
 /// The join operator of a table reference.
@@ -536,6 +541,22 @@ impl<'a> Parser<'a> {
 
     /// Reads an identifier, accepting any keyword, which SQLite allows wherever
     /// the schema permits a name.
+    /// Reads a name that may be written as a quoted string.
+    ///
+    /// `AS 'f1'` is how the suite spells an alias whose text is a keyword, and
+    /// rejecting it as a string literal in that position would refuse a
+    /// statement sqlite3 accepts.
+    fn quoted_name(&mut self, context: &str) -> Result<String> {
+        match self.peek() {
+            Some(Token::String(s)) => {
+                let s = s.clone();
+                self.advance();
+                Ok(s)
+            }
+            _ => self.name(context),
+        }
+    }
+
     /// The offset where the statement at the cursor ends.
     ///
     /// That is the next semicolon that is not inside parentheses, or the end of
@@ -866,24 +887,36 @@ impl<'a> Parser<'a> {
                 },
                 alias: None,
                 span: self.span(),
+                source: "*".to_string(),
             });
             return Ok(out);
         }
         loop {
             let span = self.span();
+            let expr_start = span.start;
             let expr = self.expr()?;
+            // The text of the expression is what names the column when there is
+            // no alias, and it ends where the expression did, before any alias.
+            let expr_end = self.tokens.get(self.pos.saturating_sub(1)).map(|(_, s)| s.end).unwrap_or(expr_start);
+            let source = self
+                .sql
+                .get(expr_start..expr_end)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            // An alias may be written with AS or bare, and a bare alias may be
+            // quoted with any of the four forms: `AS 'f1'` is a name, not a
+            // syntax error, and the suite uses it.
             let alias = if self.eat_keyword(Keyword::As)? {
-                Some(self.name("after AS")?)
+                Some(self.quoted_name("after AS")?)
             } else if matches!(self.peek(), Some(Token::Identifier(_)))
                 || matches!(self.peek(), Some(Token::Keyword(k)) if k.as_identable())
             {
-                // SQLite accepts an alias without AS. But a bare keyword that
-                // starts a new clause is not an alias.
-                Some(self.name("after a result column")?)
+                Some(self.quoted_name("after a result column")?)
             } else {
                 None
             };
-            out.push(ResultColumn { expr, alias, span });
+            out.push(ResultColumn { expr, alias, span, source });
             if !self.eat_punct(Punct::Comma)? {
                 break;
             }
