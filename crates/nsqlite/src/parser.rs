@@ -325,6 +325,10 @@ pub enum Stmt {
         columns: Vec<(String, bool)>,
         unique: bool,
         if_not_exists: bool,
+        /// The statement's own text, which sqlite_schema stores. A reopened
+        /// connection rebuilds the index from it, so it has to be what was
+        /// written rather than a reconstruction.
+        sql: String,
     },
     Insert {
         table: String,
@@ -2420,6 +2424,9 @@ impl<'a> Parser<'a> {
     }
 
     fn create_index(&mut self) -> Result<Stmt> {
+        // The statement's own text starts at CREATE, which is the token before
+        // the one the caller consumed.
+        let start = self.tokens.get(self.pos.saturating_sub(1)).map(|(_, s)| s.start);
         let unique = self.eat_keyword(Keyword::Unique)?;
         self.expect_keyword(Keyword::Index, "after CREATE")?;
         let if_not_exists = self.if_not_exists()?;
@@ -2461,13 +2468,14 @@ impl<'a> Parser<'a> {
         if self.eat_keyword(Keyword::Where)? {
             self.expr()?;
         }
-        Ok(Stmt::CreateIndex {
-            name,
-            table,
-            columns,
-            unique,
-            if_not_exists,
-        })
+        // The text is what sqlite_schema stores and what a reopened connection
+        // rebuilds the index from, so it is the original statement rather than
+        // a reconstruction of the parsed form.
+        let sql = match start {
+            Some(a) => crate::index_ddl::sql_for_statement(&self.sql[a..]).unwrap_or_default(),
+            None => String::new(),
+        };
+        Ok(Stmt::CreateIndex { name, table, columns, unique, if_not_exists, sql })
     }
 
     fn drop(&mut self) -> Result<Stmt> {

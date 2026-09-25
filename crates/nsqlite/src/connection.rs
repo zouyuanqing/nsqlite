@@ -238,12 +238,22 @@ impl Connection {
         Ok(())
     }
 
-    /// Writes a table's schema row into `sqlite_schema`.
-    fn write_schema_row(&mut self, name: &str, root: u32, sql_text: &str) -> Result<()> {
+    /// Writes an object's row into `sqlite_schema`.
+    ///
+    /// The five columns are the same for a table and an index, so one writer
+    /// serves both; only the type and the owning table differ.
+    fn write_schema_object(
+        &mut self,
+        kind: &str,
+        name: &str,
+        table: &str,
+        root: u32,
+        sql_text: &str,
+    ) -> Result<()> {
         let values = vec![
-            Value::Text("table".into()),
+            Value::Text(kind.to_owned()),
             Value::Text(name.to_owned()),
-            Value::Text(name.to_owned()),
+            Value::Text(table.to_owned()),
             Value::Integer(root as i64),
             Value::Text(sql_text.to_owned()),
         ];
@@ -412,10 +422,28 @@ impl Connection {
                 // and the statement succeeds without writing.
                 Ok(Outcome::Changed(0))
             }
-            Stmt::CreateIndex { .. } => Err(Error::new(
-                ResultCode::Error,
-                "CREATE INDEX is not supported yet",
-            )),
+            Stmt::CreateIndex { name, table, columns, unique, if_not_exists, sql } => {
+                // The index is built from the table's current rows and its
+                // root page is written into the schema, so a reopened
+                // connection finds it the same way it finds a table.
+                let named = name.clone().unwrap_or_else(|| {
+                    crate::index_ddl::derived_index_name(table)
+                });
+                if let Some(built) = crate::index_ddl::build_index(
+                    &mut self.pager,
+                    &self.catalog,
+                    &named,
+                    table,
+                    columns,
+                    *unique,
+                    *if_not_exists,
+                )? {
+                    let root = built.root_page;
+                    self.catalog.put_index(built);
+                    self.write_index_schema_row(&named, table, root, sql)?;
+                }
+                Ok(Outcome::Changed(0))
+            }
             Stmt::Unsupported(what) => Err(Error::new(
                 ResultCode::Error,
                 format!("{what} is not supported yet"),
@@ -729,6 +757,27 @@ impl Connection {
             t.root_page = root;
         }
         Ok(())
+    }
+
+    /// Writes an index's row into `sqlite_schema`.
+    ///
+    /// An index is a schema object like a table, so it is found the same way:
+    /// the row carries the type, the name, the table it belongs to, the root
+    /// page and the original statement.
+    /// Writes a table's schema row, which is the general writer with the type
+    /// and the owning table both being the table's own name.
+    fn write_schema_row(&mut self, name: &str, root: u32, sql_text: &str) -> Result<()> {
+        self.write_schema_object("table", name, name, root, sql_text)
+    }
+
+    fn write_index_schema_row(
+        &mut self,
+        name: &str,
+        table: &str,
+        root: u32,
+        sql_text: &str,
+    ) -> Result<()> {
+        self.write_schema_object("index", name, table, root, sql_text)
     }
 
     // --- PRAGMA -----------------------------------------------------------
@@ -2088,7 +2137,14 @@ mod tests {
     fn an_unimplemented_statement_says_so_rather_than_guessing() {
         let mut c = mem();
         run(&mut c, "CREATE TABLE t(a)");
-        let e = c.execute_script("CREATE INDEX i ON t(a)").unwrap_err();
+        // CREATE INDEX is implemented now, so the check uses something that is
+        // still refused. The point of the test is that an unimplemented
+        // statement says so rather than quietly doing nothing.
+        // A compound select parses and is understood, but the executor does
+        // not run one yet, which is the case the branch is for.
+        let e = c
+            .execute_script("SELECT 1 UNION SELECT 2")
+            .unwrap_err();
         assert!(
             e.message.contains("not supported yet"),
             "got: {}",
