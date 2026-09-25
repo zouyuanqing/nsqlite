@@ -864,6 +864,7 @@ impl Connection {
             columns,
             from,
             where_,
+            distinct,
             ..
         } = body
         else {
@@ -902,7 +903,7 @@ impl Connection {
         // name is the identifier, so a query asking for a column that does not
         // exist returns a row instead of failing.
         crate::resolve::check_statement(&joined, sel)?;
-        self.select_from(sel, columns, where_.as_ref(), &joined)
+        self.select_from(sel, columns, where_.as_ref(), *distinct, &joined)
     }
 
     /// Answers a query whose FROM names the schema table.
@@ -940,7 +941,8 @@ impl Connection {
             using: Vec::new(),
         };
         let joined = crate::join::resolve(vec![source])?;
-        self.pending_outcome = Some(self.select_from(sel, columns, where_, &joined)?);
+        // The schema query is the engine's own, so it is never DISTINCT.
+        self.pending_outcome = Some(self.select_from(sel, columns, where_, false, &joined)?);
         Ok(true)
     }
 
@@ -993,6 +995,7 @@ impl Connection {
         sel: &Select,
         columns: &[crate::parser::ResultColumn],
         where_: Option<&Expr>,
+        distinct: bool,
         from: &crate::join::From,
     ) -> Result<Outcome> {
         // Whether this query groups at all, which decides everything below: a
@@ -1195,6 +1198,13 @@ impl Connection {
         let mut projected: Vec<Row> = out.iter().map(|(r, _)| r.clone()).collect();
         crate::orderby::resolve_keys(sel, columns, &names, Some(from))?;
         apply_order_by(sel, columns, from, &names, &out, &mut projected)?;
+        // DISTINCT drops the repeats, comparing whole rows rather than any one
+        // column. It runs after ORDER BY and LIMIT would matter for the order,
+        // so it goes before both: the distinct set is the query's result, and
+        // the ordering and the limit then apply to that set.
+        if distinct {
+            projected = dedupe_rows(projected);
+        }
         apply_limit(sel, &mut projected)?;
         Ok(Outcome::Query {
             columns: names,
@@ -1647,6 +1657,30 @@ fn build_ctx<'a>(
         context: None,
         resolved,
     }
+}
+
+/// Removes the repeated rows, keeping the first of each run.
+///
+/// The comparison is on the whole row under SQLite's own ordering, so two rows
+/// that compare equal are one row and two that differ in any position are not.
+/// The rows are not sorted first: DISTINCT does not imply an order, and a
+/// query without ORDER BY returns its rows in whatever order they were produced.
+fn dedupe_rows(rows: Vec<Row>) -> Vec<Row> {
+    let mut out: Vec<Row> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let seen = out.iter().any(|kept| {
+            kept.values.len() == row.values.len()
+                && kept
+                    .values
+                    .iter()
+                    .zip(&row.values)
+                    .all(|(a, b)| a.compare(b) == std::cmp::Ordering::Equal)
+        });
+        if !seen {
+            out.push(row);
+        }
+    }
+    out
 }
 
 /// Applies LIMIT and OFFSET.
