@@ -346,6 +346,7 @@ impl Connection {
                 *temp,
             ),
             Stmt::DropTable { name, if_exists } => self.drop_table(name, *if_exists),
+            Stmt::Pragma(p) => self.pragma(p),
             Stmt::Insert {
                 table,
                 columns,
@@ -730,6 +731,125 @@ impl Connection {
         Ok(())
     }
 
+    // --- PRAGMA -----------------------------------------------------------
+
+    /// Runs a PRAGMA statement.
+    ///
+    /// A pragma this engine does not know is a silent no-op returning no rows,
+    /// which is what SQLite does and what the suite relies on: a file written by
+    /// a newer version can carry a pragma an older one has never heard of, and
+    /// refusing to open it would be worse than ignoring it.
+    fn pragma(&mut self, p: &crate::pragma::Pragma) -> Result<Outcome> {
+        use crate::pragma::{ColumnInfo, IndexInfo, PragmaBody};
+        if let Some(schema) = &p.schema {
+            if !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp") {
+                return Err(Error::new(
+                    ResultCode::Error,
+                    format!("unknown database {schema}"),
+                ));
+            }
+        }
+        // The column names are the ones sqlite3 reports, which the suite
+        // compares verbatim; they are not derived from the row builder.
+        let s = |n: &[&str]| n.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let empty = || Outcome::Query { columns: s(&[]), rows: Vec::new() };
+        match p.name.as_str() {
+            "table_info" => {
+                let PragmaBody::ReadArg(arg) = &p.body else {
+                    return Err(Error::new(
+                        ResultCode::Error,
+                        "PRAGMA table_info requires an argument",
+                    ));
+                };
+                let Some(table) = self.catalog.get(arg) else { return Ok(empty()) };
+                let cols: Vec<ColumnInfo> = table
+                    .columns
+                    .iter()
+                    .map(|c| ColumnInfo {
+                        name: c.name.clone(),
+                        ty: c.declared_type.clone(),
+                        not_null: c.not_null,
+                        default: c.default.as_ref().map(render_expr),
+                        pk: 0,
+                    })
+                    .collect();
+                let rows = crate::pragma::table_info_rows(&cols)
+                    .into_iter()
+                    .map(|values| Row { values })
+                    .collect();
+                Ok(Outcome::Query {
+                    columns: s(&["cid", "name", "type", "notnull", "dflt_value", "pk"]),
+                    rows,
+                })
+            }
+            "index_list" => {
+                let PragmaBody::ReadArg(arg) = &p.body else {
+                    return Err(Error::new(
+                        ResultCode::Error,
+                        "PRAGMA index_list requires an argument",
+                    ));
+                };
+                let indexes: Vec<IndexInfo> = self
+                    .catalog
+                    .indexes_on(arg)
+                    .into_iter()
+                    .map(|i| IndexInfo {
+                        name: i.name.clone(),
+                        origin: "c",
+                        unique: i.unique,
+                        partial: false,
+                    })
+                    .collect();
+                let rows = crate::pragma::index_list_rows(&indexes)
+                    .into_iter()
+                    .map(|values| Row { values })
+                    .collect();
+                Ok(Outcome::Query {
+                    columns: s(&["seq", "name", "unique", "origin", "partial"]),
+                    rows,
+                })
+            }
+            "database_list" => {
+                let file = self.path().map(|p| p.display().to_string()).unwrap_or_default();
+                let rows = vec![Row {
+                    values: vec![
+                        Value::Integer(0),
+                        Value::Text("main".into()),
+                        Value::Text(file),
+                    ],
+                }];
+                Ok(Outcome::Query { columns: s(&["seq", "name", "file"]), rows })
+            }
+            // A pragma that reads a single value. An unknown one produces no
+            // rows at all, which is how a caller tells it from a pragma that
+            // has a value and returned none.
+            _ => {
+                let Some(value) = self.pragma_scalar(&p.name) else {
+                    return Ok(empty());
+                };
+                let rows = vec![Row { values: vec![value] }];
+                Ok(Outcome::Query { columns: s(&[p.name.as_str()]), rows })
+            }
+        }
+    }
+
+    /// The value of a pragma that reads a single setting, or `None` when this
+    /// engine has none by that name.
+    fn pragma_scalar(&self, name: &str) -> Option<Value> {
+        let h = self.pager.header();
+        Some(match name {
+            "page_size" => Value::Integer(h.page_size as i64),
+            "page_count" => Value::Integer(h.db_size_pages as i64),
+            "schema_version" => Value::Integer(h.schema_cookie as i64),
+            "user_version" => Value::Integer(h.user_version as i64),
+            "application_id" => Value::Integer(h.application_id as i64),
+            "encoding" => Value::Text(h.text_encoding.name().to_string()),
+            "journal_mode" => Value::Text("delete".to_string()),
+            "freelist_count" => Value::Integer(h.freelist_count as i64),
+            _ => return None,
+        })
+    }
+
     // --- SELECT ---------------------------------------------------------
 
     fn select(&mut self, sel: &Select) -> Result<Outcome> {
@@ -777,6 +897,11 @@ impl Connection {
         // would have matched nothing.
         let sources = crate::join::sources_from(&self.queryable_tables(), from)?;
         let joined = crate::join::resolve(sources)?;
+        // Every column reference is bound before any row is read. Without this
+        // an unknown name is not an error: it becomes a result column whose
+        // name is the identifier, so a query asking for a column that does not
+        // exist returns a row instead of failing.
+        crate::resolve::check_statement(&joined, sel)?;
         self.select_from(sel, columns, where_.as_ref(), &joined)
     }
 

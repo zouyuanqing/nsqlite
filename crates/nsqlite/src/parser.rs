@@ -295,6 +295,10 @@ pub enum Constraint {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Select(Select),
+    /// A PRAGMA statement, parsed by the pragma module because its shape does
+    /// not fit the expression grammar: a name, optionally qualified, then
+    /// either nothing, a parenthesised argument, or an assignment.
+    Pragma(crate::pragma::Pragma),
     /// A statement the parser recognises but cannot yet execute, kept so the
     /// caller can report progress rather than a syntax error.
     Unsupported(String),
@@ -528,6 +532,24 @@ impl<'a> Parser<'a> {
 
     /// Reads an identifier, accepting any keyword, which SQLite allows wherever
     /// the schema permits a name.
+    /// The offset where the statement at the cursor ends.
+    ///
+    /// That is the next semicolon that is not inside parentheses, or the end of
+    /// the input, since a script is tokenised up front and the pragma module
+    /// needs a slice rather than a position.
+    fn statement_end(&self) -> usize {
+        let mut depth = 0i32;
+        for (tok, span) in self.tokens.iter().skip(self.pos) {
+            match tok {
+                Token::Punct(Punct::LParen) => depth += 1,
+                Token::Punct(Punct::RParen) => depth -= 1,
+                Token::Punct(Punct::Semicolon) if depth <= 0 => return span.start,
+                _ => {}
+            }
+        }
+        self.sql.len()
+    }
+
     fn identifier(&mut self, context: &str) -> Result<String> {
         match self.advance() {
             Some(Token::Identifier(n)) => Ok(n),
@@ -599,6 +621,46 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(Token::Keyword(Keyword::Select)) | Some(Token::Keyword(Keyword::With)) => {
                 Ok(Stmt::Select(self.select()?))
+            }
+            Some(Token::Keyword(Keyword::Pragma)) => {
+                // The pragma module owns this grammar, which does not fit the
+                // expression one: a name, optionally schema-qualified, then
+                // either nothing, a parenthesised argument, or an assignment.
+                // It wants the statement text starting AT the keyword, not
+                // after it, because it parses the whole shape itself.
+                // match self.peek() did not advance, so self.pos is still
+                // pointing AT the keyword. Its span is where the text starts.
+                let from = self.tokens.get(self.pos).map(|(_, s)| s.start).unwrap_or(0);
+                // The pragma module re-parses the text, so it has to be this
+                // statement's text and not the whole script: a script is
+                // tokenised up front, and handing over the rest of it would
+                // make the pragma swallow the statements that follow.
+                let to = self.statement_end();
+                let text = self.sql.get(from..to).unwrap_or("").to_string();
+                let stmt = crate::pragma::parse_pragma(&text)?;
+                // The tokens for this statement still have to be consumed, or
+                // the script loop would see the same PRAGMA for ever.
+                while self.pos < self.tokens.len() && self.tokens[self.pos].1.start < to {
+                    self.pos += 1;
+                }
+                return Ok(Stmt::Pragma(stmt));
+            }
+            Some(Token::Keyword(Keyword::Pragma)) => {
+                // The pragma module owns this grammar, which does not fit the
+                // expression one. It re-parses the text, so it gets this
+                // statement's slice rather than the whole script: a script is
+                // tokenised up front and handing over the rest would make the
+                // pragma swallow the statements that follow.
+                let from = self.tokens.get(self.pos).map(|(_, s)| s.start).unwrap_or(0);
+                let to = self.statement_end();
+                let text = self.sql.get(from..to).unwrap_or("").to_string();
+                let stmt = crate::pragma::parse_pragma(&text)?;
+                // The tokens still have to be consumed, or the script loop would
+                // see the same PRAGMA for ever.
+                while self.pos < self.tokens.len() && self.tokens[self.pos].1.start < to {
+                    self.pos += 1;
+                }
+                return Ok(Stmt::Pragma(stmt));
             }
             Some(Token::Keyword(Keyword::Insert)) | Some(Token::Keyword(Keyword::Replace)) => {
                 self.insert()

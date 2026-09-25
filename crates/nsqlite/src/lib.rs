@@ -29,6 +29,8 @@
 //! of these and live in their own modules as they land.
 
 pub mod affinity;
+pub mod affinity_rules;
+pub mod aggcheck;
 pub mod aggregate;
 pub mod btree;
 pub mod btree_interior;
@@ -37,17 +39,24 @@ pub mod catalog;
 pub mod connection;
 pub mod error;
 pub mod eval;
+pub mod explain;
 pub mod func_math;
 pub mod func_string;
 pub mod grouping;
 pub mod index;
+pub mod index_ddl;
 pub mod index_interior;
+pub mod insert_select;
 pub mod join;
 pub mod journal;
+pub mod msg;
+pub mod orderby;
 pub mod page;
 pub mod pager;
 pub mod parser;
+pub mod pragma;
 pub mod record;
+pub mod resolve;
 pub mod table_tree;
 pub mod text;
 pub mod tokenizer;
