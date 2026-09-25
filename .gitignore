@@ -25,8 +25,11 @@ test/sqlite-run/
 *.test
 *.tcl
 
-# Scratch an agent created by redirecting inside a quoted string, and the
-# databases the ad-hoc checks leave behind.
+# Scratch an agent created by redirecting inside a quoted string: a command
+# like `sqlite3 > "VACUUM;"` leaves a file whose name is the text between the
+# quotes, so these are SQL fragments and shell options rather than anything a
+# person meant to create. Matched by pattern rather than by name, because the
+# names are whatever statement was in the redirect.
 c.db
 d.db
 e.db
@@ -37,3 +40,18 @@ e2e2.db
 g.db
 pg.db
 pg2.db
+
+# SQL fragments and shell options that a redirect inside a quoted string
+# created as file names.
+/NOSUCHWORD*
+/REINDEX*
+/SELECT *
+/VACUUM*
+/ANALYZE*
+/ATTACH *
+/--*
+/-b*
+/-n*
+/-e*
+/-i
+*.log
