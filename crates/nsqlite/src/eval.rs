@@ -12,6 +12,7 @@
 use std::cmp::Ordering;
 
 use crate::error::{Error, Result, ResultCode};
+use crate::msg;
 use crate::parser::{BinOp, Expr, Literal, UnaryOp};
 use crate::value::Value;
 
@@ -138,14 +139,8 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Result<Value> {
             match table {
                 // A qualified name that did not resolve usually means the table
                 // is not in the query at all.
-                Some(t) => Err(Error::new(
-                    ResultCode::Error,
-                    format!("no such column: {t}.{name}"),
-                )),
-                None => Err(Error::new(
-                    ResultCode::Error,
-                    format!("no such column: {name}"),
-                )),
+                Some(t) => Err(msg::no_such_column_qualified(t, name)),
+                None => Err(msg::no_such_column(name)),
             }
         }
         Expr::NamedParameter(name, _) => Err(Error::new(
@@ -289,10 +284,7 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Result<Value> {
             distinct,
         } => {
             if *star {
-                return Err(Error::new(
-                    ResultCode::Error,
-                    format!("misuse of aggregate function {name}()"),
-                ));
+                return Err(msg::misuse_of_aggregate_function(name));
             }
             if *distinct {
                 return Err(Error::new(
@@ -803,14 +795,6 @@ pub fn type_name(v: &Value) -> &'static str {
 
 /// Calls a built-in scalar function.
 pub fn call(name: &str, args: &[Value]) -> Result<Value> {
-    let arity_error = |want: usize| {
-        Error::new(
-            ResultCode::Error,
-            format!("wrong number of arguments to function {name}()"),
-        )
-        .with_extended(0)
-    };
-    let _ = arity_error;
     let lname = name.to_ascii_lowercase();
     match lname.as_str() {
         "abs" => {
@@ -830,10 +814,7 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
         }
         "coalesce" => {
             if args.is_empty() {
-                return Err(Error::new(
-                    ResultCode::Error,
-                    "wrong number of arguments to function coalesce()",
-                ));
+                return Err(msg::wrong_argument_count(name));
             }
             for a in args {
                 if !a.is_null() {
@@ -1085,10 +1066,7 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
         }
         "min" | "max" => {
             if args.is_empty() {
-                return Err(Error::new(
-                    ResultCode::Error,
-                    format!("wrong number of arguments to function {lname}()"),
-                ));
+                return Err(msg::wrong_argument_count(name));
             }
             // The scalar min and max are NULL if any argument is NULL, which is
             // what SQLite does: `SELECT min(NULL, 1)` is NULL, not 1. The
@@ -1123,10 +1101,7 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
         // with `no such function: XYZZY`, so a test that writes the name in
         // mixed case and compares the message needs the original spelling.
         // The arity error above already reads `name` for the same reason.
-        _ => Err(Error::new(
-            ResultCode::Error,
-            format!("no such function: {name}"),
-        )),
+        _ => Err(msg::no_such_function(name)),
     }
 }
 
@@ -1134,10 +1109,7 @@ fn expect_arity(name: &str, args: &[Value], want: usize) -> Result<()> {
     if args.len() == want {
         Ok(())
     } else {
-        Err(Error::new(
-            ResultCode::Error,
-            format!("wrong number of arguments to function {name}()"),
-        ))
+        Err(msg::wrong_argument_count(name))
     }
 }
 
@@ -1145,10 +1117,7 @@ fn expect_range(name: &str, args: &[Value], lo: usize, hi: usize) -> Result<()> 
     if args.len() >= lo && args.len() <= hi {
         Ok(())
     } else {
-        Err(Error::new(
-            ResultCode::Error,
-            format!("wrong number of arguments to function {name}()"),
-        ))
+        Err(msg::wrong_argument_count(name))
     }
 }
 

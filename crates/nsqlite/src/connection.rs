@@ -19,6 +19,7 @@ use crate::affinity::Affinity;
 use crate::affinity_rules;
 use crate::catalog::{Catalog, Column, Table};
 use crate::error::{Error, Result, ResultCode};
+use crate::msg;
 use crate::eval::{eval, truthy, EvalCtx};
 use crate::pager::Pager;
 use crate::parser::{
@@ -37,6 +38,41 @@ use crate::value::Value;
 mod insert_select_hook;
 
 /// Rebuilds a table's definition by re-parsing the statement the schema stores.
+/// Rebuilds an index from the statement the schema stores.
+///
+/// The same text a CREATE INDEX wrote, re-parsed, so a reopened connection gets
+/// the same key columns and directions rather than a guess. The columns are
+/// resolved against the table later, when the index is first used, because the
+/// schema is read in rowid order and a table may be defined after the index
+/// that names it.
+fn rebuild_index(
+    name: &str,
+    table: &str,
+    sql_text: &str,
+    root: u32,
+) -> Option<crate::catalog::Index> {
+    let stmt = crate::parser::parse_one(sql_text).ok()?;
+    let crate::parser::Stmt::CreateIndex { name: named, table: tbl, columns, unique, .. } = stmt else {
+        return None;
+    };
+    Some(crate::catalog::Index {
+        name: named.unwrap_or_else(|| name.to_string()),
+        table: tbl,
+        columns: columns.iter().map(|(c, _)| c.clone()).collect(),
+        ascending: columns.iter().map(|(_, a)| *a).collect(),
+        unique,
+        root_page: root,
+    })
+    .map(|mut i| {
+        // A qualified table name in the statement and the bare one the schema
+        // row carries name the same table.
+        if i.table.is_empty() {
+            i.table = table.to_string();
+        }
+        i
+    })
+}
+
 fn rebuild_table(name: &str, sql_text: &str, root: u32) -> Result<Table> {
     let Stmt::CreateTable {
         name: parsed,
@@ -229,16 +265,35 @@ impl Connection {
         let rows = tree.scan(&mut self.pager)?;
         for row in rows {
             // A schema row has five columns; anything shorter is not one.
-            if row.values.len() < 5 || row.values[0].as_str() != Some("table") {
+            if row.values.len() < 5 {
                 continue;
             }
-            let (Some(name), Some(sql_text)) = (row.values[1].as_str(), row.values[4].as_str())
-            else {
+            let (Some(kind), Some(name), Some(sql_text)) = (
+                row.values[0].as_str(),
+                row.values[1].as_str(),
+                row.values[4].as_str(),
+            ) else {
                 continue;
             };
             let root = row.values[3].as_i64().unwrap_or(0) as u32;
-            let table = rebuild_table(name, sql_text, root)?;
-            self.catalog.put(table);
+            match kind {
+                "table" => {
+                    let table = rebuild_table(name, sql_text, root)?;
+                    self.catalog.put(table);
+                }
+                // An index is a schema object too, and a reopened connection
+                // has to find it the same way it finds a table. Skipping it
+                // made an index vanish the moment the process that created it
+                // exited, which is every statement as far as the suite's shim is
+                // concerned, so PRAGMA index_list came back empty and a query
+                // that should have used the index scanned instead.
+                "index" => {
+                    if let Some(index) = rebuild_index(name, row.values[2].as_str().unwrap_or(name), sql_text, root) {
+                        self.catalog.put_index(index);
+                    }
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -384,6 +439,21 @@ impl Connection {
         // against, so the two agree on which tables exist -- including the
         // schema table, which is not in the catalog.
         crate::aggcheck::Ctx::new().check(stmt, &self.queryable_tables())?;
+        // An EXPLAIN wraps a statement, and the wrap changes what the check
+        // above is given: it has been handed a node whose arms match none of
+        // the shapes it knows, so the whole walk stands aside and the wrapped
+        // statement goes unchecked. It is re-run on the inner statement, in the
+        // `explain` arm, and this is the one case where it has to be run
+        // *first* rather than alongside the other prepare checks: SQLite
+        // resolves an expression name in a CTE's body before it opens the CTE's
+        // reader, so `WITH q AS (SELECT count(a,b) FROM t1) SELECT * FROM q` is
+        // `wrong number of arguments to function count()` here and
+        // `common table expressions are not supported yet` would be the wrong
+        // answer twice over -- once for being later and once for not being it at
+        // all. Measured on 3.53.4.
+        if let Stmt::Explain(e) = stmt {
+            crate::aggcheck::Ctx::new().check(&e.inner, &self.queryable_tables())?;
+        }
         match stmt {
             Stmt::CreateTable {
                 name,
@@ -470,6 +540,7 @@ impl Connection {
                 // and the statement succeeds without writing.
                 Ok(Outcome::Changed(0))
             }
+            Stmt::Explain(e) => self.explain(e),
             Stmt::CreateIndex {
                 name,
                 table,
@@ -496,13 +567,16 @@ impl Connection {
                     let root = built.root_page;
                     self.catalog.put_index(built);
                     self.write_index_schema_row(&named, table, root, sql)?;
+                    // The index pages and the schema row are both dirty, and
+                    // nothing flushes on the way out of a DDL statement, so
+                    // without this the index is gone by the time the next
+                    // process opens the file. Every statement is its own
+                    // process as far as the suite's shim is concerned.
+                    self.pager.flush()?;
                 }
                 Ok(Outcome::Changed(0))
             }
-            Stmt::Unsupported(what) => Err(Error::new(
-                ResultCode::Error,
-                format!("{what} is not supported yet"),
-            )),
+            Stmt::Unsupported(what) => Err(msg::unsupported_yet(&what)),
         }
     }
 
@@ -522,10 +596,7 @@ impl Connection {
             if if_not_exists {
                 return Ok(Outcome::Changed(0));
             }
-            return Err(Error::new(
-                ResultCode::Error,
-                format!("table {name} already exists"),
-            ));
+            return Err(msg::table_exists(name));
         }
         if without_rowid {
             return Err(Error::new(
@@ -595,10 +666,7 @@ impl Connection {
                 Ok(Outcome::Changed(0))
             }
             None if if_exists => Ok(Outcome::Changed(0)),
-            None => Err(Error::new(
-                ResultCode::Error,
-                format!("no such table: {name}"),
-            )),
+            None => Err(msg::no_such_table(name)),
         }
     }
 
@@ -606,7 +674,7 @@ impl Connection {
         self.catalog
             .get(name)
             .or_else(|| crate::join::strip_schema_qualifier(name).and_then(|b| self.catalog.get(b)))
-            .ok_or_else(|| Error::new(ResultCode::Error, format!("no such table: {name}")))
+            .ok_or_else(|| msg::no_such_table(name))
     }
 
     fn table_mut(&mut self, name: &str) -> Result<&mut Table> {
@@ -615,10 +683,7 @@ impl Connection {
         // `join::strip_schema_qualifier`.
         let name = crate::join::strip_schema_qualifier(name).unwrap_or(name);
         if !self.catalog.contains(name) {
-            return Err(Error::new(
-                ResultCode::Error,
-                format!("no such table: {name}"),
-            ));
+            return Err(msg::no_such_table(name));
         }
         Ok(self.catalog.get_mut(name).expect("just checked"))
     }
@@ -665,13 +730,11 @@ impl Connection {
             Some(names) => {
                 let mut v = Vec::with_capacity(names.len());
                 for n in names {
-                    v.push(table.column_index(n).ok_or_else(|| {
-                        // SQLite's wording: table, then the unknown column.
-                        Error::new(
-                            ResultCode::Error,
-                            format!("table {table_name} has no column named {n}"),
-                        )
-                    })?);
+                    v.push(
+                        table
+                            .column_index(n)
+                            .ok_or_else(|| msg::no_such_column_for_table(table_name, n))?,
+                    );
                 }
                 v
             }
@@ -728,12 +791,9 @@ impl Connection {
             let mut named: Vec<bool> = vec![false; table.len()];
             for (i, pos) in targets.iter().enumerate() {
                 if *pos >= full.len() {
-                    return Err(Error::new(
-                        ResultCode::Error,
-                        format!(
-                            "table {table_name} has no column named {}",
-                            columns.map(|c| c[i].as_str()).unwrap_or("?")
-                        ),
+                    return Err(unknown_column(
+                        table_name,
+                        columns.map(|c| c[i].as_str()).unwrap_or("?"),
                     ));
                 }
                 full[*pos] = vals[i].clone();
@@ -835,11 +895,7 @@ impl Connection {
     fn check_not_null(&self, table: &Table, values: &[Value]) -> Result<()> {
         for (i, col) in table.columns.iter().enumerate() {
             if col.not_null && values.get(i).map(|v| v.is_null()).unwrap_or(true) {
-                return Err(Error::new(
-                    ResultCode::Constraint,
-                    format!("NOT NULL constraint failed: {}.{}", table.name, col.name),
-                )
-                .with_extended(1299));
+                return Err(msg::not_null_constraint(&table.name, &col.name));
             }
         }
         Ok(())
@@ -861,10 +917,7 @@ impl Connection {
                     && e.message.starts_with("UNIQUE constraint failed: rowid ")
                 {
                     let col = &table.columns[i].name;
-                    return Err(Error::new(
-                        ResultCode::Constraint,
-                        format!("UNIQUE constraint failed: {}.{col}", table.name),
-                    ));
+                    return Err(msg::unique_constraint(&table.name, col));
                 }
             }
             return Err(e);
@@ -1054,6 +1107,270 @@ impl Connection {
             "freelist_count" => Value::Integer(h.freelist_count as i64),
             _ => return None,
         })
+    }
+
+    // --- EXPLAIN --------------------------------------------------------
+
+    /// Runs an `EXPLAIN`, in either of the two forms the keyword covers.
+    ///
+    /// The listing itself is the explain module's work and is left there. What
+    /// has to happen here is the *preparation* half, and it is the half that is
+    /// easy to forget: SQLite resolves names while it prepares a statement, and
+    /// it prepares the wrapped statement, so both forms of `EXPLAIN` raise the
+    /// errors the bare statement raises and at the same point in the same
+    /// order. Every row below was read off `sqlite3` 3.53.4:
+    ///
+    /// ```text
+    /// EXPLAIN QUERY PLAN SELECT nosuchcol FROM t1   ->  no such column: nosuchcol
+    /// EXPLAIN         SELECT nosuchcol FROM t1      ->  no such column: nosuchcol
+    /// EXPLAIN QUERY PLAN SELECT * FROM nosuch      ->  no such table: nosuch
+    /// EXPLAIN QUERY PLAN SELECT count(a,b) FROM t1 ->  wrong number of arguments to function count()
+    /// EXPLAIN QUERY PLAN SELECT 1 FROM t1 LIMIT count(a) ->  no such column: a
+    /// ```
+    ///
+    /// So the same two checks `execute` runs above the dispatch run again on
+    /// the *inner* statement, in the same order, and then the module produces
+    /// the listing. Running them here rather than inside the module is the only
+    /// way they can be: the aggregate check is given the tables a connection
+    /// can name, which is a piece of connection state the module has no
+    /// business reaching for.
+    ///
+    /// `no such table` comes out of the module, which resolves every FROM table
+    /// before it writes a line. The order is the bare statement's and was
+    /// measured: an unknown table outranks everything, because SQLite refuses
+    /// the FROM before it resolves a name in it -- `SELECT nosuchcol FROM
+    /// nosuchtable` is `no such table: nosuchtable` -- and `no such column`
+    /// outranks every aggregate message, which the dispatch above already
+    /// documents.
+    ///
+    /// The inner statement is never *run*. An `EXPLAIN` reads only the catalog
+    /// -- it describes the access a query would take, and reading a row of the
+    /// table to work that out would be the opposite of explaining -- so a
+    /// wrapped `INSERT` changes nothing and a wrapped `DELETE` deletes nothing,
+    /// which is also what the real engine does: `EXPLAIN INSERT INTO t1
+    /// VALUES(1,2,3)` leaves the table empty.
+    fn explain(&mut self, e: &crate::explain::Explain) -> Result<Outcome> {
+        // The aggregate check on the wrapped statement. `execute` runs it
+        // above the dispatch, where the arm is reached before this one, because
+        // it has to outrank the CTE refusal below; running it a second time
+        // here is free and keeps this method whole on its own.
+        crate::aggcheck::Ctx::new().check(&e.inner, &self.queryable_tables())?;
+        // A wrapped statement this engine cannot run at all is refused with its
+        // own error rather than planned. What it cannot run is a decision
+        // `select` makes and this module knows nothing about: a sub-select in
+        // FROM and a CTE are both refusals of the *executor*, and both are
+        // statements a plan is exactly what is wanted for --
+        // `EXPLAIN QUERY PLAN SELECT * FROM (SELECT * FROM t1) s` is
+        // `CO-ROUTINE s / SCAN t1` on the real engine, measured, and so is
+        // `EXPLAIN QUERY PLAN WITH q AS (SELECT a FROM t1) SELECT * FROM q`.
+        //
+        // The two are told apart by the statement's own shape rather than by
+        // its text, which is why a plan is available for a sub-select written
+        // with or without the parentheses a `FromItem::Subquery` also carries:
+        // a `FromItem::Subquery` is the `SELECT * FROM (...)` shape, a
+        // `SelectBody::Nested` is a compound that was bracketed. A FROM that
+        // names one of the former is the refusal.
+        if let crate::parser::Stmt::Select(sel) = &e.inner {
+            let bracketed_from = match &sel.body {
+                crate::parser::SelectBody::Simple { from, .. } => from
+                    .iter()
+                    .any(|i| matches!(i, crate::parser::FromItem::Subquery { .. })),
+                crate::parser::SelectBody::Nested(_) => true,
+                crate::parser::SelectBody::Compound { .. } => false,
+            };
+            if !sel.with.is_empty() || bracketed_from {
+                return Err(self.unrunnable_select(sel));
+            }
+        }
+        // A SELECT is the one wrapped statement whose names are resolved by
+        // `resolve` rather than judged by the aggregate check, which only
+        // refuses a name when it is a defect of an aggregate's use. The FROM is
+        // resolved first, so a table that is not there is still `no such table`
+        // rather than a `no such column` about a name that could have resolved
+        // against it.
+        //
+        // `resolve::check_statement` binds the LIMIT and OFFSET against no
+        // source at all, so `LIMIT count(a)` is `no such column: a` here for
+        // the same reason it is for a bare SELECT, and the HAVING's refusal on a
+        // non-aggregate query -- which SQLite raises before it resolves the
+        // WHERE -- comes out of the same ordered walk. Both were measured
+        // through the real engine and both are the bare statement's answer.
+        //
+        // A compound body has no FROM of its own at this level, so there is
+        // nothing to resolve against. It is planned -- a plan for a compound is
+        // one of the things EXPLAIN QUERY PLAN is for -- and a name inside one
+        // of the arms is left to the module, which is where the bare
+        // statement's own answer comes from as well.
+        if let crate::parser::Stmt::Select(sel) = &e.inner {
+            let from = match &sel.body {
+                crate::parser::SelectBody::Simple { from, .. } => from.as_slice(),
+                _ => &[],
+            };
+            let sources = crate::join::sources_from(&self.queryable_tables(), from)?;
+            let joined = crate::join::resolve(sources)?;
+            crate::resolve::check_statement(&joined, sel)?;
+        }
+        // A DML statement names columns in two places the planner never reads.
+        // Its target is `no such table`, and its column list and SET clause are
+        // `no such column` or `table t has no column named c`. The planner
+        // reads a WHERE, so `DELETE FROM t WHERE nosuchcol=1` is caught above
+        // without any of this; the other two are not, and they are checked here
+        // because SQLite checks them while it prepares.
+        //
+        // Which error each is was measured on 3.53.4, and they are not
+        // interchangeable. A name in an INSERT's column *list* is a column of
+        // the table that does not exist, and it says so:
+        //
+        // ```text
+        // INSERT INTO t1(nosuchcol) VALUES(1)  ->  table t1 has no column named nosuchcol
+        // ```
+        //
+        // The same name in an UPDATE's SET clause, or in either statement's
+        // VALUES, is an ordinary *expression* and says the ordinary thing:
+        //
+        // ```text
+        // UPDATE t1 SET a=nosuchcol       ->  no such column: nosuchcol
+        // INSERT INTO t1 VALUES(nosuchcol) ->  no such column: nosuchcol
+        // ```
+        //
+        // The second is why a values expression is resolved as an expression
+        // and not as a column: the column list and the values are different
+        // kinds of thing, and the first of those four rows is the only one that
+        // is a column.
+        match &e.inner {
+            crate::parser::Stmt::Update {
+                table,
+                sets,
+                where_,
+            } => {
+                let target = self.dml_sources(table)?;
+                for (_, expr) in sets {
+                    self.check_dml_expression(table, &target, expr)?;
+                }
+                if let Some(w) = where_ {
+                    self.check_dml_expression(table, &target, w)?;
+                }
+            }
+            crate::parser::Stmt::Delete { table, where_ } => {
+                // A DELETE with no WHERE plans to no lines at all -- the module
+                // treats it as a truncate -- so the planner's own `no such
+                // table` never runs and the target has to be looked up here.
+                // With a WHERE the planner would have raised it, and looking it
+                // up anyway is the same answer from the same place.
+                let target = self.dml_sources(table)?;
+                if let Some(w) = where_ {
+                    self.check_dml_expression(table, &target, w)?;
+                }
+            }
+            crate::parser::Stmt::Insert {
+                table,
+                columns,
+                source,
+            } => {
+                let target = self.dml_sources(table)?;
+                if let crate::parser::InsertSource::Values(rows) = source {
+                    if let Some(names) = columns {
+                        for n in names {
+                            if target[0].table.column_index(n).is_none() {
+                                return Err(unknown_column(table, n));
+                            }
+                        }
+                    }
+                    for row in rows {
+                        for expr in row {
+                            self.check_dml_expression(table, &target, expr)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        crate::explain::execute(e, &self.catalog)
+    }
+
+    /// The one source a DML statement's target is, or `no such table`.
+    ///
+    /// The question and the wording are `join::sources_from`'s, because that is
+    /// where the bare statement asks it too -- the target of an `UPDATE` and
+    /// the FROM of a `SELECT` are the same lookup, and two spellings of
+    /// `no such table` is how they would come to differ.
+    ///
+    /// The plan path catches a missing table for a statement that has a WHERE,
+    /// because the planner reads its own FROM. This catches the half that has
+    /// none: `UPDATE nosuch SET a=1` and `INSERT INTO nosuch VALUES(1)`, both
+    /// of which the real engine refuses (measured).
+    fn dml_sources(&self, name: &str) -> Result<Vec<crate::join::Source>> {
+        crate::join::sources_from(
+            &self.queryable_tables(),
+            &[crate::parser::FromItem::Table(crate::parser::TableRef {
+                name: name.to_string(),
+                alias: None,
+                join: None,
+                on: None,
+                using: Vec::new(),
+                natural: false,
+                indexed_by: None,
+            })],
+        )
+    }
+
+    /// Resolves one expression of a DML statement against its table.
+    ///
+    /// `resolve` exposes its walk for a `Select` and for nothing smaller, so
+    /// the expression is handed to it as a `Select` with no projection, no
+    /// GROUP BY and no clauses other than the one WHERE carrying it. That is
+    /// the narrowest shape the walk takes, and it is the right one: a WHERE is
+    /// resolved against the FROM alone, which is exactly what a DML expression
+    /// is resolved against, with no result alias in sight to stand in for a
+    /// name.
+    fn check_dml_expression(
+        &self,
+        table_name: &str,
+        target: &[crate::join::Source],
+        expr: &crate::parser::Expr,
+    ) -> Result<()> {
+        let from = crate::join::resolve(target.to_vec())?;
+        let sel = crate::parser::Select {
+            with: Vec::new(),
+            body: crate::parser::SelectBody::Simple {
+                distinct: false,
+                columns: Vec::new(),
+                from: vec![crate::parser::FromItem::Table(crate::parser::TableRef {
+                    name: table_name.to_string(),
+                    alias: None,
+                    join: None,
+                    on: None,
+                    using: Vec::new(),
+                    natural: false,
+                    indexed_by: None,
+                })],
+                where_: Some(expr.clone()),
+                group_by: Vec::new(),
+                having: None,
+                values: None,
+            },
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        crate::resolve::check_statement(&from, &sel)?;
+        Ok(())
+    }
+
+    /// The error a wrapped SELECT gets for a shape the executor cannot run.
+    /// Taken from `select` rather than written out here, because the two must
+    /// not drift: this is the same refusal the bare statement raises, so a
+    /// query this engine cannot run cannot be planned either, and the reason it
+    /// is spelled once is that spelling it twice is how the two answers come to
+    /// differ. A CTE is tested first, because `select` tests it first too.
+    fn unrunnable_select(&self, sel: &crate::parser::Select) -> Error {
+        if !sel.with.is_empty() {
+            return Error::new(
+                ResultCode::Error,
+                "common table expressions are not supported yet",
+            );
+        }
+        Error::new(ResultCode::Error, "a subquery in FROM is not supported yet")
     }
 
     // --- SELECT ---------------------------------------------------------
@@ -1301,12 +1618,11 @@ impl Connection {
         // with one the shorter "misuse of aggregate: count()".
         if let Some(pred) = where_ {
             if let Some(agg) = crate::grouping::first_aggregate(pred) {
-                let message = if plan.has_aggregate() {
-                    format!("misuse of aggregate: {}()", agg.name)
+                return Err(if plan.has_aggregate() {
+                    msg::misuse_of_aggregate(&agg.name)
                 } else {
-                    format!("misuse of aggregate function {}()", agg.name)
-                };
-                return Err(Error::new(ResultCode::Error, message));
+                    msg::misuse_of_aggregate_function(&agg.name)
+                });
             }
         }
         let mut surviving: Vec<crate::grouping::Row> = Vec::with_capacity(rows.len());
@@ -1495,9 +1811,9 @@ impl Connection {
         let targets: Vec<(usize, &Expr)> = {
             let mut v = Vec::with_capacity(sets.len());
             for (name, expr) in sets {
-                let idx = table.column_index(name).ok_or_else(|| {
-                    Error::new(ResultCode::Error, format!("no such column: {name}"))
-                })?;
+                let idx = table
+                    .column_index(name)
+                    .ok_or_else(|| msg::no_such_column(name))?;
                 v.push((idx, expr));
             }
             v
@@ -1621,6 +1937,26 @@ impl Connection {
 
 fn is_star(e: &Expr) -> bool {
     matches!(e, Expr::Function { name, star: true, .. } if name == "*")
+}
+
+/// `table t has no column named c`, for a name in a DML statement's target.
+///
+/// A free function rather than a method because three places want it and none
+/// of them is a property of a connection: the `INSERT` path builds its target
+/// positions and refuses here, the `EXPLAIN` dispatch refuses a plan for an
+/// `INSERT` whose column list names a column that is not there, and a
+/// connection would have to be constructed to say so.
+///
+/// The wording is SQLite's, measured on 3.53.4, and it differs from the one an
+/// *expression* gets for the same name: `INSERT INTO t1(nosuchcol) VALUES(1)`
+/// is `table t1 has no column named nosuchcol` while `INSERT INTO t1
+/// VALUES(nosuchcol)` is `no such column: nosuchcol`. A column list is a list
+/// of columns; a values list is expressions.
+fn unknown_column(table: &str, column: &str) -> Error {
+    Error::new(
+        ResultCode::Error,
+        format!("table {table} has no column named {column}"),
+    )
 }
 
 /// The name SQLite gives a result column with no alias, which is the text of

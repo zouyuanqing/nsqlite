@@ -18,6 +18,7 @@
 //! levels of nesting will exhaust a default-sized thread stack.
 
 use crate::error::{Error, Result};
+use crate::msg;
 use crate::tokenizer::{Keyword, Punct, Span, Token, Tokenizer};
 use crate::value::Value;
 
@@ -362,6 +363,15 @@ pub enum Stmt {
     /// and no query planner that consults them, so running it changes nothing
     /// that a query can observe.
     Analyze,
+    /// `EXPLAIN <stmt>` and `EXPLAIN QUERY PLAN <stmt>`.
+    ///
+    /// The two are one keyword and two different statements: the first is the
+    /// opcode listing of a virtual machine this engine does not have, the
+    /// second is an access plan it does. The plan for what is wrapped is
+    /// [`explain::Explain`], which holds the parsed inner statement rather
+    /// than its text, so a syntax error inside it surfaces the way the bare
+    /// statement's would.
+    Explain(Box<crate::explain::Explain>),
 }
 
 /// Where an INSERT takes its rows from.
@@ -380,10 +390,7 @@ pub fn parse_script(sql: &str) -> Result<Vec<Stmt>> {
         out.push(p.statement()?);
         if p.pos == before {
             // A statement that consumed nothing would spin the loop for ever.
-            return Err(Error::new(
-                crate::error::ResultCode::Error,
-                format!("near \"{}\": syntax error", p.text_at(p.span())),
-            ));
+            return Err(msg::syntax_error(&p.text_at(p.span())));
         }
         // A stray semicolon between statements is fine; a missing one is not.
         while p.eat_punct(Punct::Semicolon)? {}
@@ -522,21 +529,32 @@ impl<'a> Parser<'a> {
 
     /// SQLite's wording for a token it cannot use here.
     fn unexpected(&self, context: &str) -> Error {
-        let found = match self.peek() {
-            Some(Token::Identifier(n)) => n.clone(),
-            Some(Token::Keyword(k)) => k.as_str().to_string(),
-            Some(Token::String(s)) => format!("'{s}'"),
-            Some(Token::Integer(i)) => i.to_string(),
-            Some(Token::Float(v)) => v.to_string(),
-            Some(Token::Blob(b)) => format!("x'{}'", hex(b)),
-            Some(Token::Punct(_)) => "punctuation".to_string(),
-            Some(Token::Parameter { .. }) => "?".to_string(),
-            None => "end of input".to_string(),
-        };
+        let found = self.describe_token_here();
         Error::new(
             crate::error::ResultCode::Error,
             format!("near \"{found}\": syntax error while {context}"),
         )
+    }
+
+    /// What sqlite3 would name as the token it choked on at the current
+    /// position.
+    ///
+    /// This is the same shape [`describe_token`] gives for a token already in
+    /// hand, and it exists so both sites take the spelling the *statement*
+    /// wrote rather than the token's folded form. `describe_token` on its own
+    /// cannot: it is given a `Token`, and by the time a name is a `Token` the
+    /// tokenizer has already folded it -- so `SELECT FROM t` came out
+    /// `near "from"` where sqlite3 says `near "FROM"`. `unexpected` is only
+    /// this engine's own "while <clause>" wording rather than sqlite3's bare
+    /// `near "X": syntax error`, so it stays inline; the catalogue gets the
+    /// sites whose text does match.
+    fn describe_token_here(&self) -> String {
+        match self.peek() {
+            Some(Token::Identifier(_)) | Some(Token::Keyword(_)) => {
+                self.written_name(self.pos).unwrap_or_else(|| "end of input".to_string())
+            }
+            other => other.map_or_else(|| "end of input".to_string(), describe_token),
+        }
     }
 
     /// Reads an identifier, accepting any keyword, which SQLite allows wherever
@@ -593,14 +611,51 @@ impl<'a> Parser<'a> {
     /// against the schema. Only a token that cannot be a name at all is an
     /// error here.
     fn name(&mut self, context: &str) -> Result<String> {
+        let start = self.pos;
         match self.advance() {
-            Some(Token::Identifier(n)) => Ok(n),
-            Some(Token::Keyword(k)) => Ok(k.as_str().to_string()),
+            Some(Token::Identifier(n)) => Ok(self.written_name(start).unwrap_or(n)),
+            Some(Token::Keyword(k)) => Ok(self
+                .written_name(start)
+                .unwrap_or_else(|| k.as_str().to_string())),
             _ => {
                 self.pos = self.pos.saturating_sub(1);
                 Err(self.unexpected(context))
             }
         }
+    }
+
+    /// The spelling of the token at `pos` as the statement wrote it, with any
+    /// quoting removed, or `None` when the span is not usable text.
+    ///
+    /// A name is a *name* whichever case it was written in, so the token alone
+    /// cannot say which spelling a message should echo: the tokenizer folds
+    /// every unquoted identifier to lower case, and the schema keys off that
+    /// fold, so a `Table` keyed by the spelling would go unfindable. The
+    /// folding is what lookup wants and is the wrong answer for a message.
+    ///
+    /// sqlite3 resolves the two the same way this does -- by comparing the
+    /// folded forms, and by echoing the source text when it has to name
+    /// something. `SELECT * FROM Foo` is `no such table: Foo` even though the
+    /// token the parser built is `foo`; `SELECT * FROM FOO` is
+    /// `no such table: FOO`. A quoted name is already spelled as written, and
+    /// its span covers the quotes, so the quotes are stripped here:
+    /// `SELECT * FROM "Foo"` is also `no such table: Foo`.
+    ///
+    /// This is the same rule [`Parser::after_identifier`] already had to
+    /// follow for a function call, lifted to every name the grammar reads.
+    /// Getting the spelling at the point the name is read is what makes the
+    /// message catalogue's case rule -- query-sourced names keep the case the
+    /// statement wrote -- true of the whole engine rather than of one family.
+    pub fn written_name(&self, pos: usize) -> Option<String> {
+        let (_, span) = self.tokens.get(pos)?;
+        self.sql.get(span.start..span.end).map(|w| {
+            let w = w.trim();
+            w.strip_prefix(['"', '`'])
+                .and_then(|w| w.strip_suffix(['"', '`']))
+                .or_else(|| w.strip_prefix('[').and_then(|w| w.strip_suffix(']')))
+                .unwrap_or(w)
+                .to_string()
+        })
     }
 
     /// Consumes an identifier whose text is exactly `word`, case-insensitively.
@@ -644,6 +699,7 @@ impl<'a> Parser<'a> {
     /// Parses one statement.
     fn statement(&mut self) -> Result<Stmt> {
         match self.peek() {
+            Some(Token::Keyword(Keyword::Explain)) => self.explain(),
             Some(Token::Keyword(Keyword::Select)) | Some(Token::Keyword(Keyword::With)) => {
                 Ok(Stmt::Select(self.select()?))
             }
@@ -727,12 +783,40 @@ impl<'a> Parser<'a> {
             _ => {
                 let span = self.span();
                 self.advance();
-                Err(Error::new(
-                    crate::error::ResultCode::Error,
-                    format!("near \"{}\": syntax error", self.text_at(span)),
-                ))
+                Err(msg::syntax_error(&self.text_at(span)))
             }
         }
+    }
+
+    /// `EXPLAIN <stmt>`, and the `EXPLAIN QUERY PLAN <stmt>` spelling.
+    ///
+    /// The explain module owns this grammar, for the same reason the pragma
+    /// module owns its own: the two words are optional and in a fixed order,
+    /// and the thing that follows is a whole statement rather than a piece of
+    /// this expression grammar. It re-parses the text, so it gets this
+    /// statement's slice and not the whole script, exactly as the pragma arm
+    /// does.
+    ///
+    /// The slice runs from just past the keyword to the statement's own
+    /// terminator, terminator included, and the module is written to take the
+    /// text from *after* `EXPLAIN` -- that is what lets it look for a leading
+    /// `QUERY PLAN`. Including the semicolon is not a detail: it is a token,
+    /// and a lone `;` is `near ";": syntax error`, which is where the real
+    /// engine stops on `EXPLAIN;`.
+    fn explain(&mut self) -> Result<Stmt> {
+        let from = self.span().end;
+        self.advance();
+        let to = self.statement_end();
+        let text = self.sql.get(from..to).unwrap_or("").to_string();
+        let stmt = crate::explain::parse(&text)?;
+        // The tokens for this statement still have to be consumed, or the
+        // script loop would see the same EXPLAIN for ever. `<=` and not `<`:
+        // the slice ends *at* the semicolon, so the terminator is one of the
+        // tokens that has to go.
+        while self.pos < self.tokens.len() && self.tokens[self.pos].1.start <= to {
+            self.pos += 1;
+        }
+        Ok(Stmt::Explain(Box::new(stmt)))
     }
 
     /// The source text a span covers, for error messages.
@@ -1666,21 +1750,17 @@ impl<'a> Parser<'a> {
             // covers the quotes, so the quotes are trimmed here -- sqlite3
             // answers `SELECT "AbC"(1)` with `no such function: AbC`, without
             // them.
-            let written = self.sql.get(span.start..span.end).map(|w| {
-                let w = w.trim();
-                w.strip_prefix(['"', '`'])
-                    .and_then(|w| w.strip_suffix(['"', '`']))
-                    .or_else(|| w.strip_prefix('[').and_then(|w| w.strip_suffix(']')))
-                    .unwrap_or(w)
-                    .to_string()
-            });
-            let name = written.unwrap_or(name);
+            let name = self.written_name(self.pos - 1).unwrap_or(name);
             return self.function_call(name, span);
         }
         // A qualified column is `table.column` or `schema.table.column`.
         if self.at_punct(Punct::Dot) {
+            // The identifier this function was handed has already been
+            // consumed, so the qualifier is the *last* token read rather than
+            // the one after it. `name` is the folded token spelling, which is
+            // what a lookup wants and the wrong thing to echo.
+            let mut qualifier = self.written_name(self.pos - 1).unwrap_or(name);
             self.advance();
-            let mut qualifier = name;
             if self.eat_punct(Punct::Star)? {
                 return Ok(Expr::Function {
                     name: format!("{qualifier}.*"),
@@ -1691,12 +1771,20 @@ impl<'a> Parser<'a> {
             }
             let column = self.name("after a column qualifier")?;
             if self.at_punct(Punct::Dot) {
+                // The name read so far is the *column*, not the table, so a
+                // third part is the table and the part already in hand has to
+                // move to the end. `SELECT main.Foo.x` names the column `x` of
+                // table `Foo` in schema `main`, and this used to read it as
+                // the table `main.Foo` and the column `x`.
                 self.advance();
-                let next = self.name("after a schema qualifier")?;
-                qualifier = format!("{qualifier}.{next}");
+                let table = self.name("after a schema qualifier")?;
+                // `schema.table.column`, and the order is schema, table,
+                // column: `main.T.x` is the column `x` of table `T`. The
+                // name read above as the "column" is the table, so the two
+                // have to be put back the other way round.
                 return Ok(Expr::Column {
-                    table: Some(qualifier),
-                    name: column,
+                    table: Some(format!("{qualifier}.{column}")),
+                    name: table,
                     span,
                 });
             }
@@ -1762,10 +1850,7 @@ impl<'a> Parser<'a> {
                 // expression grammar still to come.
                 self.after_identifier(kw.as_str().to_string(), span)
             }
-            _ => Err(Error::new(
-                crate::error::ResultCode::Error,
-                format!("near \"{}\": syntax error", kw.as_str()),
-            )),
+            _ => Err(msg::syntax_error(kw.as_str())),
         }
     }
 
@@ -1784,10 +1869,11 @@ impl<'a> Parser<'a> {
             whens.push((cond, result));
         }
         if whens.is_empty() {
-            return Err(Error::new(
-                crate::error::ResultCode::Error,
-                "near \"end\": syntax error: CASE requires at least one WHEN",
-            ));
+            // sqlite3 stops at the token after the last WHEN, not at the word
+            // `end`: `SELECT CASE END;` is `near ";": syntax error`. The
+            // clause this used to raise is not a format string in the binary
+            // at all, so there is no text to match it against.
+            return Err(msg::syntax_error(&self.describe_token_here()));
         }
         let otherwise = if self.eat_keyword(Keyword::Else)? {
             Some(Box::new(self.expr()?))
@@ -2473,12 +2559,13 @@ impl<'a> Parser<'a> {
     }
 
     fn create_index(&mut self) -> Result<Stmt> {
-        // The statement's own text starts at CREATE, which is the token before
-        // the one the caller consumed.
-        let start = self
-            .tokens
-            .get(self.pos.saturating_sub(1))
-            .map(|(_, s)| s.start);
+        // The statement's own text starts at CREATE. By the time this runs the
+        // cursor has moved past CREATE and possibly past UNIQUE and INDEX, so
+        // the keyword is looked for backwards from where the cursor is.
+        let start = self.tokens[..self.pos]
+            .iter()
+            .rposition(|(t, _)| matches!(t, Token::Keyword(Keyword::Create)))
+            .map(|i| self.tokens[i].1.start);
         let unique = self.eat_keyword(Keyword::Unique)?;
         self.expect_keyword(Keyword::Index, "after CREATE")?;
         let if_not_exists = self.if_not_exists()?;
@@ -2524,7 +2611,19 @@ impl<'a> Parser<'a> {
         // rebuilds the index from, so it is the original statement rather than
         // a reconstruction of the parsed form.
         let sql = match start {
-            Some(a) => crate::index_ddl::sql_for_statement(&self.sql[a..]).unwrap_or_default(),
+            // Only this statement's text. The script is tokenised up front and
+            // the cursor is already past the statement, so the end is where the
+            // last token of the statement ended rather than where the next one
+            // starts.
+            Some(a) => {
+                let to = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|(_, s)| s.end)
+                    .unwrap_or(a);
+                let text = self.sql.get(a..to.max(a)).unwrap_or_default();
+                crate::index_ddl::sql_for_statement(text).unwrap_or_default()
+            }
             None => String::new(),
         };
         Ok(Stmt::CreateIndex {

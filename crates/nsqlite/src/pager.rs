@@ -127,6 +127,10 @@ impl Pager {
             }
             pager
         };
+        // The path is recorded on both branches. A fresh database used to skip
+        // it, so `path` stayed None and BEGIN refused to open a journal, which
+        // made every transaction on a newly created database fail.
+        pager.path = Some(path.to_owned());
         if !fresh {
             pager.replay_hot_journal()?;
         }

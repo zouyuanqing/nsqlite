@@ -20,48 +20,50 @@
 //!
 //! # Case: where a name comes from decides whether it keeps its case
 //!
-//! This is the whole point of the module, and the rule is *not* uniform. SQLite
-//! folds an unquoted identifier to lower case while **parsing** it, and then
-//! echoes a name into an error message from one of two very different places.
-//! Which place decides the case, and the two disagree:
+//! This is the whole point of the module, and the rule is *not* uniform.
 //!
-//! * A **name-resolution** message echoes the spelling the *query* used, and
-//!   that spelling has its case preserved. These are the messages the parser
-//!   and the name resolver raise directly against the token stream.
-//! * A **constraint** message echoes the spelling the *schema* holds, which
-//!   was fixed when the table was created, and the query is not consulted at
-//!   all.
-//!
-//! So the rule that matters is not "keep the case" but "keep the case of
-//! *this* name, and that depends on whether it came from the query or from the
-//! schema". Both halves were confirmed against sqlite3 3.53.4:
+//! The first half of the rule was measured, not reasoned. An unquoted
+//! identifier **is** folded to lower case while it is parsed, and it stays
+//! folded in the token -- the engine's own tokenizer does the folding, in
+//! `scan_identifier`. But a message does not echo the *token*; it echoes the
+//! **source text the token was written as**, with the quoting removed. Those
+//! are two different things, and the oracle keeps them apart:
 //!
 //! ```text
-//! name resolution -- the QUERY spelling, case kept
-//!   SELECT * FROM Foo;      ->  no such table: Foo
-//!   SELECT XYZZY(1);        ->  no such function: XYZZY
-//!   SELECT ABS(1,2);        ->  wrong number of arguments to function ABS()
-//!   SELECT 1 WHERE COUNT(a) FROM t;
-//!                           ->  misuse of aggregate function COUNT()
+//! SELECT * FROM Foo;      ->  no such table: Foo
+//! SELECT XYZZY(1);        ->  no such function: XYZZY
+//! SELECT ABS(1,2);        ->  wrong number of arguments to function ABS()
+//! SELECT * FROM "Foo";    ->  no such table: Foo
+//! SELECT * FROM [Foo];    ->  no such table: Foo
+//! SELECT * FROM `Foo`;    ->  no such table: Foo
+//! ```
 //!
-//! constraints -- the SCHEMA spelling, query ignored
-//!   CREATE TABLE Tbl(a,Bb NOT NULL); INSERT INTO tbl VALUES(1,NULL);
+//! So an unquoted name is **not** folded in the message either, and the
+//! engine's rule is a single one: **every query-sourced name is the spelling
+//! the statement wrote.** The parser recovers that spelling by span -- see
+//! `parser::written_name` -- rather than reading it back off the folded token,
+//! which is what `after_identifier` already had to do for a function call.
+//! That is the whole of the gap the roadmap called out: the message never had
+//! a case rule to get wrong, the *caller* did not have the spelling.
+//!
+//! The second half of the rule is the one that looks like an exception and is
+//! not. A **constraint** message echoes the spelling the *schema* holds, which
+//! was fixed when the table was created, and the query is not consulted at
+//! all:
+//!
+//! ```text
+//! CREATE TABLE Tbl(a,Bb NOT NULL); INSERT INTO tbl VALUES(1,NULL);
 //!                           ->  NOT NULL constraint failed: Tbl.Bb
-//!   CREATE TABLE tbl(a,bb NOT NULL); INSERT INTO TBL VALUES(1,NULL);
+//! CREATE TABLE tbl(a,bb NOT NULL); INSERT INTO TBL VALUES(1,NULL);
 //!                           ->  NOT NULL constraint failed: tbl.bb
 //! ```
 //!
-//! Note the second pair: the query spelled the table `TBL` and the message
-//! still said `tbl`, because the schema says `tbl`. That is the exact
-//! inversion of the first pair, and it is the reason this rule is stated as
-//! "where did the name come from" rather than "keep the case".
-//!
 //! The two mechanisms in SQLite's own source line up with the two behaviours.
 //! Name-resolution messages use `%#T` (or `%T`), SQLite's conversion for a
-//! *token* that reproduces the original spelling; constraint messages use
-//! `%s` against the table and column names held in the schema. So the engine's
-//! rule is the same rule SQLite follows, and a call site picks the right
-//! behaviour by which constructor it reaches for.
+//! *token* that reproduces the original spelling; constraint messages use `%s`
+//! against the table and column names held in the schema. So the engine's rule
+//! is the same rule SQLite follows, and a call site picks the right behaviour
+//! by which constructor it reaches for.
 //!
 //! # Which names are schema-sourced and which are query-sourced
 //!
@@ -93,23 +95,36 @@
 //! | `table T has N columns but M values...`     | query (case kept)             |
 //! | `Nth ORDER BY / GROUP BY term out of range` | a count, not a name      |
 //! | `sub-select returns N columns`              | a count, not a name           |
+//! | `SELECTs ... left and right of OP ...`      | an operator, not a name       |
 //! | `datatype mismatch`                         | names nothing at all          |
 //!
-//! Two rows deserve their own note, because they are the ones a uniform rule
+//! Three rows deserve their own note, because they are the ones a uniform rule
 //! gets wrong -- and they fall on opposite sides of the line, which is why the
 //! line has to be drawn per message rather than per family:
 //!
 //! * `ambiguous column name: main.T.C` is schema-sourced: with
 //!   `CREATE TABLE T(a)` and `SELECT * FROM T, T` the message says
-//!   `main.T.a`, with the `T` the schema holds.
+//!   `main.T.a`, with the `T` the schema holds. With `CREATE TABLE MiXeD(a)`
+//!   and `SELECT * FROM MiXeD, mixed` it says `main.MiXeD.a` -- and note
+//!   that even when the statement spells the table in a *different* case from
+//!   the schema (`SELECT * FROM t, t` against a schema of `T`), the schema
+//!   spelling is what comes back. Two rows agreeing on the alias still
+//!   disambiguate, because the resolver matched them.
 //! * `table T has no column named C` sits right next to it in the DML family
 //!   and is query-sourced: with `CREATE TABLE MiXeD(A)` and
 //!   `INSERT INTO MIXED(zz) VALUES(1)` the message says
 //!   `table MIXED has no column named zz`.
+//! * `no such table: N` under a schema qualifier echoes *both* halves as
+//!   written, and the two disagree about which is which. `DROP TABLE xyz.i`
+//!   says `no such table: xyz.i` -- bare, unqualified, and echoing the
+//!   query. `CREATE INDEX i ON Foo(a)` says `no such table: main.Foo` --
+//!   qualified, and naming the schema the index was made in. The first goes
+//!   through the index DDL's own lookup and the second through the FROM
+//!   clause's, and neither consults the schema for a name.
 //!
-//! No message mixes the two. Every one of them is wholly query-sourced or
-//! wholly schema-sourced, which is what lets [`Msg::case_rule`] answer with a
-//! list of the same length for all of them.
+//! No message mixes the two sources. Every one of them is wholly query-sourced
+//! or wholly schema-sourced, which is what lets [`Msg::case_rule`] answer with
+//! a list of the same length for all of them.
 //!
 //! # Nothing the engine chose is a name
 //!
@@ -553,15 +568,30 @@ impl Msg {
     /// lowercases anything: it hands each name the spelling SQLite would use
     /// and this function records *which* spelling that is, so the distinction
     /// that matters lives in one place.
+    ///
+    /// The list is one entry per **name** hole and nothing else. Three of the
+    /// messages below take an operator rather than a name -- the compound-SELECT
+    /// operator, the `Nth ORDER BY` ordinal, the `Nth GROUP BY` ordinal -- and
+    /// a fourth takes a schema qualifier that is neither query nor schema in
+    /// origin but a *literal*: `main` is a keyword, so no query may spell it
+    /// any other way. They are grouped with the no-names block for that
+    /// reason, and `every_case_rule_entry_is_a_name_hole` keeps the list and
+    /// the render arms agreeing about which is which.
     pub const fn case_rule(self) -> &'static [CaseRule] {
         use CaseRule::{Query, Schema};
         match self {
-            // Query-sourced: the name came out of the statement.
+            // Query-sourced: the name came out of the statement, spelled the
+            // way the statement wrote it.
+            //
+            // Two of these take more than one name, and the counts below are
+            // the number of *name* holes each of them has -- not the number of
+            // messages in the block. `NoSuchTableSchemaQualified` has two,
+            // `NoSuchColumnQualified` two, `NoSuchColumnSchemaQualified` three,
+            // `NoSuchColumnForTable` two, `ColumnCountMismatch` one (the other
+            // two holes are counts), `AmbiguousColumnStar` three, and
+            // `CompoundColumnCount` none.
             Msg::NoSuchTable
-            | Msg::NoSuchTableSchemaQualified
             | Msg::NoSuchColumn
-            | Msg::NoSuchColumnQualified
-            | Msg::NoSuchColumnSchemaQualified
             | Msg::NoSuchColumnDoubleQuoted
             | Msg::AmbiguousColumn
             | Msg::NoSuchFunction
@@ -580,23 +610,34 @@ impl Msg {
             | Msg::ColumnCountMismatch
             | Msg::SyntaxError
             | Msg::UnrecognizedToken
-            | Msg::CompoundColumnCount => &[
+            | Msg::NoSuchTableSchemaQualified
+            | Msg::NoSuchColumnQualified
+            | Msg::NoSuchColumnSchemaQualified => &[
                 Query, Query, Query, Query, Query, Query, Query, Query, Query, Query, Query, Query,
                 Query, Query, Query, Query, Query, Query, Query, Query, Query, Query, Query, Query,
+                Query, Query, Query,
             ],
 
             // Schema-sourced: the name came out of the schema, fixed when the
             // table was created. A statement spelling it differently changes
             // nothing. This is the block a uniform "always keep the case" rule
             // gets wrong, and the one docs/testing.md 5.3 item 9 turns on.
+            //
+            // Three of the six take a single name and three take two, so the
+            // list holds nine entries: one each for `UniqueConstraintRowid`,
+            // `CheckConstraint` and `ForeignKeyMismatch`, and two each for
+            // `NotNullConstraint`, `UniqueConstraint` and `AmbiguousColumnStar`.
             Msg::NotNullConstraint
             | Msg::UniqueConstraint
             | Msg::UniqueConstraintRowid
             | Msg::CheckConstraint
             | Msg::ForeignKeyMismatch
-            | Msg::AmbiguousColumnStar => &[Schema, Schema],
+            | Msg::AmbiguousColumnStar => &[
+                Schema, Schema, Schema, Schema, Schema, Schema, Schema, Schema, Schema,
+            ],
 
-            // No names: a fixed phrase, or nothing but counts.
+            // No names: a fixed phrase, nothing but counts, or a hole that is
+            // neither -- an operator, or the literal schema name `main`.
             Msg::ForeignKeyConstraint
             | Msg::DatatypeMismatch
             | Msg::AggregateNotAllowedInGroupBy
@@ -604,6 +645,7 @@ impl Msg {
             | Msg::IntegerOverflow
             | Msg::TooManyCompoundTerms
             | Msg::IncompleteInput
+            | Msg::CompoundColumnCount
             | Msg::OrderByTermOutOfRange
             | Msg::GroupByTermOutOfRange
             | Msg::SubSelectColumnCount
@@ -947,6 +989,22 @@ pub fn no_such_collation(name: &str) -> Error {
     Msg::NoSuchCollation.error(&[name.into()])
 }
 
+/// A `table t has no column named c` error, both names as the statement wrote
+/// them.
+pub fn no_such_column_for_table(table: &str, column: &str) -> Error {
+    Msg::NoSuchColumnForTable.error(&[table.into(), column.into()])
+}
+
+/// A `table t already exists` error, for the name as the statement wrote it.
+pub fn table_exists(name: &str) -> Error {
+    Msg::TableExists.error(&[name.into()])
+}
+
+/// An `index i already exists` error, for the name as the statement wrote it.
+pub fn index_exists(name: &str) -> Error {
+    Msg::IndexExists.error(&[name.into()])
+}
+
 /// A `no such index: i` error, for the name as written in the query.
 pub fn no_such_index(name: &str) -> Error {
     Msg::NoSuchIndex.error(&[name.into()])
@@ -1229,6 +1287,19 @@ mod tests {
         c(Msg::NoSuchTable, vec![name("main.ab")], "SELECT * FROM main.ab;", "no such table: main.ab"),
         c(Msg::NoSuchTable, vec![name("Main.NOSUCH")], "SELECT * FROM Main.NOSUCH;", "no such table: Main.NOSUCH"),
         c(Msg::NoSuchTable, vec![name("xyzzy")], "SELECT * FROM xyzzy;", "no such table: xyzzy"),
+        // The unquoted spelling is the one the message echoes. This is the row
+        // the roadmap called out: a function name keeps its case, and so does
+        // a table name -- neither is folded, and the rows above with a
+        // lower-case spelling are the counter-examples, not the rule.
+        c(Msg::NoSuchTable, vec![name("XYZZY")], "SELECT * FROM XYZZY;", "no such table: XYZZY"),
+        c(Msg::NoSuchTable, vec![name("XyZzY")], "SELECT * FROM XyZzY;", "no such table: XyZzY"),
+        c(Msg::NoSuchTable, vec![name("MiXeD")], "SELECT * FROM MiXeD;", "no such table: MiXeD"),
+        c(Msg::NoSuchTable, vec![name("MiXeD")], "DELETE FROM MiXeD;", "no such table: MiXeD"),
+        c(Msg::NoSuchTable, vec![name("MiXeD")], "UPDATE MiXeD SET a=1;", "no such table: MiXeD"),
+        c(Msg::NoSuchTable, vec![name("MiXeD")], "INSERT INTO MiXeD VALUES(1);", "no such table: MiXeD"),
+        c(Msg::NoSuchTable, vec![name("MiXeD")], "DROP TABLE MiXeD;", "no such table: MiXeD"),
+        c(Msg::NoSuchTable, vec![name("MiXeD")], "ALTER TABLE MiXeD RENAME TO Other;", "no such table: MiXeD"),
+        c(Msg::NoSuchTable, vec![name("Main.NOSUCH")], "SELECT * FROM Main.NOSUCH;", "no such table: Main.NOSUCH"),
         // A bracketed or backticked name comes back bare, and `Foo` is its
         // first row's spelling too -- which is why this case exists: without
         // it, the quoted row would be a silent duplicate of the first.
@@ -1238,16 +1309,29 @@ mod tests {
         c(Msg::NoSuchTableSchemaQualified, vec![name("xyz"), name("i")], "DROP TABLE xyz.i;", "no such table: xyz.i"),
         c(Msg::NoSuchTableSchemaQualified, vec![name("xyz"), name("i")], "SELECT * FROM xyz.i;", "no such table: xyz.i"),
         c(Msg::NoSuchTableSchemaQualified, vec![name("main"), name("i")], "DROP TABLE main.i;", "no such table: main.i"),
+        // The same two names reach this message by two routes and the routes
+        // disagree about qualifying. The index DDL qualifies with the schema
+        // the index was to be made in; the table DDL echoes the name bare.
+        c(Msg::NoSuchTableSchemaQualified, vec![name("main"), name("MiXeD")], "CREATE INDEX i ON MiXeD(a);", "no such table: main.MiXeD"),
         c(Msg::NoSuchColumn, vec![name("nosuchcol")], "SELECT nosuchcol;", "no such column: nosuchcol"),
         c(Msg::NoSuchColumn, vec![name("NOSUCHCOL")], "SELECT NOSUCHCOL;", "no such column: NOSUCHCOL"),
         c(Msg::NoSuchColumn, vec![name("rowid_")], "SELECT rowid_;", "no such column: rowid_"),
         c(Msg::NoSuchColumn, vec![name("LEFT")], "SELECT [LEFT];", "no such column: LEFT"),
         c(Msg::NoSuchColumn, vec![name("XyZzY")], "SELECT XyZzY;", "no such column: XyZzY"),
+        c(Msg::NoSuchColumn, vec![name("MiXeD")], "SELECT MiXeD;", "no such column: MiXeD"),
+        c(Msg::NoSuchColumn, vec![name("nosuchcol")], "SELECT nosuchcol FROM (SELECT 1 AS x);", "no such column: nosuchcol"),
         c(Msg::NoSuchColumnQualified, vec![name("t"), name("NOSUCHCOL")], "CREATE TABLE t(a); SELECT t.NOSUCHCOL FROM t;", "no such column: t.NOSUCHCOL"),
         c(Msg::NoSuchColumnQualified, vec![name("alias"), name("b")], "CREATE TABLE t(a); SELECT alias.b FROM t alias;", "no such column: alias.b"),
+        // A qualified name echoes both halves the way the statement wrote
+        // them, and an alias spelled in a different case from the row it
+        // matched still comes back as the statement wrote it.
+        c(Msg::NoSuchColumnQualified, vec![name("t"), name("FoO")], "SELECT t.FoO FROM (SELECT 1 AS x) AS t;", "no such column: t.FoO"),
+        c(Msg::NoSuchColumnQualified, vec![name("T"), name("FoO")], "SELECT T.FoO FROM (SELECT 1 AS x) AS t;", "no such column: T.FoO"),
         c(Msg::NoSuchColumnSchemaQualified, vec![name("main"), name("docs"), name("x")], "SELECT main.docs.x;", "no such column: main.docs.x"),
         c(Msg::NoSuchColumnSchemaQualified, vec![name("Main"), name("T1"), name("nosuchcol")], "CREATE TABLE t1(a); SELECT Main.T1.nosuchcol FROM t1;", "no such column: Main.T1.nosuchcol"),
         c(Msg::NoSuchColumnSchemaQualified, vec![name("temp"), name("t"), name("a")], "CREATE TABLE t(a); SELECT temp.t.a FROM t;", "no such column: temp.t.a"),
+        c(Msg::NoSuchColumnSchemaQualified, vec![name("main"), name("t"), name("FoO")], "SELECT main.t.FoO FROM (SELECT 1 AS x) AS t;", "no such column: main.t.FoO"),
+        c(Msg::NoSuchColumnSchemaQualified, vec![name("main"), name("T"), name("FoO")], "SELECT main.T.FoO FROM (SELECT 1 AS x) AS t;", "no such column: main.T.FoO"),
         // SQLite's hint for a double-quoted string that resolved to nothing. The
         // hole is the token's text, and `Msg::render` puts the double quotes
         // around it, because the quotes are the reason for the hint.
@@ -1266,6 +1350,12 @@ mod tests {
         c(Msg::AmbiguousColumnStar, vec![name("main"), name("t"), name("a")], "CREATE TABLE t(a); SELECT * FROM t, t;", "ambiguous column name: main.t.a"),
         c(Msg::AmbiguousColumnStar, vec![name("main"), name("T"), name("a")], "CREATE TABLE T(a); SELECT * FROM T, T;", "ambiguous column name: main.T.a"),
         c(Msg::AmbiguousColumnStar, vec![name("main"), name("MiXeD"), name("a")], "CREATE TABLE MiXeD(a); SELECT * FROM MiXeD, mixed;", "ambiguous column name: main.MiXeD.a"),
+        // The schema spelling, not the query's: the statement below says `t`
+        // twice and the schema says `T`, and `T` is what comes back. This is
+        // the one name-resolution message the query does not decide, and it
+        // is on the schema side of the line for exactly that reason.
+        c(Msg::AmbiguousColumnStar, vec![name("main"), name("T"), name("a")], "CREATE TABLE T(a); SELECT * FROM t, t;", "ambiguous column name: main.T.a"),
+        c(Msg::AmbiguousColumnStar, vec![name("main"), name("t"), name("a")], "CREATE TABLE t(a); SELECT * FROM T, T;", "ambiguous column name: main.t.a"),
         c(Msg::NoSuchFunction, vec![name("XYZZY")], "SELECT XYZZY(1);", "no such function: XYZZY"),
         c(Msg::NoSuchFunction, vec![name("xyzzy")], "SELECT xyzzy(1);", "no such function: xyzzy"),
         c(Msg::NoSuchFunction, vec![name("XyZzY")], "SELECT XyZzY(1);", "no such function: XyZzY"),
@@ -1288,6 +1378,14 @@ mod tests {
         c(Msg::WrongArgumentCount, vec![name("coalesce")], "SELECT coalesce();", "wrong number of arguments to function coalesce()"),
         c(Msg::WrongArgumentCount, vec![name("group_concat")], "SELECT group_concat();", "wrong number of arguments to function group_concat()"),
         c(Msg::WrongArgumentCount, vec![name("ifnull")], "SELECT ifnull();", "wrong number of arguments to function ifnull()"),
+        // The misuse family: a function the engine does not have as an
+        // aggregate is named as the statement wrote it, which is the same
+        // rule the unknown-function message follows.
+        c(Msg::MisuseOfAggregateFunction, vec![name("Total")], "CREATE TABLE t(a); INSERT INTO t VALUES(1); SELECT 1 FROM t WHERE Total(a);", "misuse of aggregate function Total()"),
+        c(Msg::MisuseOfAggregateFunction, vec![name("Total")], "CREATE TABLE t(a); SELECT 1 FROM t WHERE Total(a);", "misuse of aggregate function Total()"),
+        c(Msg::MisuseOfAggregateFunction, vec![name("count")], "SELECT 1 WHERE count(1);", "misuse of aggregate function count()"),
+        c(Msg::MisuseOfAggregate, vec![name("COUNT")], "CREATE TABLE t(a); INSERT INTO t VALUES(1),(2),(3); SELECT COUNT(a) FROM t WHERE COUNT(a);", "misuse of aggregate: COUNT()"),
+        c(Msg::MisuseOfAggregate, vec![name("SUM")], "CREATE TABLE t(a); SELECT COUNT(a) FROM t WHERE SUM(a);", "misuse of aggregate: SUM()"),
         // --- constraints ---------------------------------------------------
         // The pair below is the heart of the case rule, so both directions are
         // quoted: the schema decides, and the query's spelling is ignored.
@@ -1495,6 +1593,12 @@ mod tests {
                 n156 = 156, n157 = 157, n158 = 158, n159 = 159,
                 n160 = 160, n161 = 161, n162 = 162, n163 = 163,
                 n164 = 164, n165 = 165, n166 = 166, n167 = 167,
+                n168 = 168, n169 = 169, n170 = 170, n171 = 171,
+                n172 = 172, n173 = 173, n174 = 174, n175 = 175,
+                n176 = 176, n177 = 177, n178 = 178, n179 = 179,
+                n180 = 180, n181 = 181, n182 = 182,
+                n183 = 183, n184 = 184, n185 = 185, n186 = 186,
+                n187 = 187, n188 = 188, n189 = 189, n190 = 190,
             }
         };
     }
@@ -1502,7 +1606,7 @@ mod tests {
     /// The number of rows [`build_cases`] builds, and the number of generated
     /// tests there are. They have to be equal: one test per row, each reaching
     /// its own row and no other.
-    const CASE_COUNT: usize = 168;
+    const CASE_COUNT: usize = 191;
 
     /// The case at `index`, or a panic that says the table and the index
     /// disagree.

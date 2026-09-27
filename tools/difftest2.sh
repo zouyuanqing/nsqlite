@@ -193,6 +193,29 @@ US=$'\x1f'
 NL=$'\n'
 TAB=$'\t'
 CR=$'\r'
+# The ROW separator of a framed result, and it is a different byte from US.
+#
+# The two transports used to frame a result the same way and that is what made
+# every multi-column comparison meaningless. `record_rows` joined FIELDS with US
+# and ROWS with a newline; `quote_rows` joined both with US. So a one-row
+# two-column result was
+#
+#     record_rows -> I3130<US>I34          (12 bytes)
+#     quote_rows  -> 10<US>21<US>          (14 bytes)
+#
+# and compare_rows does a plain string equality, so the two can agree ONLY when
+# a result has exactly one field and one row. Everything wider reported a
+# difference for every value -- and the reported row counts were pure noise,
+# because a result string of n fields and m rows holds n*m+1 separators and the
+# count was reported as that number, not as m.
+#
+# The record stream is LINE-oriented and its rows are already one per line, so
+# the smallest change is to give the quote side the same shape: a newline
+# between rows, no trailing separator, and US only between fields. Neither byte
+# can occur inside a value -- SQLite renders a control byte as
+# `unistr('\u001f')` in quote mode, and this engine's own token path hex-encodes
+# everything -- so the framing is unambiguous.
+RS=$'\n'
 
 SECTIONS=(); SEC_NAMES=()
 TOTAL=0; AGREE=0; DIFFS=0; STOP=0; CRASH=0
@@ -386,7 +409,7 @@ count_fields() {
     # -- a single NULL, the shape the old `|`-joined decoder could not represent
     # -- counted as zero.
     local s n i
-    s="$IN"
+    s="${1-$IN}"
     [ -z "$s" ] && { printf '0'; return 0; }
     n=1
     i=${#s}
@@ -412,8 +435,7 @@ show_fields() { printf '%s' "$1" | cat -v; }
 
 
 trim_pad() {
-    local s
-    s="$IN"
+    local s="${1-$IN}"
     while [ -n "$s" ] && [ "${s: -1}" = " " ]; do s="${s%?}"; done
     while [ -n "$s" ] && [ "${s: -1}" = "$TAB" ]; do s="${s%?}"; done
     printf '%s' "$s"
@@ -479,7 +501,8 @@ record_rows() {
     # a fallback comparison disagrees and the real differences drown in the
     # noise -- which is what the previous version's own comment warned about.
     local s line out tag
-    s="${IN//$CR/}"
+    s="${1-$IN}"
+    s="${s//$CR/}"
     while IFS= read -r line; do
         case "$line" in
             'R '*) ;;
@@ -496,13 +519,95 @@ record_rows() {
         printf '%s%s' "${out#$US}" "$NL"
     done <<< "$s"
 }
+
+# The same stream, with every field turned into the token the real engine's
+# `.mode quote` prints for the SAME value, so the two sides are in one
+# alphabet.
+#
+# This is the last of the three transports, and it is what the fallback path
+# needs. The record stream hex-encodes a text payload because a bash variable
+# cannot hold a NUL, and a token built by asking for quote() is itself TEXT, so
+# the token arrives hex-encoded:
+#
+#     $ nsqlited --testsuite :memory: "SELECT quote(7+3)"
+#     C 1 T71756F746528372B3329
+#     R T3130
+#
+# and the real engine prints '10' for the same value. Compared as they stand,
+# every TEXT value disagrees -- 145 of 219 statements in the corpus -- while the
+# underlying values are all correct. The tag is decoded and the class is put
+# back in the spelling the real engine uses:
+#
+#     -       -> NULL            the bare word, as .mode quote prints it
+#     T<hex>  -> '<text>'        with an embedded apostrophe doubled
+#     B<hex>  -> X'<HEX>'        as SQLite spells a blob, and uppercase
+#     I<hex>  -> <decimal>       hex of the DECIMAL TEXT
+#     F<hex>  -> <rendered>      hex of SQLite's own %!.15g rendering
+#
+# A NULL and the empty string stay apart -- `NULL` against `''` -- and a blob
+# stays apart from a text value of the same bytes, which is the whole reason the
+# comparison goes through quote() at all.
+record_tokens() {
+    local s line out tag hex i b c
+    s="${1-$IN}"
+    s="${s//$CR/}"
+    while IFS= read -r line; do
+        case "$line" in
+            'R '*) ;;
+            *)     continue ;;
+        esac
+        out=""
+        for tag in ${line#R }; do
+            case "$tag" in
+                -)
+                    tok='NULL' ;;
+                T*)
+                    hex="${tag#T}"
+                    [ -n "$hex" ] || { tok="''"; }
+                    if [ -n "$hex" ]; then
+                        b=""
+                        for ((i = 0; i < ${#hex}; i += 2)); do
+                            c="${hex:$i:2}"
+                            [ "$c" = "0a" ] && c="$NL"
+                            [ "$c" = "0d" ] && c="$CR"
+                            b+=$(printf "\\x$c")
+                        done
+                        b="${b//\'/\'\'}"
+                        tok="'$b'"
+                    fi ;;
+                B*)
+                    tok="X'$(printf '%s' "${tag#B}" | tr 'a-f' 'A-F')'" ;;
+                I*|F*)
+                    tok="$(hex_to_text "${tag:1}")" ;;
+                *)
+                    tok="$tag" ;;
+            esac
+            [ -n "$out" ] || out=""
+            if [ -z "$out" ]; then out="$tok"; else out="$out$US$tok"; fi
+        done
+        printf '%s%s' "$out" "$NL"
+    done <<< "$s"
+}
+
+# Decodes hex to text, using printf on one byte at a time so that a NUL is not
+# silently dropped the way a command substitution drops it.
+hex_to_text() {
+    local h="$1" i b out=""
+    [ -n "$h" ] || { printf ''; return 0; }
+    for ((i = 0; i < ${#h}; i += 2)); do
+        b="${h:$i:2}"
+        out+=$(printf "\\x$b")
+    done
+    printf '%s' "$out"
+}
 # The number of columns in a `C` record, which is the engine's own answer.
 # 0 when the stream carries no `C` record, which is what a refused statement
 # and a statement with no rows both look like -- the two are told apart by the
 # record stream's own dispatch, not by this number.
 ncols_record() {
     local s line
-    s="${IN//$CR/}"
+    s="${1-$IN}"
+    s="${s//$CR/}"
     while IFS= read -r line; do
         case "$line" in
             'C '*)
@@ -568,7 +673,7 @@ same_refusal() {
 
 
 quote_rows() {
-    local s line out="" cur="" f
+    local s line out="" f
     # A trailing newline is APPENDED rather than relied on from the input.
     # Command substitution removes trailing newlines from what it captures, so
     # the last line of a stream arrives without one and `read` returns false for
@@ -578,13 +683,10 @@ quote_rows() {
     # `${var//$CR}` on the input. That substitution also matches the newline and
     # joins every line of the stream into one, so the loop saw a single line and
     # the whole result came out three times over. Both were measured.
-    s="$(printf '%s' "$IN")${NL}"
+    s="$(printf '%s' "${1-$IN}")${NL}"
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%$CR}"
-        if [ -z "$(trim_pad "$line")" ]; then
-            [ -n "$cur" ] && { out+="$cur$US"; cur=""; }
-            continue
-        fi
+        [ -n "$(trim_pad "$line")" ] || continue
         # `.mode quote` reports a refusal on stdout, as `Error: near ...`, and
         # the caller's own pass has already compared the messages; the rows
         # below are the value.
@@ -598,7 +700,11 @@ quote_rows() {
         case "$(trim_pad "$f")" in
             NULL*) f='NULL' ;;
         esac
-        cur+="$f$US"
+        # US between fields, a NEWLINE between rows, and no trailing separator:
+        # the same shape record_rows produces, which is the only reason the two
+        # can be compared as strings at all. See the note on RS.
+        if [ -n "$out" ]; then out+="$RS"; fi
+        out+="$f"
     done <<< "$s"
     printf '%s' "$out"
 }
@@ -850,17 +956,133 @@ build_projection() {
     printf 'SELECT %s FROM (SELECT %s%s)' "$out" "$inner" "$RTAIL"
 }
 
+# The TOKEN form of the same statement: every output expression wrapped in
+# quote(), with NO derived table and NO alias.
+#
+# This exists because the projection above is a two-layer query, and this engine
+# refuses a subquery in FROM:
+#
+#     $ nsqlited --testsuite :memory: "SELECT quote(e1) FROM (SELECT 1 AS e1);"
+#     E a subquery in FROM is not supported yet
+#
+# so for every query that has a FROM clause the projection is unusable, and the
+# fallback -- the path the comment above it describes as "the token asked of the
+# ENGINE" -- was never actually built. It compared the real engine's quote-mode
+# rendering against this engine's RAW record tags, which are a different
+# alphabet: `10` against `I3130`. Measured on the first statement of the first
+# section of the corpus, where both engines compute the same five values:
+#
+#     sqlite3, .mode quote :  10|4|21|2|1
+#     nsqlited --testsuite  :  R I3130 I34 I3231 I32 I31
+#
+# 136 of 219 statements were reported as disagreements on that difference alone.
+# Those are not defects in the engine; they are the runner comparing two
+# notations. The rewrite below asks BOTH engines the same single-layer question,
+# so each returns a token in the same alphabet and the storage class is carried
+# by quote() on both sides.
+#
+# It keeps the DISTINCT on the OUTER query here, which is the one place the two
+# forms genuinely differ, and it is the correct choice for a fallback: the token
+# is what is being compared, so de-duplicating the tokens is what a client
+# reading this result sees. build_projection's inner form is the right one when
+# the VALUES are under test; here they are not.
+build_token_query() {
+    local sql rest lead out item expr alias tail i n
+    sql="$1"
+    case "${sql%% *}" in SELECT) ;; *) return 1 ;; esac
+    rest="${sql#SELECT }"
+    [ -n "$(trim "$rest")" ] || return 1
+    split_distinct "$rest"
+    lead="$DISTINCT_LEAD"
+    rest="$DISTINCT_REST"
+    find_result_list "$rest" || return 1
+    n=${#LIST[@]}
+    [ "$n" -ge 1 ] || return 1
+    out=""
+    for ((i = 0; i < n; i++)); do
+        item="$(trim "${LIST[$i]}")"
+        case "$item" in
+            '*') return 1 ;;
+        esac
+        # An item that is ALREADY a whole quote() call is left alone. The corpus
+        # asks for quote() itself in several places, and wrapping it again gives
+        # quote(quote(v)), which is a different value: measured, quote of the
+        # text '1' is the string '''1''' and the two engines would then be
+        # asked a different question than the corpus asked.
+        #
+        # The closing paren must be the LAST character of the item, not merely
+        # present somewhere in it. `quote(a) || b` also starts with `quote(` and
+        # also contains a `)`, and testing for the pair accepted it and produced
+        # `quote(quote(a) || b)`.
+        if [ "${item#quote(}" != "$item" ] && [ "${item%)}" = ')' ] \
+           && [ "$(paren_balanced "${item#quote()}")" = 1 ]; then
+            tok="$item"
+        else
+            # The alias is KEPT, and that is what makes ORDER BY work. The
+            # projection above strips it, and a query whose ORDER BY names an
+            # output alias then fails on BOTH engines:
+            #     SELECT quote(e1) FROM (SELECT a AS e1 FROM t ORDER BY k)
+            #     -> no such column: k
+            # Keeping `b AS k` as `quote(b) AS k` leaves `k` a real output name.
+            expr="$item"; alias=""
+            case "$item" in
+                *" AS "*|*" as "*)
+                    case "${item%%[Aa][Ss] *}" in
+                        *'"'*|*"'"*) : ;;
+                        *) expr="$(trim "${item%% AS *}")"
+                           [ "$expr" = "$item" ] && expr="$(trim "${item%% as *}")"
+                           alias="$(trim "${item#* AS }")"
+                           [ "$alias" = "$item" ] && alias="$(trim "${item#* as }")" ;;
+                    esac ;;
+            esac
+            if [ -n "$alias" ]; then
+                tok="quote($expr) AS $alias"
+            else
+                tok="quote($item)"
+            fi
+        fi
+        [ "$i" -gt 0 ] && out="$out, "
+        out="$out$tok"
+    done
+    printf 'SELECT %s%s%s' "$lead" "$out" "$RTAIL"
+}
+
+# True when $1 has balanced parentheses outside of any quoted run.
+paren_balanced() {
+    local s="$1" i ch d=0 q=""
+    for ((i = 0; i < ${#s}; i++)); do
+        ch="${s:$i:1}"
+        if [ -n "$q" ]; then
+            [ "$ch" = "$q" ] && q=""
+            continue
+        fi
+        case "$ch" in
+            "'"|'"'|'`') q="$ch" ;;
+            '(') d=$((d + 1)) ;;
+            ')') d=$((d - 1))
+                 [ "$d" -lt 0 ] && return 1 ;;
+        esac
+    done
+    [ "$d" -eq 0 ]
+}
+
 compare_rows() {
     local r="$1" n="$2" cr cn
-    # A result is ONE US-separated row string, so a row count is a count of
-    # rows rather than a count of lines, and a result with no rows is the empty
-    # string on both sides. The comparison is exact: no sorting, no trimming, no
-    # case folding, and a difference in row count is a difference. Sorting would
-    # be the single most damaging thing to add here, because row ORDER is part
-    # of the answer whenever ORDER BY is under test, and a sorted comparison
-    # would pass an engine that returns the right rows in the wrong order.
-    cr=0; [ -n "$r" ] && cr=$(( ${#r} / ${#US} + 1 ))
-    cn=0; [ -n "$n" ] && cn=$(( ${#n} / ${#US} + 1 ))
+    # A result is ONE string of US-separated fields with a NEWLINE between rows,
+    # so a row count is a count of ROWS -- one plus the number of row separators
+    # -- and a result with no rows is the empty string on both sides. The
+    # comparison is exact: no sorting, no trimming, no case folding, and a
+    # difference in row count is a difference. Sorting would be the single most
+    # damaging thing to add here, because row ORDER is part of the answer
+    # whenever ORDER BY is under test, and a sorted comparison would pass an
+    # engine that returns the right rows in the wrong order.
+    #
+    # The count is made by COUNTING the row separators rather than by dividing
+    # the byte length, because the two are only equal when every row has the
+    # same field count, and a difference in field count is itself a difference
+    # worth naming. Dividing also reported a one-row two-column result as four
+    # rows.
+    cr="$(count_rows "$r")"; cn="$(count_rows "$n")"
     if [ "$cr" -ne "$cn" ]; then
         printf 'row counts differ: sqlite3 %d, nsqlited %d' "$cr" "$cn"
         # Naming the first row that only one side has is what turns "row counts
@@ -881,18 +1103,41 @@ compare_rows() {
     return 0
 }
 
-# The zero-based row $2 of a US-separated row string.
-nth_row() {
-    local s="$1" want="$2" cur="" i=0
+# The number of rows in a framed result: the row separators plus one, and zero
+# for the empty string, which is what a result with no rows is on both sides.
+count_rows() {
+    local s="${1-}" n=0
+    [ -n "$s" ] || { printf '0'; return 0; }
+    n=1
+    # The rows are separated by RS, so the count is the number of RS bytes plus
+    # one. It is COUNTED rather than derived by dividing the byte length by the
+    # field separator, because that division is only a row count when every row
+    # has the same number of fields: a one-row two-column result divided out as
+    # four "rows", and every "row counts differ" message in a report comes from
+    # this number.
     while [ -n "$s" ]; do
-        if [ "$i" -eq "$want" ]; then printf '%s' "$cur"; return 0; fi
-        cur="$s"
-        s="${s#*"$US"}"
-        [ -z "$s" ] && break
+        case "$s" in
+            *"$RS"*) s="${s#*"$RS"}"; n=$((n + 1)) ;;
+            *) break ;;
+        esac
+    done
+    printf '%s' "$n"
+}
+
+# The zero-based row $2 of a framed result, fields still US-separated.
+nth_row() {
+    local s="$1" want="$2" i=0
+    while :; do
+        if [ "$i" -eq "$want" ]; then
+            printf '%s' "${s%%"$RS"*}"
+            return 0
+        fi
+        case "$s" in
+            *"$RS"*) s="${s#*"$RS"}" ;;
+            *) return 0 ;;
+        esac
         i=$((i + 1))
     done
-    if [ "$i" -eq "$want" ]; then printf '%s' "$cur"; fi
-    return 0
 }
 
 # Names the first differing column of a row. A field on the record-stream side
@@ -949,6 +1194,7 @@ report() {
 compare_query() {
     local sql="$1" ntoks="$2" rrows="$3" proj="$4"
     local pn2 rproj nproj nc rc reason nrows nc1 nc2
+    local tok rtok ntok nctok trrows tntoks
 
     # The typed path, when a projection could be built. Both engines are asked
     # the SAME question -- quote() of every output expression, under a generated
@@ -996,8 +1242,33 @@ compare_query() {
     # refuses one. The token is then asked of the ENGINE, the same way it is
     # asked of the real engine, so both sides are a value and neither is a
     # reconstruction from a tag byte.
+    #
+    # The token is asked of the STATEMENT, rewritten single-layer, and NOT of the
+    # statement as written. Comparing the raw record tags of the statement
+    # against the real engine's quote-mode rendering compares two alphabets and
+    # reports a difference for every value; see build_token_query.
+    tok="$(build_token_query "$sql")"
+    if [ -n "$tok" ] && [ "$tok" != "$sql" ]; then
+        printf '%s;%s' "$tok" "$NL" > "$WORKDIR/tok.sql"
+        rtok="$(run_sqlite "$RDB" "$WORKDIR/tok.sql")"
+        ntok="$("$NSQLITED" --testsuite "$NDB" 2>"$WORKDIR/n.err" < "$WORKDIR/tok.sql")"
+        nctok="$(ncols_record "$ntok")"
+        if [ ! -s "$WORKDIR/r.err" ] && [ "$nctok" -ge 1 ]; then
+            trrows="$(quote_rows "$rtok")"
+            tntoks="$(record_tokens "$ntok")"
+            if compare_rows "$trrows" "$tntoks"; then
+                AGREE=$((AGREE + 1)); WEAK=$((WEAK + 1))
+                return 0
+            fi
+            reason="$(compare_rows "$trrows" "$tntoks" || true)"
+            report "values differ (quote() of each output expression)" "$trrows" "$tntoks" \
+                "  $reason"$'\n'"  both sides are the engine's own quote() of the value" \
+                "  the compared statement was: $tok"
+            return 0
+        fi
+    fi
     if compare_rows "$rrows" "$ntoks"; then
-        AGREE=$((AGREE + 1)); STRICT=$((STRICT + 1))
+        AGREE=$((AGREE + 1)); WEAK=$((WEAK + 1))
         return 0
     fi
     reason="$(compare_rows "$rrows" "$ntoks" || true)"
@@ -1422,8 +1693,7 @@ self_test() {
     IN="$stream"; rrows="$(record_rows)"; IN="$rrows"; nf="$(count_fields)"
     check "a record row keeps one field per tag" "$nf" "3"
     IN="$(printf 'R -%s' "$NL")"; IN="$IN"; nf="$(count_fields)"
-    check "a row of one NULL tag is one field" "$nf" "1"
-    IN="$(printf 'C 1 T61%sR I31' "$NL")"; nf="$(record_rows)"
+    check "a row of one NULL tag is one field" "$nf" "1"    IN="$(printf 'C 1 T61%sR I31' "$NL")"; nf="$(record_rows)"
     check "record_rows drops the C record" "$nf" "I31"
     IN="$(printf 'C 1 T61')"; nf="$(record_rows)"
     check "record_rows on a stream with no rows is empty" "$nf" ""
@@ -1437,6 +1707,79 @@ self_test() {
     check "the quote-side padding is trimmed" "$nf" "NULL"
     IN="${SQT}a b${SQT}   "; nf="$(trim_pad)"
     IN="$(printf '%b   ' "\047a b\047")"; nf="$(trim_pad)"; check "the quote-side padding trim keeps content" "$nf" "$(printf '%ba b%b' "\047" "\047")"
+    # trim_pad TAKES the string it is asked about. It did not: it ignored $1 and
+    # read the global $IN, so a caller asking "is this line blank?" was told
+    # about the whole stream instead. In quote_rows that made the end-of-input
+    # marker look like data, so the last row was never flushed and the real
+    # engine's side of EVERY comparison came out empty -- which reads as "the
+    # other engine returned no rows" and is not a thing a run reports loudly.
+    IN="NOT-BLANK"; nf="$(trim_pad "")"
+    check "trim_pad answers about the line it is given, not the stream" "$nf" ""
+    nf="$(trim_pad "a   ")"
+    check "trim_pad trims the line it is given" "$nf" "a"
+    # The three transports must agree on the SHAPE of a result: fields by US,
+    # rows by newline, no trailing separator. They did not, and a one-row
+    # two-column result was two strings that could never be equal, so every
+    # multi-column comparison was a guaranteed difference.
+    IN=""; fr="$(record_rows "$(printf 'C 2 T61%sR I31 I34%sR I35 I36' "$NL" "$NL")")"
+    fr="$(record_rows "$(printf 'C 2 T61%sR I31 I34%sR I35 I36' "$NL" "$NL")")"
+    fq="$(quote_rows "$(printf '31%s34%s35%s36' "$NL" "$US" "$US" "$NL" "$US")")"
+    check "record_rows puts a newline between rows" "$fr" "I31${US}I34${NL}I35${US}I36"
+    check "quote_rows puts a newline between rows" "$fq" "31${US}34${NL}35${US}36"
+    check "the two transports frame a result identically" \
+        "$(compare_rows "$fq" "$(printf '31%s34%s35%s36' "$NL" "$US" "$US" "$NL" "$US")" >/dev/null 2>&1; echo $?)" "0"
+    # A row count counts ROWS. Dividing the byte length by the field separator
+    # reports a one-row two-column result as four rows, and the count is what
+    # every "row counts differ" message in a report is derived from.
+    check "one row of two fields is one row" "$(count_rows "a${US}b")" "1"
+    check "two rows of two fields is two rows" "$(count_rows "a${US}b${NL}c${US}d")" "2"
+    check "an empty result is zero rows" "$(count_rows "")" "0"
+    # record_tokens turns this engine's hex-encoded record fields into the same
+    # tokens the real engine prints, which is the only reason the two sides are
+    # in one alphabet. quote(7+3) is '10' on one engine and T3130 on the other
+    # until this runs.
+    tk="$(record_tokens "$(printf 'C 3 T61 T62 T63%sR I31 T3130 B414243' "$NL")")"
+    check "an integer record field becomes the bare decimal" \
+        "$(printf '%s' "$tk" | head -1 | cut -d"$US" -f1)" "1"
+    check "a text record field becomes a quoted token, not hex" \
+        "$(printf '%s' "$tk" | head -1 | cut -d"$US" -f2)" "'10'"
+    check "a NULL record field is the bare word NULL" \
+        "$(printf '%s' "$tk" | sed -n 2p)" "NULL"
+    check "a blob record field keeps its class" \
+        "$(printf '%s' "$tk" | sed -n 2p | cut -d"$US" -f2)" "X'414243'"
+    tk="$(record_tokens "$(printf 'C 2 T61 T62%sR T B414243' "$NL")")"
+    check "an empty text record field is an empty quoted string" \
+        "$(printf '%s' "$tk" | head -1 | cut -d"$US" -f1)" "''"
+    check "a blob is not a text value of the same bytes" \
+        "$(compare_rows "$(record_tokens "$(printf 'C 2 T61 T62%sR T B414243' "$NL")")" \
+                       "X'414243'${NL}${SQT}ABC${SQT}" >/dev/null 2>&1; echo $?)" "1"
+    # ncols_record is given the stream it is asked about. It read the global $IN
+    # instead, so the "is the projection usable?" gate was answered about the
+    # PREVIOUS statement's stream and read a column count for a stream that held
+    # only a refusal.
+    check "ncols_record reads the stream it is given" \
+        "$(ncols_record "C 7 T61")" "7"
+    check "ncols_record on a stream it is given with no C record" \
+        "$(ncols_record "$(printf 'E some refusal')")" "0"
+    # build_token_query is the fallback's actual question: the same output
+    # expressions, each wrapped in quote(), in ONE layer. The fallback was
+    # comparing the real engine's quote-mode rendering against this engine's raw
+    # record tags -- `10` against `I3130` -- and reported 136 of 219 statements
+    # as disagreements on that alone.
+    check "the token query wraps each expression in quote()" \
+        "$(build_token_query "SELECT a+b, a-b FROM n")" "SELECT quote(a+b), quote(a-b) FROM n"
+    check "the token query keeps the FROM tail" \
+        "$(build_token_query "SELECT a FROM n WHERE a>1 ORDER BY a")" \
+        "SELECT quote(a) FROM n WHERE a>1 ORDER BY a"
+    check "the token query keeps an output alias so ORDER BY can name it" \
+        "$(build_token_query "SELECT b AS k FROM n ORDER BY k")" \
+        "SELECT quote(b) AS k FROM n ORDER BY k"
+    check "the token query does not double-wrap a whole quote() call" \
+        "$(build_token_query "SELECT quote(a) FROM n")" "SELECT quote(a) FROM n"
+    check "the token query lifts a leading DISTINCT" \
+        "$(build_token_query "SELECT DISTINCT v FROM rt")" "SELECT DISTINCT quote(v) FROM rt"
+    check "the token query refuses a star" \
+        "$(build_token_query "SELECT * FROM n" >/dev/null 2>&1; echo $?)" "1"
 
     # --- the comparison ---
     # A result is ONE string of US-separated rows, so a two-row case is joined by

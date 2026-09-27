@@ -24,6 +24,7 @@
 
 use crate::catalog::Table;
 use crate::error::{Error, Result, ResultCode};
+use crate::msg::{self, Msg};
 use crate::parser::{Expr, FromItem, JoinKind, TableRef};
 use crate::value::Value;
 
@@ -408,8 +409,17 @@ pub fn resolve_ref(
             column: candidates[0].1,
         }),
         0 => Err(Unresolved::new(match table {
-            Some(t) => format!("no such column: {t}.{name}"),
-            None => format!("no such column: {name}"),
+            // A three-part reference names the column first: `main.T.x` is the
+            // column `x` of table `T` in schema `main`, and it has to be echoed
+            // in that order. The schema is the part a query cannot spell any
+            // other way -- it is a keyword -- so it needs no case handling.
+            Some(t) => match t.split_once('.') {
+                Some((schema, table)) => {
+                    Msg::NoSuchColumnSchemaQualified.render(&[schema.into(), table.into(), name.into()])
+                }
+                None => Msg::NoSuchColumnQualified.render(&[t.into(), name.into()]),
+            },
+            None => Msg::NoSuchColumn.render(&[name.into()]),
         })),
         _ => {
             // More than one source has the column. A star names the first

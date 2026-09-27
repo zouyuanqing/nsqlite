@@ -160,6 +160,30 @@
 //!   evaluates the sub-select per row. And when two indexes tie, SQLite
 //!   resolves the tie with its cost model over estimated row counts, which
 //!   this engine does not collect; see [`choose_index`].
+//!
+//! * **A statement the executor cannot run.** A plan describes work, so it is
+//!   available for a query the engine cannot answer -- but connection.rs
+//!   refuses a wrapped statement its SELECT path refuses, because a query that
+//!   cannot run should not appear to be plannable. Two shapes are affected and
+//!   both are refusals of the *executor* rather than of the planner:
+//!
+//!   ```text
+//!   SELECT * FROM (SELECT * FROM t1) s          ->  a subquery in FROM is not supported yet
+//!   WITH q AS (SELECT a FROM t1) SELECT * FROM q ->  common table expressions are not supported yet
+//!   ```
+//!
+//!   The real engine plans both -- the sub-select is `CO-ROUTINE s / SCAN t1`
+//!   and the CTE is planned through its body -- and this module can produce
+//!   the co-routine line; it is reached only by calling [`execute`] directly,
+//!   which is what the tests in this crate do. The refusal is connection.rs's
+//!   and is applied there, in `Connection::explain`; it closes when the
+//!   executor grows the two shapes, and not before.
+//!
+//! * **A sub-select standing in for a name in a result list.** The projection
+//!   is walked for covering and for a scalar sub-select, and a nested
+//!   `FromItem::Subquery` inside one of those is not, for the reason given at
+//!   [`plan_select`]: the shapes this planner walks are a WHERE and a result
+//!   list, and a FROM elsewhere is a third.
 
 use std::collections::BTreeSet;
 
@@ -200,10 +224,11 @@ pub enum Mode {
 /// SELECT                 nosuchcol FROM t1      ->  no such column: nosuchcol
 /// ```
 ///
-/// Only the `no such table` half is done here, and [`execute`] does it. A
-/// `no such column` belongs to connection.rs's prepare path, which is where a
-/// bare `SELECT` raises it and where the `EXPLAIN` dispatch has to raise it too
-/// if it is to match.
+/// The `no such column` half is not done here and is not reachable from here:
+/// it belongs to connection.rs's prepare path, which is where a bare `SELECT`
+/// raises it and where the `EXPLAIN` dispatch now raises it too. What this
+/// module does on its own is the `no such table` check, and [`execute`] does
+/// it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Explain {
     pub mode: Mode,
@@ -260,6 +285,15 @@ pub fn parse(rest: &str) -> Result<Explain> {
     let Some((_, span)) = tokens.get(i) else {
         return Err(unexpected(rest, &tokens, i));
     };
+    // The first statement is the one EXPLAIN wraps, and any that follow belong
+    // to the caller rather than to it. That is not a truncation to guard
+    // against: the parser hands over one statement's text, terminator
+    // included, so a second statement never arrives here -- and the same input
+    // to the real engine splits the same way, running `SELECT 2` after
+    // explaining `SELECT 1` (measured). The script is parsed rather than
+    // `parse_one`d because a lone `;` is `near ";": syntax error` here, which
+    // is what `statement()` raises for a token no statement begins with, and
+    // `parse_one` would instead report `no statement found`.
     let inner = crate::parser::parse_script(&rest[span.start..])?.remove(0);
     Ok(Explain { mode, inner })
 }
