@@ -55,3 +55,7 @@ pg2.db
 /-e*
 /-i
 *.log
+
+# Scratch databases the ad-hoc checks leave behind.
+tmp/
+*.log
