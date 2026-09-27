@@ -217,6 +217,23 @@ fn prepare<T: InsertTarget>(
 }
 
 /// Writes a materialised result set.
+///
+/// The rows are *built and checked* first and written second, and the split is
+/// the point. See [`ATOMICITY`] for the full statement; in short, this engine
+/// has a rollback journal but no savepoints, so a failure part way through a
+/// write loop cannot undo itself. A row that fails a constraint is therefore
+/// discovered before any of them reaches the b-tree, because every check that
+/// can be made without the b-tree is made first:
+///
+/// - a DEFAULT that does not evaluate,
+/// - NOT NULL on the finished row,
+/// - a value for the INTEGER PRIMARY KEY that is not an integer, which
+///   `next_rowid` raises before it reads the tree.
+///
+/// What is *not* checkable without writing is left to the write loop: a
+/// duplicate rowid, and UNIQUE and CHECK constraints the b-tree itself
+/// enforces. Those still leave the earlier rows behind, which is the honest
+/// limit of what this engine can do and is why the note says so.
 fn insert_prepared<T: InsertTarget>(target: &mut T, prepared: Prepared) -> Result<Outcome> {
     let Prepared {
         table,
@@ -226,8 +243,17 @@ fn insert_prepared<T: InsertTarget>(target: &mut T, prepared: Prepared) -> Resul
         rows,
     } = prepared;
 
-    let mut inserted = 0usize;
-    let mut last_rowid = None;
+    // Every row is built before any is written. Building is where the
+    // fallible checks that do not need the b-tree live, so doing it up front
+    // turns "half of this statement is now in the table" into "none of it is".
+    //
+    // Building the whole set first does not change what gets stored. sqlite3
+    // evaluates a column's DEFAULT once per row, not once per statement --
+    // checked against 3.53.4, where `INSERT INTO t(a) VALUES(1),(2),(3)` on
+    // `t(a,b DEFAULT abs(random()))` gives three *different* b values -- so
+    // building each row in its own turn is the same number of evaluations of
+    // the same expressions, in the same order.
+    let mut built: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
     for values in rows {
         // The width was checked once against the projection before anything was
         // written. Re-checking per row catches a result set whose rows are
@@ -241,7 +267,33 @@ fn insert_prepared<T: InsertTarget>(target: &mut T, prepared: Prepared) -> Resul
                 targets.len(),
             ));
         }
-        let full = build_row(&table, &targets, &values)?;
+        built.push(build_row(&table, &targets, &values)?);
+    }
+
+    // A value for the INTEGER PRIMARY KEY that is not an integer is refused
+    // here, in the checking pass, rather than by the write. The check is pure --
+    // it reads the table's definition and the row's values and nothing else --
+    // so it can be made for every row before any of them is written. That is
+    // what keeps the statement from leaving rows behind: resolved in the write
+    // loop, the rows ahead of it would already be in the b-tree, and this engine
+    // has no way to take them back out. Checked against sqlite3 3.53.4, which
+    // leaves 0 rows in the same case.
+    for full in &built {
+        check_rowid_value(&table, full)?;
+    }
+
+    // The rowid itself is resolved in the write loop, and that is deliberate
+    // rather than an oversight. sqlite3 hands out one past the largest rowid
+    // *as the statement progresses*, so a three-row insert into a table holding
+    // one row gets 2, 3 and 4 rather than 2, 2 and 2. Measured against 3.53.4:
+    //   CREATE TABLE u(a,b); INSERT INTO u VALUES(1,2);
+    //   INSERT INTO u SELECT 5,5 UNION ALL SELECT 6,6;
+    //   SELECT rowid,a FROM u;  -->  (1,1) (2,5) (3,6)
+    // Resolving them all against the tree before writing would hand out the
+    // same rowid three times and overwrite the first two rows with the third.
+    let mut inserted = 0usize;
+    let mut last_rowid = None;
+    for full in built {
         let rowid = target.next_rowid(&table, &full)?;
         target.write_row(&table, rowid, full)?;
         last_rowid = Some(rowid);
@@ -253,6 +305,34 @@ fn insert_prepared<T: InsertTarget>(target: &mut T, prepared: Prepared) -> Resul
     // database that has never inserted.
     target.finish(inserted, last_rowid)?;
     Ok(Outcome::Changed(inserted))
+}
+
+/// Refuses a row whose value for the INTEGER PRIMARY KEY is not an integer.
+///
+/// This is the same check `Connection::next_rowid` makes, split out so that it
+/// can be run over every row before the first one is written. It reads the
+/// table's definition and the row's own values and nothing else, so it is a
+/// pure test and hoisting it changes nothing but *when* the statement refuses.
+///
+/// sqlite3 3.53.4 words it `datatype mismatch`, bare, with `SQLITE_MISMATCH`
+/// (20) -- confirmed through Python's `sqlite3`, which reports that code for
+/// this error and for nothing else in this family. This engine says the same
+/// thing with the offending value named, which is more information rather than
+/// less, and that wording is the `VALUES` path's and is shared by both.
+fn check_rowid_value(table: &Table, values: &[Value]) -> Result<()> {
+    let Some(i) = table.rowid_alias else {
+        return Ok(());
+    };
+    match values.get(i) {
+        // An integer takes its own value, and a NULL or an absent column takes
+        // one past the largest; both are fine and both are decided by
+        // `next_rowid` against the live tree.
+        Some(Value::Integer(_)) | Some(Value::Null) | None => Ok(()),
+        Some(other) => Err(Error::new(
+            ResultCode::Mismatch,
+            format!("datatype mismatch: {other} is not an integer"),
+        )),
+    }
 }
 
 /// Builds the stored row: the supplied values at their targets, and the DEFAULT
@@ -368,7 +448,21 @@ fn check_column_count(
 }
 
 /// The count error in whichever of sqlite3's two wordings applies.
-fn count_error(
+///
+/// Public to the crate because the ordinary `VALUES` path raises the same
+/// error and has to raise it in the same words with the same result code. It
+/// used to compose its own, and the two drifted: `VALUES` always took the
+/// `table ... has ... columns` wording even when the statement named its
+/// columns, and it used `SQLITE_MISMATCH` (20) where sqlite3 uses
+/// `SQLITE_ERROR` (1). One constructor is the fix, and it is the same
+/// argument the module makes about rows: two forms of INSERT that build the
+/// error separately are two forms that will disagree eventually.
+///
+/// Verified against sqlite3 3.53.4 for both forms, and through Python's
+/// `sqlite3` for the code: every count mismatch, in either form, with or
+/// without a written column list, is `OperationalError` carrying
+/// `SQLITE_ERROR`.
+pub fn count_error(
     written_name: &str,
     has_column_list: bool,
     source_count: usize,
@@ -397,36 +491,46 @@ fn count_error(
 ///
 /// Every claim below is a measurement of *this* engine, not a description of
 /// sqlite3, and where the two differ the difference is stated. Read the
-/// "Honest summary" first: the short version is that this engine does not have
-/// statement-level atomicity at all, and no arrangement of caller statements
-/// gives it one.
+/// "Honest summary" first: the short version is that this engine still does not
+/// have statement-level atomicity, because it cannot undo a write, but it now
+/// refuses rather than half-applying for every failure it can see before it
+/// writes. The one it cannot see is named below.
 pub const ATOMICITY: &str = "\
 An INSERT ... SELECT that fails part way has to leave nothing behind. This
-engine does not do that, and the honest answer is that there is nothing the
-caller can do to make a single statement atomic, short of not using it.
+engine cannot promise that in general, because it has a rollback journal but no
+savepoints and no implicit transaction, so a write that has happened cannot be
+taken back. What it does instead is refuse: every failure it can detect before
+writing anything is raised before the first row is written, so the statement
+either stores all of its rows or none of them.
 
-  * A failure part way through is NOT undone. The rows written before the
-    failure stay in the b-tree. They are visible to every later statement in
-    the same session, and they are gone only because the pager never flushes on
-    the error path, so the dirty pages are discarded when the connection drops.
-    Both halves of that were measured on this engine, through Connection rather
-    than through the CLI:
+  * REFUSED, leaving 0 rows, in this session and on disk. Every row is built
+    and checked before the first one is written, so a check that fails is
+    failed before the b-tree is touched. Measured on this engine, and the same
+    0 is what sqlite3 3.53.4 returns in each case:
 
-      - INSERT INTO t SELECT x FROM s, where s holds (1),(2),(NULL),(4) and t.a
-        is NOT NULL, fails with `NOT NULL constraint failed: t.a`. In the same
-        session, SELECT count(*) FROM t returns 2 and SELECT sum(a) FROM t
-        returns 3 -- the rows before the NULL are really there. After close and
-        reopen, the same count returns 0.
+      - NOT NULL on a column the statement did not name, or named and supplied
+        NULL. INSERT INTO t SELECT x,y FROM s, where s holds (1,1),(NULL,2),
+        (3,3) and t.a is NOT NULL, fails with `NOT NULL constraint failed: t.a`
+        and SELECT count(*) FROM t returns 0, before and after a reopen. This
+        used to return 2 in the same session: the rows ahead of the NULL were
+        written first and nothing could take them back. The build-then-write
+        split is what changed that.
+      - a value for the INTEGER PRIMARY KEY that is not an integer
+        (`datatype mismatch`), which is also 0 here and 0 in sqlite3.
+      - an error in the source query, which was always before the first write
+        because the query is run to completion before anything is inserted.
 
-    sqlite3 returns 0 in *both* cases, because every statement runs inside an
-    implicit transaction. The reopen is doing this engine a favour, not
-    describing it: the file is correct, the running session is not.
-
-  * A failure in the source query itself happens before any row is written,
-    because this module runs the query to completion before it writes anything.
-    That is a consequence of the snapshot, not atomicity: it covers errors the
-    SELECT raises, and nothing else. A constraint failure is raised while the
-    rows are being written, and is not covered.
+  * NOT UNDONE, leaving the earlier rows behind. A duplicate rowid cannot be
+    found without writing: the row has to reach the b-tree for the b-tree to
+    discover that its rowid is taken, and nothing here can roll that back. So
+    INSERT INTO t SELECT x,y FROM s, with t(a INTEGER PRIMARY KEY) and s
+    holding (1,'p'),(2,'q'),(1,'r'), fails with `UNIQUE constraint failed:
+    t.a` and SELECT count(*) FROM t returns 2 in this session. sqlite3 returns
+    0. The same is true of UNIQUE and CHECK constraints the b-tree itself
+    enforces, and of any failure raised by a DEFAULT expression that this
+    engine accepts but sqlite3 would not -- see the note on non-constant
+    DEFAULTs in the module docs. Closing this gap needs savepoints or an
+    implicit transaction, neither of which this engine has.
 
 What was checked and found NOT to be a partial write: the claim that a large
 insert leaves a fraction of its rows on disk. It does not. A single
@@ -439,10 +543,10 @@ written, at 442 of 2499 -- but that is a read-side bug in this engine that
 reproduces identically on a fully successful insert, so it is not an atomicity
 effect.)
 
-Why the rollback journal does not help here. There is one, and it works: a
-transaction that fails and is rolled back leaves nothing behind. But it needs
-BEGIN, and BEGIN cannot be relied on. A database file that does not yet exist
-cannot be journalled at all: Pager::open takes its fresh branch for a
+Why the rollback journal does not close the remaining gap. There is one, and it
+works: a transaction that fails and is rolled back leaves nothing behind. But it
+needs BEGIN, and BEGIN cannot be relied on. A database file that does not yet
+exist cannot be journalled at all: Pager::open takes its fresh branch for a
 zero-length file and sets the pager's path to None, so begin_journal refuses
 with `an in-memory database cannot be journalled` for the entire lifetime of
 that connection. Measured, on this engine:
@@ -461,10 +565,12 @@ file existing is not something the caller can assume.
     COMMIT;                                  -- only reached if it succeeded
 
 On a fresh file, or in an in-memory database, the caller has no option that
-gives it atomicity, and should report the statement as having failed with rows
-possibly left behind rather than as having failed cleanly. This engine has a
-rollback journal but no savepoints, so there is no way to bracket a single
-statement the way sqlite3's implicit transaction does.
+gives it atomicity for the remaining cases, and should report the statement as
+having failed with rows possibly left behind rather than as having failed
+cleanly. This engine has a rollback journal but no savepoints, so there is no
+way to bracket a single statement the way sqlite3's implicit transaction does.
+The refusals listed first need no such bracket, and that is why a NOT NULL
+failure is safe on any database and a duplicate rowid is not.
 
 One claim that could not be exercised at all, recorded so it is not mistaken
 for a tested one: an integer overflow mid-statement. This engine does not raise

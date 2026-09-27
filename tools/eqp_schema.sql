@@ -1,0 +1,6 @@
+CREATE TABLE t1(a,b,c);
+CREATE INDEX i1 ON t1(b);
+CREATE INDEX i2 ON t1(b,c);
+CREATE INDEX i3 ON t1(c);
+CREATE TABLE t2(x,y);
+CREATE INDEX i4 ON t2(x,y);

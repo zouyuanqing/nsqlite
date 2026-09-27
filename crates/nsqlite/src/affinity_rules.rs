@@ -142,6 +142,72 @@ pub fn convert(value: &Value, affinity: Affinity) -> Value {
     apply(value, affinity)
 }
 
+/// The affinity of each column reference in a statement, keyed by the byte
+/// offset the reference was written at.
+///
+/// A comparison needs to know, for each of its two operands, whether that
+/// operand is a column and what the column's affinity is. Both questions are
+/// answered by the *statement*, not by the row, so this is built once per
+/// statement rather than per row -- which matters, because a WHERE is
+/// evaluated once per row and a per-row lookup would make the rule cost a
+/// resolution per comparison.
+///
+/// The key is the offset because that is what the parser records and what
+/// [`crate::join::Bound`] already keys on, so a reference is found by the same
+/// identifier the evaluator uses to find its value. An operand that is *not* in
+/// the map is not a column reference, which is exactly the rule's "the other
+/// operand has no affinity" case.
+pub fn affinities_of<'a, I>(
+    from: &'a crate::join::From,
+    bound: I,
+) -> std::collections::HashMap<usize, Affinity>
+where
+    I: IntoIterator<Item = &'a crate::join::Bound>,
+{
+    let mut out = std::collections::HashMap::new();
+    for b in bound {
+        if let Some(aff) = affinity_of_ref(from, &b.r#ref) {
+            out.insert(b.at, aff);
+        }
+    }
+    out
+}
+
+/// The affinity a resolved reference reads, or `None` when it is not a column.
+///
+/// A `Coalesced` reference is a column a USING clause named, which stands for
+/// one value across several sources. Which source supplies it depends on the
+/// row, so the affinity is the one belonging to the *leftmost* holder: that is
+/// the copy the star prints and the one an unqualified name reads first.
+/// Measured against sqlite3 3.53.4 -- in `a JOIN b USING(x)` with `a.x TEXT`
+/// and `b.x INTEGER`, `WHERE x = 5` is true, which is the TEXT column's
+/// affinity stringifying the literal rather than the INTEGER column's parsing
+/// it, so the leftmost holder is the one that decides.
+fn affinity_of_ref(from: &crate::join::From, r: &crate::join::Ref) -> Option<Affinity> {
+    let column_of = |i: usize, name: Option<&str>| -> Option<Affinity> {
+        let s = from.sources.get(i)?;
+        let at = match name {
+            Some(n) => s
+                .table
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(n))?,
+            None => 0,
+        };
+        s.table.columns.get(at).map(|c| c.affinity)
+    };
+    match r {
+        crate::join::Ref::Column { source, column } => from
+            .sources
+            .get(*source)
+            .and_then(|s| s.table.columns.get(*column))
+            .map(|c| c.affinity),
+        crate::join::Ref::Coalesced { holders, name } => {
+            holders.first().and_then(|i| column_of(*i, Some(name)))
+        }
+    }
+}
+
 /// The affinities a comparison applies, one per operand.
 ///
 /// # The rule, measured
@@ -310,6 +376,163 @@ pub fn apply_comparison(
     let (left_affinity, right_affinity) = operand_affinities(left_affinity, right_affinity);
     (convert(left, left_affinity), convert(right, right_affinity))
 }
+
+/// The ordering a comparison of two operands comes to, with the comparison's
+/// affinity rule applied to them first.
+///
+/// This is the whole of the comparison direction, in the form a caller that has
+/// already evaluated both operands can use: hand it the two values and each
+/// side's own column affinity, and it gives back the answer. A caller that has
+/// *not* applied the rule gets a different answer from `Value::compare`, which
+/// is the whole point -- `text '5'` and `integer 5` are different values, and
+/// the column affinities are what make them the same one.
+///
+/// `left_affinity` and `right_affinity` are `None` for an operand that is not a
+/// column reference, and both `None` means neither operand is a column: nothing
+/// is converted and the two values are compared as they are, which is what
+/// makes `1 = 1.0` true and `'1' = 1.0` false.
+///
+/// A NULL operand is *not* handled here. Three-valued logic is the caller's,
+/// because it is also the caller's for every other operator, and folding it in
+/// would make this one operator answer NULL for a reason the caller cannot see.
+pub fn compare(
+    left: &Value,
+    left_affinity: Option<Affinity>,
+    right: &Value,
+    right_affinity: Option<Affinity>,
+) -> std::cmp::Ordering {
+    let (left, right) = apply_comparison(left, left_affinity, right, right_affinity);
+    left.compare(&right)
+}
+
+/// Whether two operands are equal under the comparison rule, which is `IN`'s
+/// test as well as `=`'s.
+///
+/// `IN` is a repeated `=`, and it takes the same rule: `a IN (5, 9)` against a
+/// TEXT column `a` holding '5' is true, because the list item is converted with
+/// the column's affinity just as the right-hand side of an `=` would be. The
+/// values are compared rather than the whole `IN` being reimplemented, so the
+/// one conversion rule serves both.
+pub fn equal(
+    left: &Value,
+    left_affinity: Option<Affinity>,
+    right: &Value,
+    right_affinity: Option<Affinity>,
+) -> bool {
+    compare(left, left_affinity, right, right_affinity) == std::cmp::Ordering::Equal
+}
+
+/// Whether two operands are `IS` to each other, which is `=` except that it
+/// never answers unknown.
+///
+/// SQLite's `IS` is the same comparison as `=` with exactly one difference, and
+/// it is a difference in *when* the answer is computed rather than in what is
+/// compared: `=` short-circuits to unknown when either operand is NULL, and
+/// `IS` compares them as the values they are. Every other difference one might
+/// expect is not there. Measured against sqlite3 3.53.4 over all 441 ordered
+/// pairs of 21 values (`5`, `5.0`, `-5.0`, `0.0`, `-0.0`, `5.5`, `'5'`,
+/// `'5.0'`, `'abc'`, `''`, `x'35'`, `x'616263'`, NULL, `0`, `2^53`,
+/// `2^53 + 1`, `i64::MAX`, `i64::MAX - 1`, `i64::MIN`, `1e300`, `1e-300`):
+/// the two operators disagree on 41 of the 441, and every one of the 41 is a
+/// pair with a NULL in it — which is the short circuit, not a second rule.
+///
+/// The parts that are easy to get wrong, all measured:
+///
+/// * **An integer and a real that name the same number are the same.** `5 IS 5.0`
+///   and `5.0 IS 5` are both 1, and so is `9007199254740992 IS
+///   9007199254740992.0`. The comparison is the ordinary numeric one, which
+///   compares the two *exactly* rather than widening the integer to a double:
+///   `9223372036854775807 IS 9223372036854775807.0` is 0, because that integer
+///   is not the real written beside it.
+/// * **A negative zero is not a positive one.** `0.0 IS -0.0` is **1**, which is
+///   the opposite of what comparing the bits would give and is the reason this
+///   cannot be written as a bit comparison.
+/// * **No conversion happens on its own account.** `'5' IS 5` is 0 with no
+///   column in the query, and `x'35' IS 5` is 0. Only the affinity rule, and
+///   only with a column to take it from, changes what the operands are.
+pub fn is_same(
+    left: &Value,
+    left_affinity: Option<Affinity>,
+    right: &Value,
+    right_affinity: Option<Affinity>,
+) -> bool {
+    let (left, right) = apply_comparison(left, left_affinity, right, right_affinity);
+    // The one thing `IS` does not do is return unknown. Everything else is the
+    // ordinary comparison, and `compare` already treats NULL as equal to
+    // nothing and less than everything else, so answering "the same" here means
+    // the same as it does for the sorted position: two NULLs are the same value
+    // and a NULL is never the same as a non-NULL.
+    left.compare(&right) == std::cmp::Ordering::Equal
+}
+
+/// The empty affinity map, which is what a context with no column references
+/// carries.
+///
+/// A comparison whose two operands are both absent from the map has no column
+/// on either side, so it converts nothing — which is what SQLite does for
+/// `SELECT '5' = 5` in a query with no table. There is exactly one of these,
+/// so a context with no columns borrows it rather than building an empty map of
+/// its own.
+pub fn no_affinities() -> &'static std::collections::HashMap<usize, Affinity> {
+    static EMPTY: std::sync::OnceLock<std::collections::HashMap<usize, Affinity>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(std::collections::HashMap::new)
+}
+
+/// The affinity an *expression* contributes to a comparison when it is not a
+/// column reference, which is `None` for almost all of them.
+///
+/// SQLite's rule is written in terms of columns, and an expression is not one,
+/// so the rule as documented would have an expression contribute nothing. That
+/// is what happens for every form except one, and the exception is worth
+/// stating because it is the only way a `CAST` shows up in a comparison.
+///
+/// Measured against sqlite3 3.53.4, with `a` a TEXT column holding `'05'`:
+///
+/// ```text
+/// SELECT a = 5;                     -- 0   the literal contributes nothing
+/// SELECT a = abs(-5);                -- 0   and so does a function call
+/// SELECT a = +5;                    -- 0   and a unary operator
+/// SELECT a = 5 + 0;                 -- 0   and an arithmetic expression
+/// SELECT a = b + 0;                 -- 0   even when b is a column
+/// SELECT a = COALESCE(5, 6);        -- 0   and a function over a column
+/// SELECT a = CAST(5 AS INTEGER);    -- 1   but a numeric CAST does
+/// SELECT a = CAST(5 AS NUMERIC);    -- 1
+/// SELECT a = CAST(5 AS REAL);       -- 1
+/// SELECT a = CAST(5 AS TEXT);       -- 0   a TEXT CAST does not
+/// SELECT a = CAST(5 AS BLOB);       -- 0   and a BLOB CAST does not
+/// ```
+///
+/// The three that answer 1 do so because a `CAST` is what put a *number* where
+/// a literal would have left a *string*, and the rule's whole content is
+/// deciding what to do with a string on the other side of a numeric column. A
+/// TEXT or BLOB cast produces the same kind of value a literal would, so it has
+/// nothing to add. This is stated rather than derived because it is the one
+/// place the two readings of "an expression contributes its own affinity"
+/// diverge, and reading it the other way makes `a = CAST('05' AS INTEGER)` and
+/// `a = '05'` disagree, which SQLite does not do — both are 1.
+pub fn expression_affinity(cast_to: Option<&str>) -> Option<Affinity> {
+    let ty = cast_to?;
+    let aff = crate::affinity::affinity_of(ty);
+    // Only a numeric target produces a number, and only a number changes what
+    // the comparison does with the other operand.
+    is_numeric(aff).then_some(aff)
+}
+
+#[cfg(test)]
+#[path = "affinity_cmp_tests.rs"]
+mod affinity_cmp_tests;
+
+/// The same rules again, this time asked of a running engine.
+///
+/// The tests above call the functions in this module directly, and they pass
+/// whether or not anything calls them. That is not hypothetical: this module was
+/// once complete, documented and tested while no executor referenced it, and
+/// the engine answered `SELECT a=b` wrongly the whole time. So these go through
+/// a `Connection`, and they fail if the wiring is removed.
+#[cfg(test)]
+#[path = "affinity_engine_tests.rs"]
+mod affinity_engine_tests;
 
 #[cfg(test)]
 mod tests {

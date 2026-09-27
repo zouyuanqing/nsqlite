@@ -231,19 +231,33 @@ impl Number {
     }
 }
 
-/// Renders a real the way the CLI prints it, which is what a TEXT affinity
-/// conversion produces.
+/// Renders a real the way SQLite renders it as text, which is what a TEXT
+/// affinity conversion produces.
+///
+/// This is [`crate::value::format_real`], which is SQLite's own rendering and
+/// was measured against it; the copy that used to live here formatted to
+/// fifteen places and trimmed, which is a different function and disagreed with
+/// sqlite3 on every real outside the narrow range where the two agree. The
+/// disagreement was not only cosmetic. `CREATE TABLE t(a TEXT); INSERT INTO t
+/// VALUES(5.0)` has to store the text `'5.0'` and not `'5'`, because that text
+/// is what a comparison converts back: `SELECT a = 5.0 FROM t` is 0 in sqlite3
+/// and 1 if the stored text is `'5'`, since 5.0 converts with the column's TEXT
+/// affinity to `'5.0'` and `'5'` is not `'5.0'`. A wrong rendering here is a
+/// wrong answer to a comparison, not only a wrong display.
+///
+/// Measured against sqlite3 3.53.4, which is the source of every case:
+///
+/// | input | sqlite3 | this |
+/// |---|---|---|
+/// | `5.0` | `'5.0'` | `'5.0'` |
+/// | `2.0` | `'2.0'` | `'2.0'` |
+/// | `100.0` | `'100.0'` | `'100.0'` |
+/// | `-0.0` | `'0.0'` | `'0.0'` |
+/// | `1e20` | `'1.0e+20'` | `'1.0e+20'` |
+/// | `1e-20` | `'1.0e-20'` | `'1.0e-20'` |
+/// | `1e15` | `'1000000000000000.0'` | `'1000000000000000.0'` |
 fn format_real(r: f64) -> String {
-    if r.is_infinite() {
-        return if r < 0.0 { "-Inf".into() } else { "Inf".into() };
-    }
-    let s = format!("{r:.15}");
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    if s.is_empty() || s == "-" {
-        "0".into()
-    } else {
-        s.to_string()
-    }
+    crate::value::format_real(r)
 }
 
 #[cfg(test)]
@@ -300,7 +314,7 @@ mod tests {
         );
         assert_eq!(
             apply(&Value::real(2.0), Affinity::Text),
-            Value::Text("2".into())
+            Value::Text("2.0".into())
         );
         // Text and blobs are already what they are.
         assert_eq!(

@@ -999,6 +999,7 @@ fn constraint_holds(
             columns: &[],
             context: Some(src.name.clone()),
             resolved,
+            ..crate::eval::EvalCtx::default()
         };
         return Ok(crate::eval::truthy(crate::eval::eval(on, &ctx)?));
     }

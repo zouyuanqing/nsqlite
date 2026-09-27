@@ -16,7 +16,7 @@
 //! connection's own executor over a real table, so a mis-evaluated SELECT fails
 //! here too.
 
-use super::{insert_select, InsertTarget, Source, ATOMICITY};
+use super::{count_error, insert_select, InsertTarget, Source, ATOMICITY};
 use crate::affinity::Affinity;
 use crate::catalog::{Catalog, Table};
 use crate::connection::{Connection, Outcome};
@@ -975,9 +975,11 @@ fn the_atomicity_note_states_what_the_engine_actually_does() {
     // something this engine was *measured* to do, and each has a test in
     // `tests/insert_select.rs` that would fail if it stopped being true:
     //
-    //   - the mid-statement failure leaving rows visible  ->
-    //     `a_mid_statement_failure_leaves_the_earlier_rows_visible_in_the_session`
-    //   - the 2499-row claim not reproducing                ->
+    //   - the refusals that leave nothing behind               ->
+    //     `a_not_null_failure_part_way_leaves_nothing_behind`
+    //   - the duplicate rowid that still does leave rows     ->
+    //     `a_duplicate_rowid_still_leaves_the_earlier_rows_behind`
+    //   - the 2499-row claim not reproducing                   ->
     //     `a_failed_large_insert_leaves_nothing_on_disk`
     //   - BEGIN failing on a fresh file                   ->
     //     `a_transaction_cannot_be_opened_on_a_database_file_that_does_not_exist_yet`
@@ -993,9 +995,19 @@ fn the_atomicity_note_states_what_the_engine_actually_does() {
         "the caller is told what the transaction route is"
     );
     assert!(flat.contains("no savepoints"), "the limitation is named");
+    // The two halves of the current behaviour, both of which have to be stated:
+    // the failures it now refuses, and the one it still cannot undo.
     assert!(
-        flat.contains("A failure part way through is NOT undone"),
-        "the central claim is stated plainly and is the pessimistic one"
+        flat.contains("REFUSED, leaving 0 rows"),
+        "the refusals are stated, so a reader does not assume every failure leaks"
+    );
+    assert!(
+        flat.contains("NOT UNDONE, leaving the earlier rows behind"),
+        "the case that still leaks is stated plainly, with its own cause"
+    );
+    assert!(
+        flat.contains("duplicate rowid cannot be found without writing"),
+        "and the reason it cannot be fixed by rearranging the same code is named"
     );
     // The note must not promise a guarantee the engine cannot make. These are
     // the two that the old wording asserted and the measurements refute.
@@ -1082,4 +1094,61 @@ fn a_null_from_the_source_is_stored_as_null() {
     // sqlite3: INSERT INTO t SELECT NULL;  typeof(a), a IS NULL --> null|1
     let (rec, _) = run("INSERT INTO t SELECT NULL").unwrap();
     assert_eq!(rec.col(0, 0), Value::Null);
+}
+
+// --- the shared count error --------------------------------------------------
+
+#[test]
+fn the_count_error_is_sqlite_error_in_both_wordings() {
+    // The result code is the part that had drifted, so it is pinned for both
+    // wordings rather than only for the one the SELECT path happened to use.
+    // Read off Python's `sqlite3`, which reports SQLITE_ERROR for every count
+    // mismatch in both INSERT forms:
+    //   INSERT INTO q(a,b) VALUES(1)     -> 1 values for 2 columns            (SQLITE_ERROR)
+    //   INSERT INTO q VALUES(1)          -> table q has 2 columns but 1 ...   (SQLITE_ERROR)
+    let named = count_error("q", true, 1, 2);
+    assert_eq!(named.message, "1 values for 2 columns");
+    assert_eq!(named.code, ResultCode::Error);
+
+    let bare = count_error("q", false, 1, 2);
+    assert_eq!(
+        bare.message,
+        "table q has 2 columns but 1 values were supplied"
+    );
+    assert_eq!(bare.code, ResultCode::Error);
+
+    // Not SQLITE_MISMATCH (20), which is what the VALUES path used to raise and
+    // what makes the two forms of one logical error report different codes.
+    assert_ne!(named.code, ResultCode::Mismatch);
+    assert_ne!(bare.code, ResultCode::Mismatch);
+}
+
+#[test]
+fn the_count_error_counts_the_targets_not_the_table() {
+    // What selects the wording is whether a column list was *written*, not how
+    // many columns the table has. A table of three written as `q(a,b)` against
+    // three values is `3 values for 2 columns`, not a message about three
+    // columns. Checked against 3.53.4:
+    //   INSERT INTO q(a,b) VALUES(1,2,3)  -> 3 values for 2 columns
+    let e = count_error("q", true, 3, 2);
+    assert_eq!(e.message, "3 values for 2 columns");
+    // And with no list the same shape names the table and its true width.
+    let e = count_error("q", false, 3, 3);
+    assert_eq!(
+        e.message,
+        "table q has 3 columns but 3 values were supplied"
+    );
+}
+
+#[test]
+fn the_count_error_quotes_the_name_the_statement_wrote() {
+    // A schema qualifier is stripped to find the table but kept in the message,
+    // because that is what the statement wrote. Matches the `target_table` half
+    // of the trait, which is measured the same way in
+    // `a_schema_qualifier_on_the_target_is_accepted`.
+    let e = count_error("main.q", false, 1, 2);
+    assert_eq!(
+        e.message,
+        "table main.q has 2 columns but 1 values were supplied"
+    );
 }

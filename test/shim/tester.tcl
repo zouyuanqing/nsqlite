@@ -465,10 +465,12 @@ proc nsqlite_field {f} {
   }
   switch -- $tag {
     B {
-      # A blob is compared as its upper-case hex, which is the CLI's rendering
-      # and the form the suite's expectations are written in. No decode needed:
-      # the payload already is the hex.
-      return [string toupper $hex]
+      # A blob reaches the suite as a Tcl byte string, which is what an
+      # expectation like {abcdef {}} compares against. The hex is decoded rather
+      # than passed through: the suite writes blob values as the bytes they hold,
+      # so x'616263646566' is expected as abc and comparing it as hex would
+      # report a difference where there is none.
+      return [nsqlite_unhex $hex]
     }
     T - I - F {
       return [nsqlite_unhex $hex]

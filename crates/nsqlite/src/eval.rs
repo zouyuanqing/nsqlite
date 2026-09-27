@@ -16,7 +16,7 @@ use crate::parser::{BinOp, Expr, Literal, UnaryOp};
 use crate::value::Value;
 
 /// The values visible to an expression: bound parameters and the row in scope.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct EvalCtx<'a> {
     /// Bound parameters, 1-based as SQLite numbers them. The vector is
     /// 0-based here, so index 0 is parameter 1.
@@ -37,6 +37,40 @@ pub struct EvalCtx<'a> {
     /// that is when an ambiguous or unknown column has to be reported. The list
     /// is rebuilt for each joined row, so it holds values rather than positions.
     pub resolved: Vec<(usize, Value)>,
+    /// The affinity of each column reference in the statement, by the byte
+    /// offset it was written at, which is the same key `resolved` uses.
+    ///
+    /// A comparison needs this to answer the question SQLite answers with it: a
+    /// column compared against a literal is compared under the *column's*
+    /// affinity, and two columns each apply theirs to the other. An operand with
+    /// no entry here is not a column reference and so contributes no affinity,
+    /// which is a real case rather than a missing one — see
+    /// [`crate::affinity_rules::operand_affinities`].
+    ///
+    /// Empty for a statement with no FROM, and for a context built without one,
+    /// in which case every comparison converts nothing, exactly as SQLite does
+    /// for `SELECT '5' = 5`.
+    pub affinities: &'a std::collections::HashMap<usize, crate::affinity::Affinity>,
+}
+
+/// A context with nothing in scope, which is what a test comparing two values
+/// under an explicit affinity wants.
+///
+/// The affinity map is the shared empty one rather than a `HashMap::new()`, so
+/// a default context costs no allocation and converts nothing — which is the
+/// right answer for a comparison with no column in it, and is why the default
+/// is a context at all rather than a caller having to spell the map out.
+impl<'a> Default for EvalCtx<'a> {
+    fn default() -> EvalCtx<'a> {
+        EvalCtx {
+            params: &[],
+            row: Vec::new(),
+            columns: &[],
+            context: None,
+            resolved: Vec::new(),
+            affinities: crate::affinity_rules::no_affinities(),
+        }
+    }
 }
 
 impl<'a> EvalCtx<'a> {
@@ -48,6 +82,7 @@ impl<'a> EvalCtx<'a> {
             columns: &[],
             context: None,
             resolved: Vec::new(),
+            affinities: crate::affinity_rules::no_affinities(),
         }
     }
 
@@ -57,6 +92,28 @@ impl<'a> EvalCtx<'a> {
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v)
+    }
+
+    /// The affinity an operand of a comparison contributes, or `None` when it
+    /// contributes none.
+    ///
+    /// A column reference contributes the affinity of the column it resolved to,
+    /// which is what the rule is written in terms of. A `CAST` to a numeric type
+    /// contributes that type's affinity, which is the one non-column form that
+    /// does — see [`crate::affinity_rules::expression_affinity`] for the
+    /// measurement and for why it is the only one.
+    ///
+    /// Everything else contributes nothing: a literal, an arithmetic expression,
+    /// a function call, a parameter, a subquery. That is not a gap in the
+    /// lookup, it is the rule — `a = 5 + 0` against a TEXT column holding '5'
+    /// is 0 in sqlite3, exactly as `a = 5` is, and the value on the right is
+    /// left as the number it already is.
+    pub fn operand_affinity(&self, e: &Expr) -> Option<crate::affinity::Affinity> {
+        match e {
+            Expr::Column { span, .. } => self.affinities.get(&span.start).copied(),
+            Expr::Cast { ty, .. } => crate::affinity_rules::expression_affinity(Some(ty)),
+            _ => None,
+        }
     }
 }
 
@@ -132,7 +189,14 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Result<Value> {
             }
             let l = eval(left, ctx)?;
             let r = eval(right, ctx)?;
-            binary(*op, l, r)
+            // A comparison takes each operand's own column affinity, which is
+            // what makes a TEXT column holding '5' equal to the integer 5. The
+            // rule is in `affinity_rules` and measured against sqlite3; here the
+            // two operands are asked what they are rather than left as they
+            // were written.
+            let la = ctx.operand_affinity(left);
+            let ra = ctx.operand_affinity(right);
+            binary(*op, l, la, r, ra)
         }
         Expr::IsNull { expr, negated } => {
             let v = eval(expr, ctx)?;
@@ -149,7 +213,19 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Result<Value> {
             let hi = eval(high, ctx)?;
             // SQL's BETWEEN is inclusive on both ends, which is spelled as two
             // comparisons rather than as a subtraction.
-            let inside = v.compare(&lo) != Ordering::Less && v.compare(&hi) != Ordering::Greater;
+            //
+            // Both are the comparison of `=`, affinity rule included, so the
+            // same operand affinity is asked of each side. `a BETWEEN 4 AND 6`
+            // against a TEXT column holding '5' is true, which is the case that
+            // shows the rule is here rather than only in `=`.
+            let a = ctx.operand_affinity(expr);
+            let lo_a = ctx.operand_affinity(low);
+            let hi_a = ctx.operand_affinity(high);
+            let inside = !v.is_null()
+                && !lo.is_null()
+                && !hi.is_null()
+                && crate::affinity_rules::compare(&v, a, &lo, lo_a) != Ordering::Less
+                && crate::affinity_rules::compare(&v, a, &hi, hi_a) != Ordering::Greater;
             Ok(Value::Integer(i64::from(inside != *negated)))
         }
         Expr::Collate { expr, .. } => eval(expr, ctx),
@@ -166,6 +242,10 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Result<Value> {
             if v.is_null() {
                 return Ok(Value::Null);
             }
+            // `IN` is a repeated `=`, so it takes the same affinity rule, and
+            // the affinity asked of each list item is the same one the right
+            // hand side of an `=` would have contributed.
+            let a = ctx.operand_affinity(expr);
             let mut saw_null = false;
             for item in list {
                 let candidate = eval(item, ctx)?;
@@ -173,7 +253,7 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Result<Value> {
                     saw_null = true;
                     continue;
                 }
-                if v.eq_value(&candidate) {
+                if crate::affinity_rules::equal(&v, a, &candidate, ctx.operand_affinity(item)) {
                     return Ok(Value::Integer(i64::from(!*negated)));
                 }
             }
@@ -232,15 +312,35 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Result<Value> {
             otherwise,
         } => {
             let base = match operand {
-                Some(e) => Some(eval(e, ctx)?),
+                Some(e) => {
+                    let aff = ctx.operand_affinity(e);
+                    Some((eval(e, ctx)?, aff))
+                }
                 None => None,
             };
             for (cond, result) in whens {
                 let cv = eval(cond, ctx)?;
+                // The searched form evaluates the arm's condition directly, with
+                // no operand to compare against; the simple form compares the
+                // operand to the arm's expression, and that is a `=` and so
+                // takes the affinity rule — which is what makes
+                // `CASE a WHEN 5` match a TEXT column holding '5'. The
+                // comparison is a value comparison here, so a NULL is a
+                // non-match rather than an unknown, which is the existing
+                // behaviour and the one sqlite3 has.
                 let hit = match &base {
                     // The searched form evaluates the arm's condition directly.
                     None => truthy(cv),
-                    Some(b) => !b.is_null() && !cv.is_null() && b.eq_value(&cv),
+                    Some((b, base_aff)) => {
+                        !b.is_null()
+                            && !cv.is_null()
+                            && crate::affinity_rules::equal(
+                                b,
+                                *base_aff,
+                                &cv,
+                                ctx.operand_affinity(cond),
+                            )
+                    }
                 };
                 if hit {
                     return eval(result, ctx);
@@ -348,7 +448,13 @@ fn unary(op: UnaryOp, v: Value) -> Result<Value> {
     })
 }
 
-fn binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
+fn binary(
+    op: BinOp,
+    l: Value,
+    l_aff: Option<crate::affinity::Affinity>,
+    r: Value,
+    r_aff: Option<crate::affinity::Affinity>,
+) -> Result<Value> {
     use BinOp::*;
     match op {
         // AND and OR are short-circuited by the caller, so they never arrive
@@ -359,7 +465,12 @@ fn binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
             if l.is_null() || r.is_null() {
                 return Ok(Value::Null);
             }
-            let ord = l.compare(&r);
+            // The operands are converted in place by the affinity rule before
+            // they are compared, so the ordering is taken on the converted pair
+            // rather than on the values as they were written. This is the whole
+            // of `CREATE TABLE t(a TEXT, b INTEGER)` with '5' and 5 comparing
+            // equal: the text is parsed by the INTEGER column's affinity.
+            let ord = crate::affinity_rules::compare(&l, l_aff, &r, r_aff);
             let (result, swapped) = match op {
                 Eq => (ord == Ordering::Equal, false),
                 Ne => (ord != Ordering::Equal, false),
@@ -375,17 +486,11 @@ fn binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
             Ok(Value::Integer(i64::from(result)))
         }
         Is | IsNot => {
-            // IS compares NULL as equal to NULL, and two reals with the same
-            // bits as equal, which is why it is not the same as `=`.
-            let same = match (&l, &r) {
-                (Value::Null, Value::Null) => true,
-                (Value::Null, _) | (_, Value::Null) => false,
-                (Value::Integer(a), Value::Integer(b)) => a == b,
-                (Value::Real(a), Value::Real(b)) => a.to_bits() == b.to_bits(),
-                (Value::Text(a), Value::Text(b)) => a == b,
-                (Value::Blob(a), Value::Blob(b)) => a == b,
-                _ => false,
-            };
+            // `IS` is the same comparison as `=` without the unknown answer, so
+            // it takes the same affinity rule. It is not a bit comparison: a
+            // negative zero and a positive one are the same to `IS`, and so are
+            // an integer and a real that name the same number.
+            let same = crate::affinity_rules::is_same(&l, l_aff, &r, r_aff);
             Ok(Value::Integer(i64::from(same == (op == Is))))
         }
         In | NotIn => unreachable!("IN is handled by its own expression form"),
@@ -1229,10 +1334,24 @@ mod tests {
         // NULL IS NULL is true where NULL = NULL is unknown.
         assert_eq!(ok("NULL IS NULL"), Value::Integer(1));
         assert_eq!(ok("NULL = NULL"), Value::Null);
-        // Two reals with the same bits are IS-equal even if one is a negative
-        // zero, which comparison would call equal anyway.
-        assert_eq!(ok("0.0 IS 0"), Value::Integer(0));
-        assert_eq!(ok("1 IS 1.0"), Value::Integer(0));
+        // `IS` is `=` without the unknown answer, so an integer and a real that
+        // name the same number are the same to it: `1 IS 1.0` and `0.0 IS 0`
+        // are both 1 in sqlite3 3.53.4, and so is a negative zero against a
+        // positive one, which a comparison of their bits would call different.
+        assert_eq!(ok("0.0 IS 0"), Value::Integer(1));
+        assert_eq!(ok("1 IS 1.0"), Value::Integer(1));
+        assert_eq!(ok("0.0 IS -0.0"), Value::Integer(1));
+        // What it does not do is convert: a text and a number are the same only
+        // when they are the same text, with no column to convert either way.
+        assert_eq!(ok("'1' IS 1"), Value::Integer(0));
+        assert_eq!(ok("x'31' IS '1'"), Value::Integer(0));
+        // And two numbers that do not name the same value are not the same even
+        // where a `f64` cannot tell them apart: 2^53 + 1 is an exact i64 and
+        // not an exact double, so it is not the real written beside it.
+        assert_eq!(
+            ok("9007199254740993 IS 9007199254740993.0"),
+            Value::Integer(0)
+        );
     }
 
     #[test]

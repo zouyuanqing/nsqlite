@@ -416,6 +416,7 @@ impl Plan {
                 columns: &[],
                 resolved: group.resolved.clone(),
                 context: None,
+                ..EvalCtx::default()
             };
             let mut values = Vec::with_capacity(self.output.len());
             for slot in &self.output {
@@ -612,6 +613,7 @@ impl Row {
             columns: &[],
             resolved: self.resolved.clone(),
             context: None,
+            ..EvalCtx::default()
         }
     }
 }

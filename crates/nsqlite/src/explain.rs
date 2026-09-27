@@ -76,6 +76,10 @@
 //! | `UNION ALL` over a table | `COMPOUND QUERY` / `LEFT-MOST SUBQUERY` / `UNION ALL` |
 //! | a compound that has to be sorted | `MERGE (UNION ALL)` / `LEFT` / `RIGHT` |
 //! | a sub-select in FROM | `CO-ROUTINE v` |
+//! | a sub-select standing alone as a value | `SCALAR SUBQUERY n` |
+//! | ... reading a column of the outer query | `CORRELATED SCALAR SUBQUERY n` |
+//! | an `ORDER BY` term in the other direction | the index delivers that one term |
+//! | a merge arm read through a whole-table index | `SCAN t USING COVERING INDEX i` |
 //!
 //! # What this does not reproduce
 //!
@@ -131,13 +135,31 @@
 //!   implementing it for `GLOB` alone is still the right half.
 //! * **A `NOT NULL` constraint on a column.** SQLite drops an `IS NULL` on a
 //!   column declared `NOT NULL` outright, and a plan here still seeks for it.
-//! * **Sub-selects that are not in the FROM clause.** `LIST SUBQUERY n` and
-//!   `CORRELATED SCALAR SUBQUERY n` are emitted for the shapes this planner
-//!   walks. A sub-select nested inside an expression the plan never descends
-//!   into contributes no line, which is a real difference from SQLite and is
+//! * **A sub-select nested inside an expression the plan never descends into.**
+//!   `LIST SUBQUERY n`, `SCALAR SUBQUERY n` and `CORRELATED SCALAR SUBQUERY n`
+//!   are emitted for the shapes this planner walks -- a `WHERE` clause and a
+//!   result list. A sub-select buried in an expression no arm of that walk
+//!   reaches contributes no line, which is a real difference from SQLite and is
 //!   called out at [`plan_select`]. A `LIST SUBQUERY` is counted but not
 //!   descended into: a nested one is reported under the outer one's number
 //!   rather than under a number of its own, where SQLite starts a fresh scope.
+//! * **A join constraint between two columns, outside a sub-select.** SQLite
+//!   reads `t1.a=t2.x` as a seek on the inner table when an index serves it --
+//!   `SELECT * FROM t1, t2 WHERE t1.a=t2.x` with `i4(x,y)` is
+//!   `SCAN t1 ~ SEARCH t2 USING COVERING INDEX i4 (x=?)` -- and a join is
+//!   reported here as one line per table, which is the work this engine does.
+//!   The *correlated* form is different and is planned: inside a sub-select
+//!   that reads the outer query, the outer reference is a value rather than a
+//!   join, so the inner table is seeked. See [`plan_select_under`].
+//! * **A tie between two covering indexes, and a sub-select that aggregates.**
+//!   Two things are not reproduced, and both are visible on
+//!   `SELECT (SELECT max(t1.b) FROM t2) FROM t1` over `t1(a,b,c)` with
+//!   `i1(b)`, `i2(b,c)`, `i3(c)`: SQLite reports `SEARCH t1 USING COVERING
+//!   INDEX i1` where this reports `SCAN t1 USING COVERING INDEX i1`, because
+//!   SQLite pushes the `max()` down onto the outer scan and this engine
+//!   evaluates the sub-select per row. And when two indexes tie, SQLite
+//!   resolves the tie with its cost model over estimated row counts, which
+//!   this engine does not collect; see [`choose_index`].
 
 use std::collections::BTreeSet;
 
@@ -165,10 +187,23 @@ pub enum Mode {
 /// An `EXPLAIN` statement: which listing was asked for, and the statement it
 /// wraps.
 ///
-/// The inner statement is a parsed [`Stmt`] rather than text, so that
-/// `EXPLAIN SELECT nosuchcol FROM t` raises the same `no such column` the bare
-/// statement would. SQLite resolves names while preparing, not while running,
-/// and matching that is the difference between a plan and a syntax check.
+/// The inner statement is a parsed [`Stmt`] rather than text, so that a syntax
+/// error inside it surfaces the same way the bare statement's would.
+///
+/// It is *not* enough to raise `no such column`, which this module's docs used
+/// to claim. SQLite resolves names while preparing, and both forms of
+/// `EXPLAIN` raise there:
+///
+/// ```text
+/// EXPLAIN QUERY PLAN SELECT nosuchcol FROM t1   ->  no such column: nosuchcol
+/// EXPLAIN         SELECT nosuchcol FROM t1      ->  no such column: nosuchcol
+/// SELECT                 nosuchcol FROM t1      ->  no such column: nosuchcol
+/// ```
+///
+/// Only the `no such table` half is done here, and [`execute`] does it. A
+/// `no such column` belongs to connection.rs's prepare path, which is where a
+/// bare `SELECT` raises it and where the `EXPLAIN` dispatch has to raise it too
+/// if it is to match.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Explain {
     pub mode: Mode,
@@ -189,14 +224,23 @@ const CONSTANT_ROW: &str = "SCAN CONSTANT ROW";
 ///
 /// The caller has already consumed the keyword; `rest` is the source text from
 /// there on, so a leading `QUERY PLAN` can still be in it. Errors are SQLite's,
-/// byte for byte, and were measured rather than assumed:
+/// byte for byte, and were measured rather than assumed. The two shapes are
+/// *a token that is not a statement* and *no token at all*, and SQLite words
+/// them differently:
 ///
 /// ```text
 /// EXPLAIN;              near ";": syntax error
 /// EXPLAIN QUERY;        near ";": syntax error
 /// EXPLAIN QUERY FOO;    near "FOO": syntax error
 /// EXPLAIN blah;         near "blah": syntax error
+/// EXPLAIN               incomplete input
+/// EXPLAIN QUERY         incomplete input
+/// EXPLAIN QUERY PLAN    incomplete input
 /// ```
+///
+/// The split is where the input ran out, not where the semicolon is: a
+/// semicolon that was actually written is a token and is named, and only an
+/// input that simply stopped reports `incomplete input`. See [`unexpected`].
 pub fn parse(rest: &str) -> Result<Explain> {
     let tokens = Tokenizer::tokenize_all(rest)?;
     let mut mode = Mode::Opcodes;
@@ -222,15 +266,20 @@ pub fn parse(rest: &str) -> Result<Explain> {
 
 /// `near "<token>": syntax error`, naming the token the parser stopped at.
 ///
-/// An index past the end means the input ran out, and the token SQLite names
-/// there is the semicolon that would have followed, which is why a bare
-/// `EXPLAIN;` reports `near ";"` and not a missing-token message.
+/// An index past the end means the input ran out before a statement began, and
+/// SQLite words that differently from a token it dislikes: it reports
+/// `incomplete input`. So the semicolon a bare `EXPLAIN;` stops at is a real
+/// token and is named, while a bare `EXPLAIN` has no token to name and says
+/// the input was incomplete. Measured on 3.53.4, and the same split the
+/// pragma module draws at `pragma.rs:407`.
 fn unexpected(sql: &str, tokens: &[(Token, Span)], index: usize) -> Error {
-    let text = match tokens.get(index) {
-        Some((_, span)) => &sql[span.start..span.end],
-        None => ";",
+    let Some((_, span)) = tokens.get(index) else {
+        return Error::new(ResultCode::Error, "incomplete input");
     };
-    Error::new(ResultCode::Error, format!("near \"{text}\": syntax error"))
+    Error::new(
+        ResultCode::Error,
+        format!("near \"{}\": syntax error", &sql[span.start..span.end]),
+    )
 }
 
 /// Runs an `EXPLAIN` and returns the rows SQLite would return for it.
@@ -402,7 +451,6 @@ const TRUE_PREDICATE: Expr = Expr::Literal(Literal::Integer(1));
 
 /// The plan for a SELECT.
 fn plan_select(sel: &Select, catalog: &Catalog) -> Result<Tree> {
-
     // A non-recursive WITH is planned as though its body had been written in
     // place, which is what SQLite does: `WITH q AS (SELECT a FROM t1) SELECT
     // * FROM q` plans as a scan of t1 and nothing else -- including the body's
@@ -637,9 +685,7 @@ fn plan_select_under(sel: &Select, catalog: &Catalog, outer: &[String]) -> Resul
 /// here: the value is not known while the statement is being planned.
 fn bind_outer_refs(e: &Expr, outer: &[String]) -> Expr {
     match e {
-        Expr::Column {
-            table: Some(t), ..
-        } if outer.iter().any(|o| o.eq_ignore_ascii_case(t)) => {
+        Expr::Column { table: Some(t), .. } if outer.iter().any(|o| o.eq_ignore_ascii_case(t)) => {
             Expr::Literal(Literal::Null)
         }
         Expr::Unary { op, expr } => Expr::Unary {
@@ -981,7 +1027,8 @@ fn plan_body_under(
                 // a `SCALAR SUBQUERY 1` beside it and a second constant row
                 // under that.
                 let mut children = vec![Tree::Leaf(CONSTANT_ROW.to_string())];
-                for (n, sub) in scalar_subqueries(&columns.iter().map(|c| &c.expr).collect::<Vec<_>>())
+                for (n, sub) in
+                    scalar_subqueries(&columns.iter().map(|c| &c.expr).collect::<Vec<_>>())
                 {
                     children.push(Tree::Node(
                         format!("SCALAR SUBQUERY {n}"),
@@ -1070,7 +1117,7 @@ fn plan_body_under(
                             accesses.push(plan_cte_at(body, ctes, catalog, order)?);
                             continue;
                         }
-                        let access = Access::ordered(
+                        let access = Access::build_with(
                             tref,
                             where_.as_ref(),
                             columns,
@@ -1078,13 +1125,13 @@ fn plan_body_under(
                             order,
                             *distinct,
                             catalog,
+                            false,
+                            merging_arm,
                         );
                         access.require()?;
                         // A compound arm is read as part of a merge, where a
                         // whole-table covering index counts; see `line_under`.
-                        accesses.push(Tree::Leaf(
-                            access.line_under(wanted, merging_arm),
-                        ));
+                        accesses.push(Tree::Leaf(access.line_under(wanted, merging_arm)));
                     }
                 }
             }
@@ -1262,14 +1309,29 @@ fn plan_compound(
         return merge_compound(&arms, &names, catalog, ctes, wanted, order);
     }
     // Plain concatenation: one node per arm and one per operator.
+    //
+    // The arms are *not* merge arms here. A concatenation reads each arm once
+    // in whatever order it comes out, so a whole-table index saves nothing and
+    // the strict covering rule stands: `SELECT a FROM t1 UNION ALL SELECT x
+    // FROM t2` reports `SCAN t2`, where the same `t2` under a merge is
+    // `SCAN t2 USING COVERING INDEX i4`.
     let mut children = vec![Tree::Node(
         "LEFT-MOST SUBQUERY".into(),
-        vec![plan_body_under(arms[0], catalog, ctes, wanted, order, true)?],
+        vec![plan_body_under(
+            arms[0], catalog, ctes, wanted, order, false,
+        )?],
     )];
     for (i, name) in names.iter().enumerate() {
         children.push(Tree::Node(
             (*name).to_string(),
-            vec![plan_body_under(arms[i + 1], catalog, ctes, wanted, order, true)?],
+            vec![plan_body_under(
+                arms[i + 1],
+                catalog,
+                ctes,
+                wanted,
+                order,
+                false,
+            )?],
         ));
     }
     Ok(Tree::Node("COMPOUND QUERY".into(), children))
@@ -1328,9 +1390,8 @@ fn merge_compound(
     // `A UNION B UNION ALL C ORDER BY 1`, which is `MERGE (UNION ALL)` over
     // `MERGE (UNION)` rather than the sibling shape the same statement has
     // without the ORDER BY.
-    let peel = order.is_empty()
-        && names.len() > 1
-        && names.last().is_some_and(|n| *n == "UNION ALL");
+    let peel =
+        order.is_empty() && names.len() > 1 && names.last().is_some_and(|n| *n == "UNION ALL");
     let keep = if peel { arms.len() - 1 } else { arms.len() };
     let tree = merge_arms(
         &arms[..keep],
@@ -1378,7 +1439,10 @@ fn merge_arms(
         return Ok(Tree::Node(
             format!("MERGE ({})", names[0]),
             vec![
-                Tree::Node("LEFT".into(), vec![merge_arm_of(arms[0], catalog, ctes, wanted, order)?]),
+                Tree::Node(
+                    "LEFT".into(),
+                    vec![merge_arm_of(arms[0], catalog, ctes, wanted, order)?],
+                ),
                 Tree::Node(
                     "RIGHT".into(),
                     vec![merge_arm_of(arms[1], catalog, ctes, wanted, order)?],
@@ -1959,9 +2023,7 @@ fn qualifiers(body: &SelectBody) -> BTreeSet<String> {
 /// the node it is handed.
 fn collect_qualifiers(e: &Expr, out: &mut BTreeSet<String>) {
     match e {
-        Expr::Column {
-            table: Some(t), ..
-        } => {
+        Expr::Column { table: Some(t), .. } => {
             out.insert(t.to_ascii_lowercase());
         }
         Expr::Unary { expr, .. } => collect_qualifiers(expr, out),
@@ -2062,7 +2124,17 @@ impl<'a> Access<'a> {
         distinct: bool,
         catalog: &'a Catalog,
     ) -> Access<'a> {
-        Self::build(tref, where_, columns, group_by, distinct, catalog, false)
+        Self::build_with(
+            tref,
+            where_,
+            columns,
+            group_by,
+            &[],
+            distinct,
+            catalog,
+            false,
+            false,
+        )
     }
 
     /// The same, for a select that also has an ORDER BY, whose terms are read.
@@ -2076,7 +2148,7 @@ impl<'a> Access<'a> {
         catalog: &'a Catalog,
     ) -> Access<'a> {
         Self::build_with(
-            tref, where_, columns, group_by, order_by, distinct, catalog, false,
+            tref, where_, columns, group_by, order_by, distinct, catalog, false, false,
         )
     }
 
@@ -2095,28 +2167,7 @@ impl<'a> Access<'a> {
     /// WHERE b=1` reports `i1`, where the equivalent `SELECT * FROM t1 WHERE
     /// b=1` reports `i3`.
     fn for_dml(tref: &'a TableRef, where_: Option<&Expr>, catalog: &'a Catalog) -> Access<'a> {
-        Self::build(tref, where_, &[], &[], false, catalog, true)
-    }
-
-    fn build(
-        tref: &'a TableRef,
-        where_: Option<&Expr>,
-        columns: &[ResultColumn],
-        group_by: &[Expr],
-        distinct: bool,
-        catalog: &'a Catalog,
-        whole_row: bool,
-    ) -> Access<'a> {
-        Self::build_with(
-            tref,
-            where_,
-            columns,
-            group_by,
-            &[],
-            distinct,
-            catalog,
-            whole_row,
-        )
+        Self::build_with(tref, where_, &[], &[], &[], false, catalog, true, false)
     }
 
     /// The same, with the ORDER BY terms alongside the GROUP BY ones.
@@ -2142,6 +2193,7 @@ impl<'a> Access<'a> {
         distinct: bool,
         catalog: &'a Catalog,
         whole_row: bool,
+        merge_arm: bool,
     ) -> Access<'a> {
         let mut needed = BTreeSet::new();
         let mut star = false;
@@ -2158,8 +2210,18 @@ impl<'a> Access<'a> {
         for g in group_by {
             add_columns(g, &mut needed);
         }
-        for (term, _) in order_by {
-            needed.insert(term.clone());
+        // The ORDER BY terms join the set a covering index is measured
+        // against, because an ORDER BY that the index delivers means the index
+        // is read instead of the table. They do *not* join it for an arm of a
+        // merge, whose ordering is the compound's rather than the arm's own and
+        // may name a column the arm does not have at all: measured on
+        // `SELECT a FROM t1 UNION ALL SELECT x FROM t2 ORDER BY 1`, where the
+        // `t2` arm is read through `i4(x,y)` -- covering `x` -- and the `a`
+        // that the merge orders by belongs to `t1`.
+        if !merge_arm {
+            for (term, _) in order_by {
+                needed.insert(term.clone());
+            }
         }
         if distinct {
             for c in columns {
@@ -2167,6 +2229,34 @@ impl<'a> Access<'a> {
                     needed.insert(n);
                 }
             }
+        }
+        // A correlated sub-select is re-run for every row of *this* access, so
+        // it reads this table's columns, and an index chosen for the outer scan
+        // has to carry them or the row is fetched anyway. `add_columns` stops at
+        // a sub-select, so those references are collected here instead -- and
+        // only the ones qualified with this table's name, or the inner select's
+        // own columns would be mistaken for this table's.
+        //
+        // Measured on `t1(a,b,c)` with `i1(b)`, `i2(b,c)` and `i3(c)`, where the
+        // result list reads no column of `t1` at all and `i3` is the only index
+        // a plain count finds:
+        //
+        // ```text
+        // SELECT (SELECT x FROM t2 WHERE x=t1.b) FROM t1
+        //     sqlite3   SCAN t1 USING COVERING INDEX i1
+        //     without   SCAN t1 USING COVERING INDEX i3
+        // SELECT (SELECT x FROM t2 WHERE x=t1.a) FROM t1
+        //     sqlite3   SCAN t1          (no index holds `a`, so neither covers)
+        //     without   SCAN t1 USING COVERING INDEX i3
+        // ```
+        for c in columns {
+            add_correlated_refs(&c.expr, &tref.name, &mut needed);
+        }
+        if let Some(w) = where_ {
+            add_correlated_refs(w, &tref.name, &mut needed);
+        }
+        for g in group_by {
+            add_correlated_refs(g, &tref.name, &mut needed);
         }
         let table = catalog.get(&tref.name).cloned();
         let text: BTreeSet<String> = table
@@ -2415,10 +2505,44 @@ impl<'a> Access<'a> {
             .collect();
         let mut key = pinned.min(columns.len());
         let mut served = 0;
-        for (term, _) in wanted {
+        //
+        // A term counts only when the index delivers it in the direction asked
+        // for: an ASC key cannot satisfy `b DESC`, because a reverse scan would
+        // have to be undone for the term behind it. The walk stops there and the
+        // note counts the terms before it. This is the same test as
+        // `order_satisfied`, and it has to be -- the index that gets chosen and
+        // the note printed beside it are one question asked twice. Measured on
+        // `t1(a,b,c)` with `i1(b)`, `i2(b,c)` and `i3(c)`:
+        //
+        //   ORDER BY b, c       SCAN t1 USING INDEX i2                       (no sorter)
+        //   ORDER BY b DESC, c   SCAN t1 USING INDEX i1 ~ LAST TERM OF ORDER BY
+        //   ORDER BY b, c DESC   SCAN t1 USING INDEX i1 ~ LAST TERM OF ORDER BY
+        //
+        // The narrow index is chosen in the DESC cases precisely because the
+        // wide one cannot serve them, so a test that ignored direction would
+        // pick `i2` and then have to report a sorter under an access that
+        // already delivers the order.
+        //
+        // A term counts when the index delivers it in the direction asked for.
+        // The test is `order_satisfied`'s, because the index that gets chosen
+        // and the note printed beside it are one question asked twice.
+        for (i, (term, asc)) in wanted.iter().enumerate() {
+            let at_key = key < columns.len() && columns[key].eq_ignore_ascii_case(term);
+            if at_key {
+                let key_asc = choice.index.ascending.get(key).copied().unwrap_or(true);
+                if *asc != key_asc {
+                    // A reversal reverses every term with it, so only the first
+                    // term -- the one being reversed -- still counts; see
+                    // `order_satisfied` for the rule and the measurements.
+                    if i == 0 {
+                        served += 1;
+                    }
+                    break;
+                }
+            }
             if constants.contains(term) {
                 served += 1;
-            } else if key < columns.len() && columns[key].eq_ignore_ascii_case(term) {
+            } else if at_key {
                 served += 1;
                 key += 1;
             } else {
@@ -2532,14 +2656,34 @@ impl<'a> Access<'a> {
     /// is reported against the table. Measured on `t1(a,b)` with an index on
     /// `(a,b)`, where `SELECT a FROM t1` is `SCAN t1` and not
     /// `SCAN t1 USING INDEX iab`.
-    fn scan_is_useful(&self, index: &Index, wanted: &[(String, bool)]) -> bool {
+    /// [`Access::scan_is_useful`], told whether this is an arm of a merge.
+    ///
+    /// A standalone scan refuses an index as wide as the table, because such an
+    /// index is no narrower than the table it stands in for and so saves
+    /// nothing. An arm of a merge is read whether or not an index is used, so
+    /// the same index does save a table lookup there, and SQLite reports it.
+    /// Measured on `t2(x,y)` with `i4(x,y)`, the whole table:
+    ///
+    /// ```text
+    /// SELECT x FROM t2                          SCAN t2
+    /// SELECT x FROM t2 UNION SELECT a FROM t1   MERGE ... SCAN t2 USING COVERING INDEX i4
+    /// ```
+    ///
+    /// Same index, same columns, same access; the merge is the only difference,
+    /// which is why the leniency is scoped to the arm and reaches both this
+    /// test and the one that prints the word COVERING.
+    fn scan_is_useful_under(&self, index: &Index, wanted: &[(String, bool)], arm: bool) -> bool {
         if self.minmax.is_some() {
             return true;
         }
         if !wanted.is_empty() && order_satisfied(index, wanted) > 0 {
             return true;
         }
-        self.coverable(index, false)
+        if arm {
+            self.coverable_for(index, false, true)
+        } else {
+            self.coverable(index, false)
+        }
     }
 
     /// The access line for this table.
@@ -2610,10 +2754,28 @@ impl<'a> Access<'a> {
             // table instead. Measured on `t1(a,b)` with an index on `(a,b)`,
             // where `SELECT a FROM t1` is `SCAN t1` and not
             // `SCAN t1 USING INDEX iab`.
-            if !self.scan_is_useful(c.index, wanted) {
+            //
+            // An arm of a merge is the one place that reasoning does not hold.
+            // The arm is read anyway, so an index as wide as the table still
+            // saves a table lookup, and SQLite says so. The flag reaches
+            // `coverable_for` as `useful`: outside a merge `useful` is already
+            // true whenever `scan_is_useful` let us get here, because the only
+            // ways through are a min/max, an ordering, or a strict covering
+            // index, and the first two are the `useful` cases. Inside a merge
+            // the arm may be covering only under the lenient rule, and
+            // `coverable_for` is what applies it. Measured on `t2(x,y)` with
+            // `i4(x,y)`, the whole table:
+            //
+            //   SELECT x FROM t2                          SCAN t2
+            //   SELECT x FROM t2 UNION SELECT a FROM t1   ... SCAN t2 USING COVERING INDEX i4
+            //
+            // The same flag as the test above, for the same reason: an arm may
+            // be covering only under the lenient rule, and a standalone scan
+            // only under the strict one.
+            if !self.scan_is_useful_under(c.index, wanted, arm) {
                 return format!("SCAN {}{}", self.name, self.left_join_suffix());
             }
-            let kind = if self.coverable_for(c.index, false, true || arm) {
+            let kind = if self.coverable_for(c.index, false, arm) {
                 "COVERING INDEX"
             } else {
                 "INDEX"
@@ -2671,12 +2833,65 @@ struct Choice<'i> {
     eq_prefix: usize,
 }
 
+/// How many leading ORDER BY terms an index delivers, in the order asked.
+///
+/// A term is served when the index's key column names it *and* the key is
+/// declared in the direction the term asks for. A mismatch is not fatal: the
+/// scan can be run backwards, so the mismatched term itself is still delivered
+/// -- and nothing after it is, because those terms would come out reversed
+/// along with it. That is why a mismatch costs exactly one term.
+///
+/// Measured on `t1(a,b,c)` with `i1(b)`, `i2(b,c)`, `i3(c)`, all declared ASC:
+///
+/// ```text
+/// ORDER BY b DESC         SCAN t1 USING INDEX i1
+/// ORDER BY b DESC, c      SCAN t1 USING INDEX i1 ~ LAST TERM OF ORDER BY
+/// ORDER BY b, c DESC      SCAN t1 USING INDEX i1 ~ LAST TERM OF ORDER BY
+/// ORDER BY b, c           SCAN t1 USING INDEX i2
+/// ```
+///
+/// and on `t(a,b,c,d)` with `i3(b,c,d)`, where the mismatch costs two:
+///
+/// ```text
+/// ORDER BY b DESC, c, d   SCAN t USING INDEX i3 ~ LAST 2 TERMS OF ORDER BY
+/// ```
+///
+/// The narrow index in the DESC cases is not a fallback: `i2` cannot serve them
+/// at all, so counting direction is what makes the right one win.
 fn order_satisfied(index: &Index, order: &[(String, bool)]) -> usize {
-    order
-        .iter()
-        .zip(index.columns.iter())
-        .take_while(|((c, _), ic)| c.eq_ignore_ascii_case(ic))
-        .count()
+    let mut served = 0usize;
+    for (i, (term, asc)) in order.iter().enumerate() {
+        let Some(key) = index.columns.get(i) else {
+            break;
+        };
+        if !term.eq_ignore_ascii_case(key) {
+            break;
+        }
+        let key_asc = index.ascending.get(i).copied().unwrap_or(true);
+        if *asc != key_asc {
+            // A reversed term is delivered by running the scan backwards, and
+            // that reverses every term with it. So the *first* term still
+            // counts -- it is the one being reversed -- but nothing behind it
+            // can, and a reversal anywhere else costs the whole order. Measured
+            // on `t(a,b,c)` with `i1(b)` and `i2(b,c)`, all declared ASC:
+            //
+            //   ORDER BY b DESC         SCAN t USING INDEX i1               1 of 1
+            //   ORDER BY b DESC, c      SCAN t USING INDEX i1 ~ LAST TERM   1 of 2
+            //   ORDER BY b, c DESC      SCAN t USING INDEX i1 ~ LAST TERM   1 of 2
+            //   ORDER BY c DESC, b      SCAN t ~ USE TEMP B-TREE            0 of 2
+            //   ORDER BY b DESC, c, a   SCAN t USING INDEX i1 ~ LAST 2      1 of 3
+            //
+            // The narrow `i1` is chosen in the second and third because `i2`
+            // serves none of them: its `c` sits behind its `b`, so reversing on
+            // `c` reverses `b` too and the index orders nothing.
+            if i == 0 {
+                served += 1;
+            }
+            break;
+        }
+        served += 1;
+    }
+    served
 }
 
 /// How many leading key columns are pinned by equality.
@@ -3619,6 +3834,12 @@ fn minmax_arg(e: &Expr) -> Option<String> {
 }
 
 /// The columns an expression reads, for the covering test.
+///
+/// A sub-select nested in the expression contributes nothing here; its
+/// references back to *this* query are collected by [`Access::build_with`],
+/// which is the only place that knows which table this access is for. A
+/// sub-select's own columns belong to its own FROM, and letting them in here
+/// would let an index satisfy a name it does not hold.
 fn add_columns(e: &Expr, out: &mut BTreeSet<String>) {
     match e {
         Expr::Column { name, .. } => {
@@ -3679,6 +3900,200 @@ fn add_columns(e: &Expr, out: &mut BTreeSet<String>) {
         }
         Expr::Cast { expr, .. } => add_columns(expr, out),
         Expr::Collate { expr, .. } => add_columns(expr, out),
+        _ => {}
+    }
+}
+
+/// The columns of `table` that a sub-select nested in `e` reads, for the
+/// covering test. See [`Access::build_with`] for why they count.
+///
+/// Only a *qualified* reference counts, for the same reason
+/// [`subquery_reads_from`] gives: `t1.b` names the outer row, while a bare `b`
+/// resolves inside the sub-select's own FROM and says nothing about it. The
+/// traversal is the same shape as [`add_columns`], because a sub-select can sit
+/// anywhere in an expression, but each one is descended into for *this* table
+/// only.
+fn add_correlated_refs(e: &Expr, table: &str, out: &mut BTreeSet<String>) {
+    match e {
+        Expr::Subquery { select } => {
+            add_qualified_in_body(&select.body, table, out);
+        }
+        Expr::Exists { select, .. } => {
+            add_qualified_in_body(&select.body, table, out);
+        }
+        Expr::Unary { expr, .. } => add_correlated_refs(expr, table, out),
+        Expr::Binary { left, right, .. } => {
+            add_correlated_refs(left, table, out);
+            add_correlated_refs(right, table, out);
+        }
+        Expr::IsNull { expr, .. } => add_correlated_refs(expr, table, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            add_correlated_refs(expr, table, out);
+            add_correlated_refs(low, table, out);
+            add_correlated_refs(high, table, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            add_correlated_refs(expr, table, out);
+            for i in list {
+                add_correlated_refs(i, table, out);
+            }
+        }
+        Expr::InSelect { expr, select, .. } => {
+            add_correlated_refs(expr, table, out);
+            add_qualified_in_body(&select.body, table, out);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            add_correlated_refs(expr, table, out);
+            add_correlated_refs(pattern, table, out);
+            if let Some(e) = escape {
+                add_correlated_refs(e, table, out);
+            }
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                add_correlated_refs(a, table, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => {
+            if let Some(o) = operand {
+                add_correlated_refs(o, table, out);
+            }
+            for (a, b) in whens {
+                add_correlated_refs(a, table, out);
+                add_correlated_refs(b, table, out);
+            }
+            if let Some(o) = otherwise {
+                add_correlated_refs(o, table, out);
+            }
+        }
+        Expr::Cast { expr, .. } => add_correlated_refs(expr, table, out),
+        Expr::Collate { expr, .. } => add_correlated_refs(expr, table, out),
+        _ => {}
+    }
+}
+
+/// [`add_correlated_refs`] over a sub-select's whole body, including a nested
+/// body or the two arms of a compound.
+fn add_qualified_in_body(body: &SelectBody, table: &str, out: &mut BTreeSet<String>) {
+    match body {
+        SelectBody::Nested(s) => add_qualified_in_body(&s.body, table, out),
+        SelectBody::Compound { left, right, .. } => {
+            add_qualified_in_body(left, table, out);
+            add_qualified_in_body(right, table, out);
+        }
+        SelectBody::Simple {
+            columns,
+            where_,
+            group_by,
+            values,
+            ..
+        } => {
+            for c in columns {
+                add_qualified_in_expr(&c.expr, table, out);
+            }
+            if let Some(w) = where_ {
+                add_qualified_in_expr(w, table, out);
+            }
+            for g in group_by {
+                add_qualified_in_expr(g, table, out);
+            }
+            if let Some(vs) = values {
+                for r in vs {
+                    for e in r {
+                        add_qualified_in_expr(e, table, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The columns of `table` that one expression qualifies, descending through the
+/// containers an expression can nest inside but not through another sub-select,
+/// which has its own body and is handled by [`add_qualified_in_body`].
+fn add_qualified_in_expr(e: &Expr, table: &str, out: &mut BTreeSet<String>) {
+    match e {
+        Expr::Column {
+            table: Some(t),
+            name,
+            ..
+        } if t.eq_ignore_ascii_case(table) => {
+            out.insert(name.to_ascii_lowercase());
+        }
+        Expr::Subquery { select } | Expr::Exists { select, .. } => {
+            add_qualified_in_body(&select.body, table, out);
+        }
+        Expr::InSelect { expr, select, .. } => {
+            add_qualified_in_expr(expr, table, out);
+            add_qualified_in_body(&select.body, table, out);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
+            add_qualified_in_expr(expr, table, out)
+        }
+        Expr::Binary { left, right, .. } => {
+            add_qualified_in_expr(left, table, out);
+            add_qualified_in_expr(right, table, out);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            add_qualified_in_expr(expr, table, out);
+            add_qualified_in_expr(low, table, out);
+            add_qualified_in_expr(high, table, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            add_qualified_in_expr(expr, table, out);
+            for i in list {
+                add_qualified_in_expr(i, table, out);
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            add_qualified_in_expr(expr, table, out);
+            add_qualified_in_expr(pattern, table, out);
+            if let Some(e) = escape {
+                add_qualified_in_expr(e, table, out);
+            }
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                add_qualified_in_expr(a, table, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => {
+            if let Some(o) = operand {
+                add_qualified_in_expr(o, table, out);
+            }
+            for (a, b) in whens {
+                add_qualified_in_expr(a, table, out);
+                add_qualified_in_expr(b, table, out);
+            }
+            if let Some(o) = otherwise {
+                add_qualified_in_expr(o, table, out);
+            }
+        }
+        Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => {
+            add_qualified_in_expr(expr, table, out)
+        }
         _ => {}
     }
 }

@@ -321,6 +321,43 @@ fn explain_syntax_errors_match_sqlite() {
     }
 }
 
+/// Input that runs out before a statement begins says `incomplete input`,
+/// which is a different message from the one a written-out semicolon gets.
+///
+/// The boundary is the input, not the semicolon: `EXPLAIN;` stops *at* a token
+/// and names it, while `EXPLAIN` has no token left to name. Every row here was
+/// read off sqlite3 3.53.4:
+///
+/// ```text
+/// EXPLAIN                   -> incomplete input
+/// EXPLAIN QUERY             -> incomplete input
+/// EXPLAIN QUERY PLAN        -> incomplete input
+/// EXPLAIN QUERY PLAN;       -> near ";": syntax error
+/// EXPLAIN blah              -> near "blah": syntax error
+/// EXPLAIN QUERY FOO         -> near "FOO": syntax error
+/// ```
+#[test]
+fn an_explain_that_runs_out_is_incomplete_input() {
+    for rest in ["", " QUERY", " QUERY PLAN"] {
+        let err = explain::parse(rest).expect_err(&format!("{rest:?} must not parse"));
+        assert_eq!(err.message, "incomplete input", "for EXPLAIN{rest}");
+    }
+}
+
+/// The same split with the semicolon written out, so the two are neighbours
+/// rather than the same case twice.
+#[test]
+fn a_written_semicolon_is_still_named() {
+    for rest in [" QUERY PLAN;", " QUERY FOO", " blah"] {
+        let err = explain::parse(rest).expect_err(&format!("{rest:?} must not parse"));
+        assert!(
+            err.message.starts_with("near \""),
+            "for EXPLAIN{rest}: got {}",
+            err.message
+        );
+    }
+}
+
 /// A statement `EXPLAIN` wraps is parsed, so its own syntax error surfaces.
 #[test]
 fn explain_reports_the_wrapped_statements_syntax_error() {
@@ -1527,5 +1564,61 @@ fn a_cte_is_inlined_in_place_in_the_from_clause() {
         "EXPLAIN QUERY PLAN WITH q AS (SELECT a FROM t1) SELECT * FROM t2, q",
         &cat,
         "SCAN t2 ~ SCAN t1",
+    );
+}
+
+// --- a correlated sub-select reads the outer table -------------------------
+
+/// A correlated sub-select re-runs for every outer row, so it reads the outer
+/// table's columns, and the index chosen for the outer scan has to carry them.
+///
+/// This is a coverage question the result list alone cannot answer: the outer
+/// query projects a sub-select and names no column of `t1` at all, so a count
+/// taken from the projections alone finds only `i3(c)` covering. Measured on
+/// `t1(a,b,c)` with `i1(b)`, `i2(b,c)` and `i3(c)`:
+///
+/// ```text
+/// SELECT (SELECT x FROM t2 WHERE x=t1.b) FROM t1
+///     sqlite3   SCAN t1 USING COVERING INDEX i1
+/// SELECT (SELECT x FROM t2 WHERE x=t1.a) FROM t1
+///     sqlite3   SCAN t1                      (no index holds `a`, so none covers)
+/// ```
+#[test]
+fn a_correlated_subquery_column_counts_for_the_outer_covering_test() {
+    let cat = catalog(
+        vec![table("t1", &["a", "b", "c"]), table("t2", &["x", "y"])],
+        vec![
+            index("i1", "t1", &["b"], false),
+            index("i2", "t1", &["b", "c"], false),
+            index("i3", "t1", &["c"], false),
+            index("i4", "t2", &["x", "y"], false),
+        ],
+    );
+    // `t1.b` is what the sub-select reads, and `i1` holds it.
+    eqp_on(
+        "EXPLAIN QUERY PLAN SELECT (SELECT x FROM t2 WHERE x=t1.b) FROM t1",
+        &cat,
+        "SCAN t1 USING COVERING INDEX i1 ~ CORRELATED SCALAR SUBQUERY 1 ~ SEARCH t2 USING COVERING INDEX i4 (x=?)",
+    );
+}
+
+/// The same shape with a column no index holds, which is what makes the rule
+/// falsifiable: if the sub-select's reference were ignored, `i3` would cover and
+/// the plan would say so.
+#[test]
+fn an_uncorrelated_column_leaves_no_index_covering() {
+    let cat = catalog(
+        vec![table("t1", &["a", "b", "c"]), table("t2", &["x", "y"])],
+        vec![
+            index("i1", "t1", &["b"], false),
+            index("i2", "t1", &["b", "c"], false),
+            index("i3", "t1", &["c"], false),
+            index("i4", "t2", &["x", "y"], false),
+        ],
+    );
+    eqp_on(
+        "EXPLAIN QUERY PLAN SELECT (SELECT x FROM t2 WHERE x=t1.a) FROM t1",
+        &cat,
+        "SCAN t1 ~ CORRELATED SCALAR SUBQUERY 1 ~ SEARCH t2 USING COVERING INDEX i4 (x=?)",
     );
 }

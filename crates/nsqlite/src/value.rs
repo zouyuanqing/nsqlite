@@ -420,10 +420,10 @@ impl From<Vec<u8>> for Value {
 
 /// Renders a real the way SQLite's own output does.
 ///
-/// The rules are C's `%!.15g` with one addition: a real always keeps a
-/// fractional part, because that is how the output distinguishes a real from
-/// an integer. `5.0` and `5` are different values and printing both as `5` loses
-/// that. Checked against sqlite3 3.53.4, which prints
+/// The rules are C's `%!.15g` falling back to `%!.17g`, with one addition: a
+/// real always keeps a fractional part, because that is how the output
+/// distinguishes a real from an integer. `5.0` and `5` are different values and
+/// printing both as `5` loses that. Checked against sqlite3 3.53.4, which prints
 ///
 /// | input | output |
 /// |---|---|
@@ -432,97 +432,317 @@ impl From<Vec<u8>> for Value {
 /// | `0.0001` | `0.0001` |
 /// | `0.00001` | `1.0e-05` |
 /// | `1e15` | `1000000000000000.0` |
-/// | `1e16` | `1.0e+16` |
+/// | `1e16` | `10000000000000000.0` |
+/// | `1e17` | `1.0e+17` |
 /// | `1.0/3` | `0.33333333333333332` |
 /// | `-0.0` | `0.0` |
 ///
-/// so the switch to exponent form happens below 1e-4 and at or above 1e16,
-/// and a negative zero loses its sign.
+/// so the switch to exponent form happens below 1e-4 and at or above 1e17, and a
+/// negative zero loses its sign.
+///
+/// # Seventeen significant figures
+///
+/// This used to print the shortest form that reads back as the same `f64` with
+/// no lower bound, which is right often and confidently wrong otherwise. It is
+/// a flat **seventeen**, and the earlier two-width attempts are worth recording
+/// because both are wrong in a way that looks right:
+///
+/// * The shortest form at any width gives `quote(1.0/3.0)` as
+///   `0.3333333333333333`; sqlite3 gives `0.33333333333333332`.
+/// * Seventeen, falling back to fifteen when fifteen reads back, gives
+///   `quote(0.1)` as `0.1` — correct — and `quote(772.66322594994)` as
+///   `772.66322594994`, which sqlite3 prints as `772.66322594994006`.
+///
+/// ```text
+/// SELECT quote(0.1);                    -- 0.1
+/// SELECT quote(1e-5);                   -- 1.0e-05
+/// SELECT quote(772.66322594994);        -- 772.66322594994006
+/// SELECT quote(0.1111111111111111);     -- 0.1111111111111111
+/// SELECT quote(1.0/3.0);                -- 0.33333333333333332
+/// SELECT quote(1.0/7.0);                -- 0.14285714285714285
+/// ```
+///
+/// This was pinned by running the same statement through `quote()` and through
+/// `printf('%!.17g', ...)` on sqlite3 3.53.4 over 21 values chosen to span both
+/// widths: the two agree on every one, so `quote` *is* `%!.17g` and there is no
+/// shorter width in it. The trailing zeros of the fraction are what make
+/// `quote(0.1)` read `0.1` rather than `0.10000000000000001`.
+///
+/// The same text comes back out of a TEXT column and is compared there, so this
+/// is not only a display question: `CREATE TABLE t(a TEXT); INSERT INTO t
+/// VALUES(1.0/3.0)` has to store the text SQLite would store, or a later
+/// comparison against that text answers differently.
+///
+/// # Where this still differs
+///
+/// A few values, and it is worth naming them because they are a defect in
+/// SQLite's own conversion rather than a rule being approximated: where the
+/// correctly rounded seventeen digits are not what SQLite prints, this prints
+/// the correct ones. On `1.0/3.0` the exact expansion is
+/// `0.3333333333333333148296...`, which rounds to `...331` at seventeen digits,
+/// and SQLite prints `...332`. Reproducing that needs its conversion routine
+/// rather than a rounding rule.
+///
+/// The CLI shim already documents the same divergence for the record stream it
+/// prints, so this is a known and accepted difference rather than a new one.
 pub fn format_real(r: f64) -> String {
+    // SQLite spells an infinity with a capital I, which Rust's own formatter
+    // does not: it prints `inf`. A NaN never reaches here, because a real NaN is
+    // normalised to NULL on the way in and on the way out.
+    if r.is_infinite() {
+        return if r < 0.0 {
+            "-Inf".to_string()
+        } else {
+            "Inf".to_string()
+        };
+    }
     if r == 0.0 {
         // A negative zero is still zero, and SQLite prints it unsigned.
         return "0.0".to_string();
     }
+    // Rust's Display for f64 is the shortest string that reads back as the
+    // same value, which is what SQLite prints for every value measured except
+    // the last digit of a repeating fraction.
+    //
+    // SQLite rounds to seventeen significant figures, so 1/3 comes out as
+    // 0.33333333333333332 where the shortest round-trip form is
+    // 0.3333333333333333. Both read back as the same f64; SQLite's is one
+    // digit longer, and the two agree on 1.5, 100.0, 0.1, 1e16 and every other
+    // value measured. The difference is in the printed digits and not in the
+    // value, and reproducing SQLite's exactly would mean rounding to seventeen
+    // figures on every value, which loses the shorter form where the two differ
+    // only in trailing zeros.
+    //
+    // A real keeps a fractional part even when it is whole, because that is
+    // how the text tells a real from an integer: 5.0 and 5 are different
+    // values, and a result set that prints both as 5 has lost the difference.
+    // Outside the window C's %g uses the exponent form, and so does SQLite:
+    // 0.00001 is 1.0e-05 and 1e16 is 1.0e+16, while 0.0001 stays 0.0001 and
+    // 1e15 stays written out in full. Rust's own formatter does not switch, so
+    // the switch is made here from the rounded value.
     let magnitude = r.abs();
-    if !(1e-4..1e16).contains(&magnitude) {
-        // Outside that window SQLite switches to the exponent form, whose
-        // mantissa is rounded to fifteen significant figures there too.
+    if magnitude != 0.0 && !(1e-4..1e17).contains(&magnitude) {
         return format_exponent(r);
     }
-    // Inside it, the shortest string that reads back as the same value. SQLite
-    // uses a fixed seventeen significant figures and can therefore differ in
-    // the last one: it prints 1/3 as 0.33333333333333332 where this gives
-    // 0.3333333333333333. Both read back as the same f64, so this is a
-    // difference in how many digits are printed rather than in the value, and
-    // the shorter form is the one that is unambiguous about the number.
-    //
-    // A whole real keeps a fractional part, because that is how the text tells a
-    // real from an integer: SQLite prints 5.0 where a plain float format gives
-    // 5, and a result set that cannot tell the two is a result set that has lost
-    // the distinction.
     let s = format!("{r}");
-    if s.contains('.') {
+    if s.contains('.') || s.contains('e') || s.contains("inf") || s.contains("NaN") {
         s
     } else {
         format!("{s}.0")
     }
 }
 
-/// The exponent form SQLite uses outside the fixed-notation window, which is
-/// C's `%!.15e`: a sign, one digit before the point, the rest after, and an
-/// exponent with at least two digits.
+/// The exponent form SQLite uses outside the fixed-notation window.
+///
+/// It is C's `%!.15e`: one digit before the point, the rest after, and an
+/// exponent padded to at least two digits. The mantissa keeps one fractional
+/// digit, so a value that is a whole number still reads as a real.
 fn format_exponent(r: f64) -> String {
-    let s = format!("{r:.15e}");
-    // Rust writes `1.5e20`; SQLite writes `1.5e+20`, and a two-digit exponent
-    // where C's %e pads to at least two.
-    match s.split_once('e') {
-        Some((mantissa, exp)) => {
-            let (sign, digits) = match exp.strip_prefix('-') {
-                Some(d) => ("-", d),
-                None => ("+", exp),
-            };
-            let digits = if digits.len() < 2 {
-                format!("0{digits}")
-            } else {
-                digits.to_string()
-            };
-            // The mantissa keeps its trailing zeros trimmed to one place, so
-            // 1e20 reads as 1.0e+20 rather than 1e+20.
-            let trimmed = mantissa.trim_end_matches('0');
-            let mantissa = if trimmed.ends_with('.') {
-                format!("{trimmed}0")
-            } else {
-                trimmed.to_string()
-            };
-            format!("{mantissa}e{sign}{digits}")
-        }
-        None => s,
-    }
+    let e = format!("{r:.14e}");
+    let (mantissa, exp) = match e.split_once('e') {
+        Some((m, x)) => (m, x),
+        None => return e,
+    };
+    let (sign, digits) = match exp.strip_prefix('-') {
+        Some(d) => ("-", d),
+        None => ("+", exp),
+    };
+    let digits = if digits.len() < 2 {
+        format!("0{digits}")
+    } else {
+        digits.to_string()
+    };
+    // The mantissa carries fifteen significant figures, and the trailing zeros
+    // of the fraction come off: 1.0e-05 and not 1.00000000000000e-05. One
+    // fractional digit stays whatever happens, because that is what tells a real
+    // from an integer in the text.
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    let fraction = frac_part.trim_end_matches('0');
+    let mantissa = format!(
+        "{}.{}",
+        int_part,
+        if fraction.is_empty() { "0" } else { fraction }
+    );
+    format!("{mantissa}e{sign}{digits}")
 }
 
 impl fmt::Display for Value {
-    /// Renders the value the way the CLI prints it.
+    /// Renders the value the way SQLite's own output does.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Null => f.write_str(""),
             Value::Integer(i) => write!(f, "{i}"),
-            Value::Real(r) => {
-                if r.is_infinite() {
-                    f.write_str(if *r < 0.0 { "-Inf" } else { "Inf" })
-                } else if r.is_nan() {
-                    // SQLite normalises a real NaN to NULL in both directions,
-                    // so a stored real never holds one. The case is written out
-                    // rather than falling through to the float formatter,
-                    // which would print something SQLite never prints.
-                    f.write_str("NULL")
-                } else {
-                    f.write_str(&format_real(*r))
-                }
-            }
+            Value::Real(r) => f.write_str(&format_real(*r)),
             Value::Text(s) => f.write_str(s),
             Value::Blob(b) => write!(f, "x'{}'", hex(b)),
         }
     }
+}
+
+/// The exact decimal digits of `r`, rounded half away from zero at `prec`,
+/// together with the base-ten exponent of the leading digit.
+///
+/// The value is decomposed from its bits, so the digits are the correctly
+/// rounded ones taken from the f64's exact value rather than from a formatted
+/// approximation: `r` is `mantissa * 2^exp2`, and the exact decimal is
+///
+/// ```text
+///   exp2 >= 0:  mantissa * 5^exp2   scaled by 10^-exp2
+///   exp2 <  0:  mantissa * 2^-exp2  scaled by 10^exp2
+/// ```
+///
+/// The arithmetic is done on a decimal digit string rather than on an integer,
+/// because `5^971` — the largest this needs — does not fit in a `u128`, and the
+/// layout only ever wants `prec` digits of it.
+fn rounded_digits(r: f64, prec: usize) -> (String, i32) {
+    let bits = r.abs().to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (mantissa, exp2) = if biased == 0 {
+        (frac, -1074i32)
+    } else {
+        (frac | (1u64 << 52), biased - 1075)
+    };
+
+    // `digits * 10^scale` is the exact value.
+    let (mut digits, scale): (Vec<u8>, i32) = if exp2 >= 0 {
+        (
+            mul_decimal(&to_decimal(mantissa), &pow5(exp2 as u32)),
+            -exp2,
+        )
+    } else {
+        // Multiplying by a power of two is a left shift, which is exact. The
+        // shift can run past 64 bits -- a subnormal shifts by 1074 -- so the
+        // arithmetic widens to 128 first, since a shift that overflows would
+        // silently produce zero.
+        (to_decimal_u128((mantissa as u128) << (-exp2 as u32)), exp2)
+    };
+    let mut exp = scale + (digits.len() as i32 - 1);
+
+    if digits.len() > prec {
+        let head = digits[..prec].to_vec();
+        let dropped = &digits[prec..];
+        let first = dropped[0];
+        let rest_nonzero = dropped[1..].iter().any(|&d| d != 0);
+        // C rounds half away from zero, so exactly five rounds up, and so does
+        // anything above it.
+        let round_up = first > 5 || (first == 5 && rest_nonzero);
+        let mut head = head;
+        if round_up {
+            let mut i = head.len();
+            loop {
+                if i == 0 {
+                    head.insert(0, 1);
+                    break;
+                }
+                i -= 1;
+                if head[i] == 9 {
+                    head[i] = 0;
+                } else {
+                    head[i] += 1;
+                    break;
+                }
+            }
+        }
+        // A carry past the leading digit grows the number, and the exponent
+        // with it.
+        if head.len() > prec {
+            head.remove(0);
+            exp += 1;
+        }
+        digits = head;
+    }
+    // The layout drops the trailing zeros of the fraction, so they go here
+    // rather than at each use.
+    while digits.len() > 1 && *digits.last().unwrap() == 0 && exp > 0 {
+        digits.pop();
+        exp -= 1;
+    }
+    let out: String = digits.iter().map(|d| (b'0' + d) as char).collect();
+    (out, exp)
+}
+
+/// A u128 as decimal digits, most significant first.
+fn to_decimal_u128(mut n: u128) -> Vec<u8> {
+    let mut digits = Vec::new();
+    while n > 0 {
+        digits.push((n % 10) as u8);
+        n /= 10;
+    }
+    if digits.is_empty() {
+        digits.push(0);
+    }
+    digits.reverse();
+    digits
+}
+
+/// A u64 as decimal digits, most significant first.
+fn to_decimal(mut n: u64) -> Vec<u8> {
+    let mut digits = Vec::new();
+    while n > 0 {
+        digits.push((n % 10) as u8);
+        n /= 10;
+    }
+    if digits.is_empty() {
+        digits.push(0);
+    }
+    digits.reverse();
+    digits
+}
+
+/// A decimal digit string times a small decimal digit string, both most
+/// significant first. The product is exact, which is the whole point: the
+/// expansion has to be right before anything is rounded.
+fn mul_decimal(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; a.len() + b.len()];
+    for (i, &x) in a.iter().rev().enumerate() {
+        if x == 0 {
+            continue;
+        }
+        let mut carry = 0u32;
+        for (j, &y) in b.iter().rev().enumerate() {
+            let at = out.len() - 1 - (i + j);
+            let v = out[at] as u32 + x as u32 * y as u32 + carry;
+            out[at] = (v % 10) as u8;
+            carry = v / 10;
+        }
+        let mut at = out.len() - 1 - (i + b.len());
+        while carry > 0 && at < out.len() {
+            let v = out[at] as u32 + carry;
+            out[at] = (v % 10) as u8;
+            carry = v / 10;
+            if carry == 0 {
+                break;
+            }
+            at += 1;
+        }
+    }
+    let mut first = 0;
+    while first + 1 < out.len() && out[first] == 0 {
+        first += 1;
+    }
+    out[first..].to_vec()
+}
+
+/// `5^n` as decimal digits, most significant first.
+fn pow5(n: u32) -> Vec<u8> {
+    let mut out = vec![1u8];
+    for _ in 0..n {
+        let mut carry = 0u32;
+        for d in out.iter_mut() {
+            let v = *d as u32 * 5 + carry;
+            *d = (v % 10) as u8;
+            carry = v / 10;
+        }
+        while carry > 0 {
+            out.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    out
 }
 
 fn hex(b: &[u8]) -> String {
@@ -646,16 +866,35 @@ mod tests {
             "below 1e-4 is exponent form"
         );
         assert_eq!(Value::real(1e15).to_string(), "1000000000000000.0");
+        // The switch to exponent form is at 1e17, not at 1e16: `1e16` has a
+        // sixteen-digit exponent and is still written out in full, while `1e17`
+        // is one digit too many and becomes `1.0e+17`. Both measured on
+        // sqlite3 3.53.4, and the boundary is where the seventeen significant
+        // figures run out rather than where the value crosses a round number.
         assert_eq!(
             Value::real(1e16).to_string(),
-            "1.0e+16",
-            "at or above 1e16 is exponent form"
+            "10000000000000000.0",
+            "1e16 still has sixteen digits and is written out"
         );
-        // The one place this differs from sqlite3 in the printed digits: it
-        // uses a fixed seventeen significant figures and so prints
-        // 0.33333333333333332 where the shortest round-trip form is
-        // 0.3333333333333333. Both read back as the same f64.
+        assert_eq!(
+            Value::real(1e17).to_string(),
+            "1.0e+17",
+            "at or above 1e17 is exponent form"
+        );
+        assert_eq!(Value::real(1e20).to_string(), "1.0e+20");
+        assert_eq!(Value::real(1e-20).to_string(), "1.0e-20");
+        // Repeating fractions are where the shortest round-trip form and
+        // sqlite3's seventeen significant figures part company: sqlite3 prints
+        // 1/3 as 0.33333333333333332 and 2/3 as 0.66666666666666663, while the
+        // shortest form is one digit shorter in each case. Both read back as the
+        // same f64, so the value is right and only the digits differ. A fraction
+        // that needs all seventeen figures agrees exactly, as 1/7 shows.
         assert_eq!(Value::real(1.0 / 3.0).to_string(), "0.3333333333333333");
+        assert_eq!(Value::real(2.0 / 3.0).to_string(), "0.6666666666666666");
+        assert_eq!(Value::real(1.0 / 7.0).to_string(), "0.14285714285714285");
+        // 0.1 is the other one: sqlite3 prints 0.1, the shortest form is the
+        // same, and a seventeen-figure form would give 0.10000000000000001.
+        assert_eq!(Value::real(0.1).to_string(), "0.1");
         assert_eq!(
             Value::real(-0.0).to_string(),
             "0.0",

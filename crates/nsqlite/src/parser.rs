@@ -897,7 +897,11 @@ impl<'a> Parser<'a> {
             let expr = self.expr()?;
             // The text of the expression is what names the column when there is
             // no alias, and it ends where the expression did, before any alias.
-            let expr_end = self.tokens.get(self.pos.saturating_sub(1)).map(|(_, s)| s.end).unwrap_or(expr_start);
+            let expr_end = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map(|(_, s)| s.end)
+                .unwrap_or(expr_start);
             let source = self
                 .sql
                 .get(expr_start..expr_end)
@@ -916,7 +920,12 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            out.push(ResultColumn { expr, alias, span, source });
+            out.push(ResultColumn {
+                expr,
+                alias,
+                span,
+                source,
+            });
             if !self.eat_punct(Punct::Comma)? {
                 break;
             }
@@ -2203,7 +2212,10 @@ impl<'a> Parser<'a> {
                     Some(other) => {
                         return Err(Error::new(
                             crate::error::ResultCode::Error,
-                            format!("near \"{}\": syntax error in a declared type", describe_token(&other)),
+                            format!(
+                                "near \"{}\": syntax error in a declared type",
+                                describe_token(&other)
+                            ),
                         ))
                     }
                 }
@@ -2218,7 +2230,11 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(ColumnDef { name, ty, constraints })
+        Ok(ColumnDef {
+            name,
+            ty,
+            constraints,
+        })
     }
 
     /// Reads one word of a column type, stopping at anything that starts a
@@ -2459,7 +2475,10 @@ impl<'a> Parser<'a> {
     fn create_index(&mut self) -> Result<Stmt> {
         // The statement's own text starts at CREATE, which is the token before
         // the one the caller consumed.
-        let start = self.tokens.get(self.pos.saturating_sub(1)).map(|(_, s)| s.start);
+        let start = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|(_, s)| s.start);
         let unique = self.eat_keyword(Keyword::Unique)?;
         self.expect_keyword(Keyword::Index, "after CREATE")?;
         let if_not_exists = self.if_not_exists()?;
@@ -2508,7 +2527,14 @@ impl<'a> Parser<'a> {
             Some(a) => crate::index_ddl::sql_for_statement(&self.sql[a..]).unwrap_or_default(),
             None => String::new(),
         };
-        Ok(Stmt::CreateIndex { name, table, columns, unique, if_not_exists, sql })
+        Ok(Stmt::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+            if_not_exists,
+            sql,
+        })
     }
 
     fn drop(&mut self) -> Result<Stmt> {

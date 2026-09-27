@@ -488,7 +488,7 @@ fn an_unknown_column_in_the_column_list_is_reported() {
 // --- what a mid-statement failure leaves behind ---------------------------
 
 #[test]
-fn a_mid_statement_failure_leaves_the_earlier_rows_visible_in_the_session() {
+fn a_not_null_failure_part_way_leaves_nothing_behind() {
     // The measurement behind [`nsqlite::insert_select::ATOMICITY`].
     //
     // sqlite3 3.53.4, same statements, count taken in the same session:
@@ -497,16 +497,12 @@ fn a_mid_statement_failure_leaves_the_earlier_rows_visible_in_the_session() {
     //   INSERT INTO t SELECT x FROM s;   -> NOT NULL constraint failed: t.a
     //   SELECT count(*) FROM t;           -> 0
     //
-    // this engine, same session, after reopen:
-    //   SELECT count(*) FROM t;           -> 2
-    //   SELECT sum(a) FROM t;             -> 3
-    //   reopen, SELECT count(*) FROM t;   -> 0
-    //
-    // The rows before the NULL really are in the b-tree -- it is a read-back
-    // that sees them, and `sum` confirms they are the values 1 and 2 rather
-    // than something else. They disappear only because the pager never flushes
-    // on the error path and the dirty pages are dropped when the connection
-    // closes. The file is right; the running session is not.
+    // This used to report 2 here, in the same session: the rows before the
+    // NULL were written before the NULL was reached, and the engine has no
+    // savepoints to take them back out with. It now builds and checks every row
+    // before writing any, so the failure is discovered while nothing has been
+    // written and the count agrees with sqlite3's. The fix is what this test
+    // pins; the limit that remains is named in the test below.
     let p = temp_path("mid_statement");
     {
         let mut c = Connection::open(&p).expect("open a fresh database file");
@@ -518,13 +514,8 @@ fn a_mid_statement_failure_leaves_the_earlier_rows_visible_in_the_session() {
 
         assert_eq!(
             count(&mut c, "t"),
-            2,
-            "the rows before the NULL are still there, in this session"
-        );
-        assert_eq!(
-            scalar(&mut c, "SELECT sum(a) FROM t"),
-            "3",
-            "values 1 and 2"
+            0,
+            "the rows before the NULL were not written, in this session either"
         );
         assert_eq!(
             c.changes(),
@@ -536,7 +527,35 @@ fn a_mid_statement_failure_leaves_the_earlier_rows_visible_in_the_session() {
     assert_eq!(
         count(&mut c, "t"),
         0,
-        "the reopened file has nothing, because nothing was flushed"
+        "and nothing reached the file, because nothing was written"
+    );
+}
+
+/// The limit that remains, stated as a test rather than only as prose.
+///
+/// A duplicate rowid is the one failure that *cannot* be found without writing:
+/// the row has to go into the b-tree for the b-tree to discover that its rowid
+/// is taken. This engine has no savepoints, so the rows ahead of it stay.
+///
+/// sqlite3 3.53.4, same session, same statements, count taken in the same
+/// session after the failure: **0**. This engine reports 1. The divergence is
+/// recorded rather than papered over, because a test that quietly expected the
+/// wrong thing is worse than no test, and because the number can only improve
+/// when the engine grows savepoints or an implicit transaction.
+#[test]
+fn a_duplicate_rowid_still_leaves_the_earlier_rows_behind() {
+    let mut c = Connection::open_memory().expect("in-memory database");
+    run(&mut c, "CREATE TABLE t(a INTEGER PRIMARY KEY, b)");
+    run(&mut c, "CREATE TABLE s(x, y)");
+    // (1,'p') is fine, (2,'q') is fine, (1,'r') collides with the first.
+    run(&mut c, "INSERT INTO s VALUES(1,'p'),(2,'q'),(1,'r')");
+    let e = fails(&mut c, "INSERT INTO t SELECT x, y FROM s");
+    assert!(e.contains("UNIQUE constraint failed: t.a"), "got {e:?}");
+    assert_eq!(
+        count(&mut c, "t"),
+        2,
+        "both rows written before the collision are still there; sqlite3 \
+         reports 0 here, and closing that gap needs savepoints"
     );
 }
 
@@ -897,4 +916,167 @@ fn a_value_typed_helper_confirms_the_int_shape_the_tests_assume() {
         matches!(stmt, Stmt::Insert { .. }),
         "the statement really is an INSERT"
     );
+}
+
+// --- the two INSERT forms must raise the *same* count error -------------------
+//
+// This is the check that keeps finding 5 fixed. The two paths used to build the
+// error separately and had drifted: `VALUES` used `SQLITE_MISMATCH` (20) where
+// `SELECT` used `SQLITE_ERROR` (1), and `VALUES` always took the
+// `table ... has ... columns` wording even when the statement named its
+// columns. Every expectation below was produced by running the statement
+// through the real sqlite3 3.53.4, and the result code through Python's
+// `sqlite3`, which reports SQLITE_ERROR for all of them.
+//
+// The module owns the wording in `insert_select::count_error` and the VALUES
+// path now calls it, so a test that pins the message on both forms is what
+// stops them drifting apart a third time.
+
+/// Runs `sql` and returns `(message, result code)`.
+fn fails_with_code(c: &mut Connection, sql: &str) -> (String, nsqlite::error::ResultCode) {
+    match c.execute(&parse_one(sql).expect("test SQL should parse")) {
+        Ok(o) => panic!("{sql:?} unexpectedly succeeded: {o:?}"),
+        Err(e) => (e.message.clone(), e.code),
+    }
+}
+
+/// `(message, code)` from the real sqlite3 for each count mismatch, and what
+/// this engine now returns for the same statements.
+#[test]
+fn both_insert_forms_raise_the_same_count_error() {
+    use nsqlite::error::ResultCode;
+    // sqlite3 3.53.4, measured:
+    //   INSERT INTO q(a,b) VALUES(1)        -> 1 values for 2 columns
+    //   INSERT INTO q(a,b) VALUES(1,2,3)    -> 3 values for 2 columns
+    //   INSERT INTO q(a,a) VALUES(1,2,3)    -> 3 values for 2 columns
+    //   INSERT INTO q VALUES(1)             -> table q has 2 columns but 1 values were supplied
+    //   INSERT INTO q VALUES(1,2,3)         -> table q has 2 columns but 3 values were supplied
+    // and via Python's sqlite3, every one of them is SQLITE_ERROR.
+    let cases = [
+        (
+            "INSERT INTO q(a,b) VALUES(1)",
+            "1 values for 2 columns",
+            ResultCode::Error,
+        ),
+        (
+            "INSERT INTO q(a,b) VALUES(1,2,3)",
+            "3 values for 2 columns",
+            ResultCode::Error,
+        ),
+        (
+            "INSERT INTO q(a,a) VALUES(1,2,3)",
+            "3 values for 2 columns",
+            ResultCode::Error,
+        ),
+        (
+            "INSERT INTO q VALUES(1)",
+            "table q has 2 columns but 1 values were supplied",
+            ResultCode::Error,
+        ),
+        (
+            "INSERT INTO q VALUES(1,2,3)",
+            "table q has 2 columns but 3 values were supplied",
+            ResultCode::Error,
+        ),
+    ];
+    for (sql, want_msg, want_code) in cases {
+        let mut c = Connection::open_memory().expect("in-memory database");
+        run(&mut c, "CREATE TABLE q(a,b)");
+        let (msg, code) = fails_with_code(&mut c, sql);
+        assert_eq!(msg, want_msg, "message for {sql:?}");
+        assert_eq!(
+            code, want_code,
+            "{sql:?} must be SQLITE_ERROR (1), not SQLITE_MISMATCH (20)"
+        );
+    }
+}
+
+/// The `SELECT` form and the `VALUES` form agree, statement for statement.
+#[test]
+fn the_two_forms_agree_on_the_count_error() {
+    use nsqlite::error::ResultCode;
+    // Pairs of the same logical mistake, one per form. Before the fix these
+    // reported *different messages* for the column-list case and different
+    // result codes for every case.
+    let pairs = [
+        (
+            "INSERT INTO t(a,b) SELECT x FROM s",
+            "INSERT INTO t(a,b) VALUES(1)",
+            "1 values for 2 columns",
+        ),
+        (
+            "INSERT INTO t(a,b) SELECT x,y,x FROM s",
+            "INSERT INTO t(a,b) VALUES(1,2,3)",
+            "3 values for 2 columns",
+        ),
+        (
+            "INSERT INTO t SELECT x FROM s",
+            "INSERT INTO t VALUES(1)",
+            "table t has 2 columns but 1 values were supplied",
+        ),
+    ];
+    for (sel, vals, want) in pairs {
+        let mut c = Connection::open_memory().expect("in-memory database");
+        run(&mut c, "CREATE TABLE t(a,b)");
+        run(&mut c, "CREATE TABLE s(x,y)");
+
+        let (sel_msg, sel_code) = fails_with_code(&mut c, sel);
+        let (val_msg, val_code) = fails_with_code(&mut c, vals);
+
+        assert_eq!(sel_msg, want, "SELECT form, {sel:?}");
+        assert_eq!(val_msg, want, "VALUES form, {vals:?}");
+        assert_eq!(
+            sel_code, val_code,
+            "the two forms must carry the same result code for {want:?}"
+        );
+        assert_eq!(sel_code, ResultCode::Error);
+    }
+}
+
+/// A ragged `VALUES` list is its own error, and it is raised before any row is
+/// written.
+#[test]
+fn a_ragged_values_list_is_refused_before_anything_is_written() {
+    // sqlite3 3.53.4: both spellings below report
+    //   all VALUES must have the same number of terms
+    // and a list whose rows agree with each other but not with the target
+    // reports the count instead. Python's sqlite3: SQLITE_ERROR for all three.
+    //
+    // The ragged case is the one where this engine used to be observably
+    // wrong in a worse way than a wrong code: it wrote the first row and only
+    // then noticed the second was short, so a statement that reported failure
+    // had already changed the table. This asserts nothing is written.
+    let mut c = Connection::open_memory().expect("in-memory database");
+    run(&mut c, "CREATE TABLE t(a,b,c)");
+
+    let (msg, code) = fails_with_code(&mut c, "INSERT INTO t VALUES(1,2,3),(4,5)");
+    assert_eq!(msg, "all VALUES must have the same number of terms");
+    assert_eq!(code, nsqlite::error::ResultCode::Error);
+    assert_eq!(count(&mut c, "t"), 0, "the well-formed row was not written");
+
+    let (msg, code) = fails_with_code(&mut c, "INSERT INTO t VALUES(1,2),(3,4,5)");
+    assert_eq!(msg, "all VALUES must have the same number of terms");
+    assert_eq!(code, nsqlite::error::ResultCode::Error);
+    assert_eq!(count(&mut c, "t"), 0, "still nothing written");
+
+    // And the agreeing-but-wrong case still reports the count, not this.
+    let (msg, _) = fails_with_code(&mut c, "INSERT INTO t(a) VALUES(1,2),(3,4)");
+    assert_eq!(msg, "2 values for 1 columns");
+    assert_eq!(count(&mut c, "t"), 0);
+}
+
+/// The ragged check must not reject a well-formed list, including the degenerate
+/// ones.
+#[test]
+fn a_well_formed_values_list_is_not_mistaken_for_a_ragged_one() {
+    let mut c = Connection::open_memory().expect("in-memory database");
+    run(&mut c, "CREATE TABLE t(a,b)");
+    run(&mut c, "INSERT INTO t VALUES(1,2),(3,4),(5,6)");
+    assert_eq!(count(&mut c, "t"), 3);
+    // A list with one row is trivially un-ragged.
+    run(&mut c, "INSERT INTO t VALUES(7,8)");
+    assert_eq!(count(&mut c, "t"), 4);
+    // A named list of the same width as the table's.
+    run(&mut c, "INSERT INTO t(a) VALUES(9),(10)");
+    assert_eq!(count(&mut c, "t"), 6);
 }

@@ -22,9 +22,59 @@ use crate::aggcheck::Ctx;
 use crate::parser::{parse_one, Expr, SelectBody, Stmt};
 
 /// The check's verdict on a statement, as the error message or `Ok`.
+///
+/// Driven with no catalog, which is what a caller that has no schema can do.
+/// The aggregate rules are all decided from the parse tree and are answered
+/// exactly; a name in the statement is invisible to the walk, so a statement
+/// that mixes a bad name with an aggregate defect is answered with the
+/// aggregate one. That is the one limit [`Names`] documents, and the cases
+/// that need a schema drive [`check_with_tables`] instead.
 fn check(sql: &str) -> Result<(), String> {
     let stmt: Stmt = parse_one(sql).unwrap_or_else(|e| panic!("{sql:?} did not parse: {e}"));
-    Ctx::new().check(&stmt).map_err(|e| e.message)
+    Ctx::new().check_without_names(&stmt).map_err(|e| e.message)
+}
+
+/// The check's verdict on a statement, with the schema the fixture describes.
+///
+/// This is the call the connection makes, and the only one that can tell a
+/// name that resolves from one that does not — which decides whether a
+/// statement mixing a bad name with an aggregate defect reports
+/// `no such column` or the aggregate message. The fixture is the one at the
+/// top of this file, so `t` is `t(a,b)`, `u` is `u(m,x)` and `tkt2526` is the
+/// ticket's own table.
+fn check_with_tables(sql: &str) -> Result<(), String> {
+    let stmt: Stmt = parse_one(sql).unwrap_or_else(|e| panic!("{sql:?} did not parse: {e}"));
+    let tables = fixture_tables();
+    Ctx::new().check(&stmt, &tables).map_err(|e| e.message)
+}
+
+/// The fixture's tables, as the catalog holds them.
+///
+/// Built by parsing the fixture's own DDL and handing it to the same
+/// `catalog::Table` conversion the connection uses, so the columns here are the
+/// ones a real statement would resolve against rather than a hand-written list
+/// that could drift from the fixture the oracle answers were recorded against.
+fn fixture_tables() -> Vec<crate::catalog::Table> {
+    let catalog = crate::catalog::Catalog::new();
+    let mut out = Vec::new();
+    for sql in [
+        "CREATE TABLE test1(f1 int, f2 int)",
+        "CREATE TABLE t(a,b)",
+        "CREATE TABLE u(m,x)",
+        "CREATE TABLE tkt2526(a,b,c PRIMARY KEY)",
+    ] {
+        let Stmt::CreateTable {
+            name,
+            columns,
+            constraints,
+            ..
+        } = parse_one(sql).unwrap_or_else(|e| panic!("{sql:?} did not parse: {e}"))
+        else {
+            panic!("{sql:?} is not a CREATE TABLE");
+        };
+        out.push(catalog.table_from_create(name.as_str(), &columns, &constraints));
+    }
+    out
 }
 
 /// The check's verdict on one expression, for a CHECK constraint or a partial
@@ -1655,4 +1705,708 @@ fn a_subquery_in_a_limit() {
         check("SELECT 1 FROM t LIMIT (SELECT 1 WHERE count(*)>0)"),
         Err("misuse of aggregate function count()".to_string())
     );
+}
+
+// --- 17. a name that resolves to nothing, against the oracle ----------------
+//
+// Every expectation below was recorded by running the statement through the
+// real `sqlite3` on the fixture at the top of this file, so `t` is `t(a,b)`
+// and `u` is `u(m,x)`. These need a schema, so they go through
+// `check_with_tables`: without one the walk cannot tell a name that resolves
+// from one that does not, and answers with the aggregate message instead.
+//
+// The rule they pin down is SQLite's `sqlite3ErrorMsg`, which frees the old
+// message and keeps the new one (`util.c:268`), combined with a resolution
+// walk that stops at the first node which fails (`resolve.c:1505`). A name
+// error is therefore not simply the more important message — it is the one
+// the walk reached before giving up, and an aggregate defect the walk reached
+// earlier has already written its own message over it.
+
+/// `SELECT 1 FROM t GROUP BY nosuchcol, min()`
+/// → `no such column: nosuchcol`
+///
+/// The name comes first in the clause, so the walk fails on it and the later
+/// term's arity error is never reached. This is the case that made the module's
+/// `refusal` flag wrong: the clause-level verdict was held back until the whole
+/// clause had been walked, so it outranked a name the walk had already failed
+/// on.
+#[test]
+fn a_bad_name_before_an_aggregate_defect_in_the_group_by() {
+    for (sql, want) in [
+        (
+            "SELECT 1 FROM t GROUP BY nosuchcol, min()",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY nosuchcol, min(a)",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY nosuchcol, count(*)",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY a, nosuchcol, min()",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY a, min(a), nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY nosuchcol+min(a)",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY min(a)+nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY min(nosuchcol)",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY count(nosuchcol, a)",
+            "no such column: nosuchcol",
+        ),
+    ] {
+        assert_eq!(check_with_tables(sql), Err(want.to_string()), "for {sql}");
+    }
+}
+
+/// `SELECT 1 FROM t GROUP BY m, count(*)` → `no such column: m`
+///
+/// The single-term form `GROUP BY m` is the same error, and it is the shape
+/// the module already got right: `m` names nothing, so it is neither a column
+/// nor a substitution for an aggregate alias.
+#[test]
+fn an_unresolvable_name_beside_an_aggregate_in_the_group_by() {
+    for (sql, want) in [
+        ("SELECT 1 FROM t GROUP BY m, count(*)", "no such column: m"),
+        ("SELECT 1 FROM t GROUP BY m, min()", "no such column: m"),
+        (
+            "SELECT 1 FROM t GROUP BY a, m, count(*)",
+            "no such column: m",
+        ),
+        ("SELECT 1 FROM t GROUP BY b, m", "no such column: m"),
+        (
+            "SELECT 1 FROM t GROUP BY b, m, count(*)",
+            "no such column: m",
+        ),
+    ] {
+        assert_eq!(check_with_tables(sql), Err(want.to_string()), "for {sql}");
+    }
+}
+
+/// `SELECT 1 FROM u GROUP BY m, count(*)` where `m` *is* a column of the FROM
+/// → `aggregate functions are not allowed in the GROUP BY clause`
+///
+/// The mirror of the case above, and the reason the name has to be resolved
+/// against the schema rather than pattern-matched: the same statement is the
+/// refusal when the schema has the column and `no such column` when it does
+/// not. `u` is `u(m,x)`, so `m` resolves there and `a` does not.
+#[test]
+fn a_name_that_resolves_leaves_the_group_by_verdict_alone() {
+    assert_eq!(
+        check_with_tables("SELECT 1 FROM u GROUP BY m, count(*)"),
+        Err("aggregate functions are not allowed in the GROUP BY clause".to_string())
+    );
+    assert_eq!(
+        check_with_tables("SELECT 1 FROM u GROUP BY a, count(*)"),
+        Err("no such column: a".to_string())
+    );
+    // And with a name that resolves in the fixture table, the clause is still
+    // the refusal rather than anything about the name.
+    assert_eq!(
+        check_with_tables("SELECT 1 FROM t GROUP BY a, count(*)"),
+        Err("aggregate functions are not allowed in the GROUP BY clause".to_string())
+    );
+}
+
+/// `SELECT 1 FROM t GROUP BY t.nosuchcol, count(*)` → `no such column:
+/// t.nosuchcol`
+///
+/// A qualified name is reported as it was written, qualifier and all
+/// (`resolve.c:791-793`), and a qualifier naming no source in the FROM fails
+/// like any other: `u.a` names a table that is not in this FROM, and `main.a`
+/// names a schema rather than a table.
+#[test]
+fn a_qualified_name_reports_the_qualifier() {
+    for (sql, want) in [
+        (
+            "SELECT 1 FROM t GROUP BY t.nosuchcol, count(*)",
+            "no such column: t.nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY nosuchtbl.a, count(*)",
+            "no such column: nosuchtbl.a",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY u.a, count(*)",
+            "no such column: u.a",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY main.a, count(*)",
+            "no such column: main.a",
+        ),
+    ] {
+        assert_eq!(check_with_tables(sql), Err(want.to_string()), "for {sql}");
+    }
+}
+
+/// `SELECT 1 FROM t GROUP BY t.a, count(*)` and the rowid names
+/// → `aggregate functions are not allowed in the GROUP BY clause`
+///
+/// A name that resolves leaves the clause's own verdict alone, whichever way
+/// it resolves: through a real column, through a table's alias, or through one
+/// of the three names a rowid table answers to besides its columns.
+#[test]
+fn a_name_that_resolves_in_any_of_its_ways_leaves_the_refusal() {
+    for sql in [
+        "SELECT 1 FROM t GROUP BY t.a, count(*)",
+        "SELECT 1 FROM t AS q GROUP BY q.a, count(*)",
+        "SELECT 1 FROM t AS q GROUP BY b, count(*)",
+        "SELECT 1 FROM t GROUP BY rowid, count(*)",
+        "SELECT 1 FROM t GROUP BY oid, count(*)",
+        "SELECT 1 FROM t GROUP BY _rowid_, count(*)",
+    ] {
+        assert_eq!(
+            check_with_tables(sql),
+            Err("aggregate functions are not allowed in the GROUP BY clause".to_string()),
+            "for {sql}"
+        );
+    }
+}
+
+/// `SELECT 1 FROM t WHERE nosuchcol AND count(*)>0` → `no such column:
+/// nosuchcol`, and the mirror is the misuse
+///
+/// The pair that shows the rule is positional rather than a ranking: the same
+/// two defects, in the same clause, and which one is reported depends only on
+/// which the walk reaches first.
+#[test]
+fn a_bad_name_and_a_misuse_report_in_walk_order() {
+    for (sql, want) in [
+        (
+            "SELECT 1 FROM t WHERE nosuchcol AND count(*)>0",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(*)>0 AND nosuchcol",
+            "misuse of aggregate function count()",
+        ),
+        (
+            "SELECT 1 FROM t WHERE min() AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE nosuchcol AND min()",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(a,b) AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE nosuchcol AND count(a,b)",
+            "no such column: nosuchcol",
+        ),
+    ] {
+        assert_eq!(check_with_tables(sql), Err(want.to_string()), "for {sql}");
+    }
+}
+
+/// `SELECT 1 FROM t ORDER BY nosuchcol, count(*)` → `no such column:
+/// nosuchcol`
+///
+/// The ORDER BY is resolved in a walk of its own (`resolve.c:2088`) and a
+/// failure in it returns `WRC_Abort` for the whole SELECT, so the `EP_Agg` test
+/// over the GROUP BY that follows it (`resolve.c:2109`) is never reached. The
+/// aggregate message is not merely outranked here — it is never computed.
+///
+/// The one direction that does report the aggregate is where it comes first in
+/// the same clause: `ORDER BY min(), nosuchcol` is the arity error, because
+/// the walk stops there.
+#[test]
+fn a_bad_name_in_an_order_by_ends_the_statement() {
+    for (sql, want) in [
+        (
+            "SELECT 1 FROM t ORDER BY nosuchcol, count(*)",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t ORDER BY count(*), nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t ORDER BY nosuchcol, min()",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t ORDER BY min(), nosuchcol",
+            "wrong number of arguments to function min()",
+        ),
+        (
+            "SELECT 1 FROM t ORDER BY nosuchcol, max(m)",
+            "no such column: nosuchcol",
+        ),
+    ] {
+        assert_eq!(check_with_tables(sql), Err(want.to_string()), "for {sql}");
+    }
+}
+
+/// A statement that names a column nothing has is the name's error
+///
+/// A name the walk reaches with nothing to resolve it to is
+/// `no such column` on `sqlite3`, and this check now answers that itself rather
+/// than leaving it to the resolution that runs after. That is the change the
+/// schema bought: the statement is refused with the same message, from a phase
+/// that can still see the aggregate defects a later clause would have
+/// reported.
+#[test]
+fn a_bad_name_on_its_own_is_the_name_error() {
+    for sql in [
+        "SELECT nosuchcol FROM t",
+        "SELECT 1 FROM t WHERE nosuchcol",
+        "SELECT 1 FROM t ORDER BY nosuchcol",
+        "SELECT 1 FROM t LIMIT nosuchcol",
+        "SELECT 1 FROM t GROUP BY nosuchcol",
+    ] {
+        assert_eq!(
+            check_with_tables(sql),
+            Err("no such column: nosuchcol".to_string()),
+            "for {sql}"
+        );
+    }
+}
+
+/// A statement with no bad name in it is untouched
+///
+/// The other half: giving the walk a schema must not make it report anything
+/// for a statement that is merely legal.
+#[test]
+fn a_statement_with_no_bad_name_is_not_reported_at_all() {
+    for sql in [
+        "SELECT a, b FROM t",
+        "SELECT 1 FROM t",
+        "SELECT count(*) FROM t",
+        "SELECT 1 FROM t GROUP BY a, b",
+        "SELECT 1 FROM t WHERE b",
+        "SELECT 1 FROM t ORDER BY b",
+        "SELECT 1 FROM t LIMIT b",
+    ] {
+        assert_eq!(check_with_tables(sql), Ok(()), "for {sql}");
+    }
+}
+
+/// A defect in an earlier clause outranks a bad name in a later one
+///
+/// The clauses are resolved in a fixed order, so a projection's arity error is
+/// written before the GROUP BY is ever looked at and the name never overwrites
+/// it. This is the `sqlite3ErrorMsg` overwrite rule again, at clause scale.
+#[test]
+fn a_defect_in_an_earlier_clause_outranks_a_later_bad_name() {
+    for sql in [
+        "SELECT count(a,b) FROM t WHERE nosuchcol",
+        "SELECT count(a,b) FROM t GROUP BY nosuchcol",
+        "SELECT count(a,b) FROM t ORDER BY nosuchcol",
+    ] {
+        assert_eq!(
+            check_with_tables(sql),
+            Err("wrong number of arguments to function count()".to_string()),
+            "for {sql}"
+        );
+    }
+}
+
+/// A bad name in a subquery is the subquery's to report
+///
+/// `SELECT 1 FROM t WHERE a IN (SELECT nosuchcol FROM t)` is the same
+/// `no such column: nosuchcol` as the subquery on its own, because a subquery
+/// is resolved as a SELECT of its own with a FROM of its own — and the name is
+/// judged against *that* FROM, not the enclosing one's. Here both are `t`, so
+/// the two agree; the point is that the flag does not leak out of the subquery
+/// and silence the enclosing statement's own checks.
+#[test]
+fn a_bad_name_in_a_subquery_is_reported_by_the_subquery() {
+    for sql in [
+        "SELECT 1 FROM t WHERE a IN (SELECT nosuchcol FROM t)",
+        "SELECT 1 FROM t WHERE a IN (SELECT 1 FROM t GROUP BY nosuchcol, min())",
+        "SELECT 1 FROM t WHERE a IN (SELECT 1 FROM t ORDER BY nosuchcol, min())",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT nosuchcol FROM t)",
+        "SELECT (SELECT 1 FROM t GROUP BY nosuchcol, min()) FROM t",
+        "SELECT 1 FROM t GROUP BY a, (SELECT nosuchcol FROM t)",
+    ] {
+        assert_eq!(
+            check_with_tables(sql),
+            Err("no such column: nosuchcol".to_string()),
+            "for {sql}"
+        );
+    }
+}
+
+/// A FROM naming a table this connection does not have silences the check
+///
+/// `sqlite3` refuses the table before it looks at anything else, so the answer
+/// is `no such table: nosuchtable` and never an aggregate message — however
+/// wrong the aggregate verdict would be. Reporting one here would be reporting
+/// an error for a statement `sqlite3` never got as far as checking.
+#[test]
+fn an_unknown_table_silences_the_aggregate_checks() {
+    assert_eq!(
+        check_with_tables("SELECT 1 FROM nosuchtable GROUP BY m, count(*)"),
+        Ok(())
+    );
+    assert_eq!(
+        check_with_tables("SELECT 1 FROM nosuchtable WHERE count(*)>0"),
+        Ok(())
+    );
+}
+
+/// With no schema the aggregate rules are still answered exactly
+///
+/// [`Ctx::check_without_names`] is what the rest of this file drives, and the
+/// aggregate verdicts it gives are the oracle's for every statement whose only
+/// defect is an aggregate one. The two calls agree wherever no name is
+/// involved, which is what makes the schema an addition rather than a change.
+#[test]
+fn the_two_entry_points_agree_where_no_name_is_involved() {
+    for (sql, want) in [
+        (
+            "SELECT count(a,b) FROM t",
+            Err("wrong number of arguments to function count()".to_string()),
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY a, count(*)",
+            Err("aggregate functions are not allowed in the GROUP BY clause".to_string()),
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(*)>0",
+            Err("misuse of aggregate function count()".to_string()),
+        ),
+        (
+            "SELECT min(a) AS m FROM t GROUP BY a HAVING max(m)<1",
+            Err("misuse of aliased aggregate m".to_string()),
+        ),
+        ("SELECT count(*) FROM t", Ok(())),
+        ("SELECT a, b, count(*) FROM t GROUP BY a+0", Ok(())),
+    ] {
+        assert_eq!(check(sql), want.clone(), "for {sql}");
+        assert_eq!(check_with_tables(sql), want, "for {sql}");
+    }
+}
+
+/// A defect in one clause ends the statement, so a later clause is not
+/// resolved at all
+///
+/// The WHERE is resolved after the projection and before the ORDER BY and the
+/// GROUP BY (`resolve.c:2001`, `:2036`, `:2088`, `:2105`), and a failure in any
+/// of them returns `WRC_Abort` for the whole SELECT (`resolve.c:1505`). So which
+/// of two defects is reported is decided by which clause each is in, and not by
+/// any ranking between the messages.
+#[test]
+fn a_defect_in_an_earlier_clause_ends_the_statement() {
+    for (sql, want) in [
+        (
+            "SELECT 1 FROM t WHERE min() GROUP BY count(*)",
+            "wrong number of arguments to function min()",
+        ),
+        (
+            "SELECT 1 FROM t WHERE min() ORDER BY count(*)",
+            "wrong number of arguments to function min()",
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(*) ORDER BY min()",
+            "misuse of aggregate function count()",
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(*) GROUP BY a",
+            "misuse of aggregate: count()",
+        ),
+        (
+            "SELECT 1 FROM t WHERE nosuchcol AND count(a,b)",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(a,b) AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE nosuchcol ORDER BY count(a,b)",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(a,b) ORDER BY nosuchcol",
+            "wrong number of arguments to function count()",
+        ),
+    ] {
+        assert_eq!(check_with_tables(sql), Err(want.to_string()), "for {sql}");
+    }
+}
+
+/// A misuse under an operator ends the clause, and a bare one does not
+///
+/// A misused aggregate is not an aggregate (`resolve.c:1299` clears `is_agg`),
+/// so an operator holding one folds to a constant before the walk descends into
+/// it and the rest of the clause is never walked. A bare call is a node of its
+/// own, so the walk records the verdict and goes on to the next node — which is
+/// how a name beside it becomes the later message and so the reported one.
+///
+/// The pair is the same two defects in the same clause, and only the shape of
+/// the aggregate around them differs.
+#[test]
+fn a_misuse_under_an_operator_ends_the_clause() {
+    for (sql, want) in [
+        (
+            "SELECT 1 FROM t WHERE count(*)>0 AND nosuchcol",
+            "misuse of aggregate function count()",
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(*) AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE min(a)>0 AND nosuchcol",
+            "misuse of aggregate function min()",
+        ),
+        (
+            "SELECT 1 FROM t WHERE min(a) AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(*)+0 AND nosuchcol",
+            "misuse of aggregate function count()",
+        ),
+        (
+            "SELECT 1 FROM t WHERE abs(count(*)) AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE a>0 AND count(*)>0 AND nosuchcol",
+            "misuse of aggregate function count()",
+        ),
+        (
+            "SELECT 1 FROM t WHERE a>0 AND nosuchcol AND count(*)>0",
+            "no such column: nosuchcol",
+        ),
+    ] {
+        assert_eq!(check_with_tables(sql), Err(want.to_string()), "for {sql}");
+    }
+}
+
+// --- 18. what decides which of two defects is reported -----------------------
+//
+// The statements below each have exactly one defect on `sqlite3` -- a bad name,
+// or an aggregate misuse -- and the module answers all of them. They are here
+// because each one is a case where a plausible rule gets it wrong, and the
+// oracle is the only thing that settles which.
+
+// A name in a fold's argument list is resolved before the misuse is recorded.
+//
+// `resolveExprStep` records the call's own verdict and *then* walks the
+// argument list (`resolve.c:1354`), so the name is the later message and
+// `sqlite3ErrorMsg` keeps it. This holds in a WHERE and in an ORDER BY alike,
+// and for every aggregate.
+#[test]
+fn a_name_in_a_folds_arguments_beats_the_misuse() {
+    for (sql, want) in [
+        (
+            "SELECT 1 FROM t WHERE count(nosuchcol)",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t ORDER BY count(nosuchcol)",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE sum(nosuchcol)",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t ORDER BY sum(nosuchcol)",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE min(nosuchcol)",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY count(nosuchcol)",
+            "no such column: nosuchcol",
+        ),
+    ] {
+        assert_eq!(check_with_tables(sql), Err(want.to_string()), "for {sql}");
+    }
+}
+
+/// A LIMIT is resolved before every other clause of its SELECT
+///
+/// `resolve.c:1930` resolves a LIMIT and an OFFSET against an empty
+/// `NameContext` before the body is walked at all, so a defect in one is
+/// reached before a name anywhere else. That is what makes `ORDER BY nosuchcol
+/// LIMIT min()` the arity error and not the name.
+#[test]
+fn a_limit_is_resolved_before_the_rest_of_the_select() {
+    assert_eq!(
+        check_with_tables("SELECT 1 FROM t ORDER BY nosuchcol LIMIT min()"),
+        Err("wrong number of arguments to function min()".to_string())
+    );
+    // And a name in a LIMIT is still the name when nothing else is wrong.
+    assert_eq!(
+        check_with_tables("SELECT 1 FROM t LIMIT nosuchcol"),
+        Err("no such column: nosuchcol".to_string())
+    );
+}
+
+/// The first of two bad names is the one reported
+///
+/// `resolve.c:1505` returns `WRC_Abort` from the node that failed, so the walk
+/// stops at the first name and the second is never reached. This is the one
+/// place where a later message does *not* win, and it is the same walk order the
+/// aggregate messages follow.
+#[test]
+fn the_first_of_two_bad_names_is_reported() {
+    assert_eq!(
+        check_with_tables("SELECT 1 FROM t WHERE nosuchcol AND nosuchcol2"),
+        Err("no such column: nosuchcol".to_string())
+    );
+    assert_eq!(
+        check_with_tables("SELECT 1 FROM t WHERE nosuchcol2 AND nosuchcol"),
+        Err("no such column: nosuchcol2".to_string())
+    );
+    assert_eq!(
+        check_with_tables("SELECT 1 FROM t WHERE nosuchcol AND nosuchcol2 AND min()"),
+        Err("no such column: nosuchcol".to_string())
+    );
+}
+
+/// A comparison folds, and an `AND` does not
+///
+/// A comparison is code-generated before the walk descends into it, and a
+/// misused aggregate is not an aggregate (`resolve.c:1299` clears `is_agg`), so
+/// `count(*)>0` is already a constant and the rest of the clause is never
+/// walked. An `AND` is not code-generated during resolution, so its operands
+/// are walked in the ordinary way and the walk continues past a bare verdict.
+///
+/// The pairs are the same two defects with the aggregate's shape the only
+/// difference, which is what makes the shape the deciding thing.
+#[test]
+fn a_comparison_folds_its_operands_and_an_and_does_not() {
+    for (sql, want) in [
+        (
+            "SELECT 1 FROM t WHERE count(*)>0 AND nosuchcol",
+            "misuse of aggregate function count()",
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(*) AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE nosuchcol AND count(*)>0",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE min(a)>0 AND nosuchcol",
+            "misuse of aggregate function min()",
+        ),
+        (
+            "SELECT 1 FROM t WHERE min(a) AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(*)=1 AND nosuchcol",
+            "misuse of aggregate function count()",
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(*)+0 AND nosuchcol",
+            "misuse of aggregate function count()",
+        ),
+        // A unary operator and an ordinary call are walked into as ordinary
+        // nodes, so neither of them folds.
+        (
+            "SELECT 1 FROM t WHERE -count(*) AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE abs(count(*)) AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+    ] {
+        assert_eq!(check_with_tables(sql), Err(want.to_string()), "for {sql}");
+    }
+}
+
+/// A constant that decides an `AND` drops the other side
+///
+/// `sqlite3ExprSimplifiedAndOr` (`expr.c:2393`) rewrites `x AND false` to
+/// `false` and `x AND true` to `x`, so the dropped side is never resolved and a
+/// defect in it is never found. This is the only case where a name beside an
+/// aggregate is *not* an error, and it is not a rule about names at all -- it is
+/// a rule about the constant.
+#[test]
+fn a_constant_deciding_an_and_drops_the_other_side() {
+    for sql in [
+        "SELECT 1 FROM t WHERE nosuchcol AND 0",
+        "SELECT 1 FROM t WHERE 0 AND nosuchcol",
+    ] {
+        assert_eq!(check_with_tables(sql), Ok(()), "for {sql}");
+    }
+    // A constant that does not decide it -- a true one -- leaves the other side
+    // resolved, so the name is still reported.
+    assert_eq!(
+        check_with_tables("SELECT 1 FROM t WHERE nosuchcol AND 1"),
+        Err("no such column: nosuchcol".to_string())
+    );
+    assert_eq!(
+        check_with_tables("SELECT 1 FROM t WHERE 1 AND nosuchcol"),
+        Err("no such column: nosuchcol".to_string())
+    );
+}
+
+/// A comma separates terms, an `AND` does not
+///
+/// `ORDER BY` and `GROUP BY` are lists of terms resolved one after another
+/// (`resolveOrderGroupBy`, `resolve.c:1841`), so a defect in one term leaves the
+/// terms after it resolved. A WHERE is one expression, so a bare verdict inside
+/// it does not stop the operands beside it from being reached. The same pair of
+/// defects, in the two places, and the two answers.
+#[test]
+fn a_comma_separates_terms_but_an_and_does_not() {
+    for (sql, want) in [
+        (
+            "SELECT 1 FROM t ORDER BY min(), nosuchcol",
+            "wrong number of arguments to function min()",
+        ),
+        (
+            "SELECT 1 FROM t ORDER BY nosuchcol, min()",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY min(), nosuchcol",
+            "wrong number of arguments to function min()",
+        ),
+        (
+            "SELECT 1 FROM t GROUP BY nosuchcol, min()",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE min() AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t WHERE count(a,b) AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        (
+            "SELECT 1 FROM t ORDER BY count(a,b) AND nosuchcol",
+            "no such column: nosuchcol",
+        ),
+        // And a term that failed does end the terms after it.
+        (
+            "SELECT 1 FROM t GROUP BY a, min(), nosuchcol",
+            "wrong number of arguments to function min()",
+        ),
+    ] {
+        assert_eq!(check_with_tables(sql), Err(want.to_string()), "for {sql}");
+    }
 }

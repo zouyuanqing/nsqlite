@@ -207,7 +207,10 @@ impl Connection {
     /// The column-naming settings, as sqlite3 starts every connection with
     /// them: short on, full off.
     pub fn default_column_name_flags() -> crate::pragma::ColumnNameFlags {
-        crate::pragma::ColumnNameFlags { full: false, short: true }
+        crate::pragma::ColumnNameFlags {
+            full: false,
+            short: true,
+        }
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -355,6 +358,13 @@ impl Connection {
 
     /// Runs one statement.
     pub fn execute(&mut self, stmt: &Stmt) -> Result<Outcome> {
+        // `changes` is cleared on entry, and a statement that fails therefore
+        // reports zero rather than the count of the statement before it. That
+        // was checked against sqlite3 3.53.4 through the C API, and it is what
+        // a caller wants: a statement that did not complete changed no rows, and
+        // the count it would otherwise inherit belongs to a different
+        // statement. The rows themselves are unaffected, which is the
+        // statement-journal's job rather than this counter's.
         self.changes = 0;
         // The static aggregate checks (arity, scope, nesting, ticket #2526's
         // aliased-aggregate rule) are a property of the parse tree, decided
@@ -366,7 +376,14 @@ impl Connection {
         // report the one sqlite3 does. Above the dispatch also means before any
         // statement executes, so a statement that both misuses an aggregate and
         // would have written rows has written none.
-        crate::aggcheck::Ctx::new().check(stmt)?;
+        //
+        // The catalog is handed in because the walk needs to tell a name that
+        // resolves from one that does not: `no such column` outranks every
+        // aggregate message, and only the schema can say which a bare name is.
+        // `queryable_tables` is the same list the SELECT path resolves a FROM
+        // against, so the two agree on which tables exist -- including the
+        // schema table, which is not in the catalog.
+        crate::aggcheck::Ctx::new().check(stmt, &self.queryable_tables())?;
         match stmt {
             Stmt::CreateTable {
                 name,
@@ -453,13 +470,20 @@ impl Connection {
                 // and the statement succeeds without writing.
                 Ok(Outcome::Changed(0))
             }
-            Stmt::CreateIndex { name, table, columns, unique, if_not_exists, sql } => {
+            Stmt::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+                if_not_exists,
+                sql,
+            } => {
                 // The index is built from the table's current rows and its
                 // root page is written into the schema, so a reopened
                 // connection finds it the same way it finds a table.
-                let named = name.clone().unwrap_or_else(|| {
-                    crate::index_ddl::derived_index_name(table)
-                });
+                let named = name
+                    .clone()
+                    .unwrap_or_else(|| crate::index_ddl::derived_index_name(table));
                 if let Some(built) = crate::index_ddl::build_index(
                     &mut self.pager,
                     &self.catalog,
@@ -654,17 +678,48 @@ impl Connection {
             None => (0..table.len()).collect(),
         };
 
-        let mut inserted = 0usize;
+        // A ragged `VALUES` list is a *different* error from a count that
+        // simply disagrees with the target, and sqlite3 says so. Measured on
+        // 3.53.4: `INSERT INTO t VALUES(1,2,3),(4,5)` and its mirror both report
+        // `all VALUES must have the same number of terms`, where a list whose
+        // rows agree with each other but not with `t` reports the count. The
+        // ragged case is raised before the first row is written, which is what
+        // sqlite3 does too -- nothing is left behind, in this session or on
+        // disk. The check sits above the write loop for the same reason the
+        // `SELECT` form's does: the shape is knowable without writing anything.
+        if let Some(want) = rows.first().map(Vec::len) {
+            if rows.iter().any(|r| r.len() != want) {
+                return Err(Error::new(
+                    ResultCode::Error,
+                    "all VALUES must have the same number of terms",
+                ));
+            }
+        }
+
+        // Build every row before writing any, for the same reason
+        // `insert_select::insert_prepared` does and with the same caveat about
+        // what is left: a DEFAULT that does not evaluate, a NOT NULL column
+        // left empty, or a non-integer for the INTEGER PRIMARY KEY is now
+        // caught before the first row reaches the b-tree rather than part way
+        // through. What needs the b-tree -- a duplicate rowid, UNIQUE, CHECK --
+        // can only be found by writing, so those still leave the earlier rows
+        // behind, exactly as they do on the `SELECT` form. See
+        // `insert_select::ATOMICITY`.
+        let mut built: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
         for vals in rows {
             if vals.len() != targets.len() {
-                return Err(Error::new(
-                    ResultCode::Mismatch,
-                    format!(
-                        "table {} has {} columns but {} values were supplied",
-                        table_name,
-                        targets.len(),
-                        vals.len()
-                    ),
+                // The same constructor the `SELECT` path uses, so the two forms
+                // cannot drift apart again. It picks the wording from whether
+                // the statement *wrote* a column list, not from the counts, and
+                // it is `SQLITE_ERROR` (1) rather than the `SQLITE_MISMATCH`
+                // (20) this used to raise. Both confirmed against 3.53.4 and
+                // through Python's `sqlite3`, which reports SQLITE_ERROR for
+                // every count mismatch in either form.
+                return Err(crate::insert_select::count_error(
+                    table_name,
+                    columns.is_some(),
+                    vals.len(),
+                    targets.len(),
                 ));
             }
             // Build the full row, applying a default for every column the
@@ -714,7 +769,33 @@ impl Connection {
             for (i, col) in table.columns.iter().enumerate() {
                 full[i] = affinity_rules::convert(&full[i], col.affinity);
             }
+            built.push(full);
+        }
 
+        // Every row is checked for a usable INTEGER PRIMARY KEY value before the
+        // first is written, for the same reason `insert_select` does it there:
+        // the check is pure, so running it for every row up front refuses the
+        // statement with nothing written instead of with the rows ahead of it
+        // already in the b-tree. The rowids themselves are still resolved in the
+        // write loop, because sqlite3 hands out one past the largest rowid as
+        // the statement progresses -- see the note in
+        // `insert_select::insert_prepared`.
+        for full in &built {
+            let Some(alias) = table.rowid_alias else {
+                continue;
+            };
+            if let Some(v) = full.get(alias) {
+                if !matches!(v, Value::Integer(_) | Value::Null) {
+                    return Err(Error::new(
+                        ResultCode::Mismatch,
+                        format!("datatype mismatch: {v} is not an integer"),
+                    ));
+                }
+            }
+        }
+
+        let mut inserted = 0usize;
+        for full in built {
             let rowid = self.next_rowid(&table, &full)?;
             self.insert_row(&table, rowid, full)?;
             self.last_insert_rowid = rowid;
@@ -849,7 +930,10 @@ impl Connection {
         // The column names are the ones sqlite3 reports, which the suite
         // compares verbatim; they are not derived from the row builder.
         let s = |n: &[&str]| n.iter().map(|x| x.to_string()).collect::<Vec<String>>();
-        let empty = || Outcome::Query { columns: s(&[]), rows: Vec::new() };
+        let empty = || Outcome::Query {
+            columns: s(&[]),
+            rows: Vec::new(),
+        };
         match p.name.as_str() {
             "table_info" => {
                 let PragmaBody::ReadArg(arg) = &p.body else {
@@ -858,7 +942,9 @@ impl Connection {
                         "PRAGMA table_info requires an argument",
                     ));
                 };
-                let Some(table) = self.catalog.get(arg) else { return Ok(empty()) };
+                let Some(table) = self.catalog.get(arg) else {
+                    return Ok(empty());
+                };
                 let cols: Vec<ColumnInfo> = table
                     .columns
                     .iter()
@@ -907,7 +993,10 @@ impl Connection {
                 })
             }
             "database_list" => {
-                let file = self.path().map(|p| p.display().to_string()).unwrap_or_default();
+                let file = self
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
                 let rows = vec![Row {
                     values: vec![
                         Value::Integer(0),
@@ -915,7 +1004,10 @@ impl Connection {
                         Value::Text(file),
                     ],
                 }];
-                Ok(Outcome::Query { columns: s(&["seq", "name", "file"]), rows })
+                Ok(Outcome::Query {
+                    columns: s(&["seq", "name", "file"]),
+                    rows,
+                })
             }
             "full_column_names" | "short_column_names" => {
                 let on = match &p.body {
@@ -936,8 +1028,13 @@ impl Connection {
                 let Some(value) = self.pragma_scalar(&p.name) else {
                     return Ok(empty());
                 };
-                let rows = vec![Row { values: vec![value] }];
-                Ok(Outcome::Query { columns: s(&[p.name.as_str()]), rows })
+                let rows = vec![Row {
+                    values: vec![value],
+                }];
+                Ok(Outcome::Query {
+                    columns: s(&[p.name.as_str()]),
+                    rows,
+                })
             }
         }
     }
@@ -1179,6 +1276,12 @@ impl Connection {
         }
         let bound = crate::join::bind_all(from, &exprs, &names)?;
 
+        // The affinity each of those references contributes to a comparison,
+        // resolved once from the same FROM and the same bound list, so the
+        // evaluator's answer to `a = 5` and `a = b` comes from the column
+        // declarations rather than from how the values happened to be stored.
+        let affinities = affinity_rules::affinities_of(from, &bound);
+
         // The ON and USING constraints are bound against the same FROM, so they
         // are resolved here too and evaluated inside the loop.
         let on_exprs = crate::join::bind_constraints(from)?;
@@ -1208,7 +1311,7 @@ impl Connection {
         }
         let mut surviving: Vec<crate::grouping::Row> = Vec::with_capacity(rows.len());
         for jr in &rows {
-            let ctx = build_ctx(jr, from, &bound);
+            let ctx = build_ctx(jr, from, &bound, &affinities);
             if let Some(pred) = where_ {
                 if !truthy(eval(pred, &ctx)?) {
                     continue;
@@ -1243,7 +1346,7 @@ impl Connection {
             // or an aggregate over one, still resolves: a grouped query can
             // order by anything the group has, not only what it projects.
             let spec = crate::orderby::resolve_keys(sel, columns, &names, Some(from))?;
-            let mut sorted = apply_group_order_by(sel, &spec, &plan, &names, &groups, &out)?;
+            let mut sorted = apply_group_order_by(sel, &spec, &plan, &names, &groups, &out, from)?;
             apply_limit(sel, &mut sorted)?;
             return Ok(Outcome::Query {
                 columns: names,
@@ -1256,7 +1359,7 @@ impl Connection {
         // joined values of the ones that survived.
         let mut out: Vec<(Row, crate::join::JoinedRow)> = Vec::with_capacity(rows.len());
         for jr in rows.iter() {
-            let ctx = build_ctx(jr, from, &bound);
+            let ctx = build_ctx(jr, from, &bound, &affinities);
             // WHERE filters the joined rows, which for an ungrouped query is
             // the only place it is applied: the join itself only tested each
             // join's own ON or USING constraint.
@@ -1400,6 +1503,15 @@ impl Connection {
             v
         };
 
+        // The WHERE is bound against a one-source FROM over this table, so the
+        // filter's comparisons get the same affinity rule a SELECT's do:
+        // `UPDATE t SET ... WHERE a = 5` matches a TEXT column holding '5'.
+        // Built once, before the rows, because it is the same every row.
+        let affinities = match where_ {
+            Some(p) => single_table_affinities(&table, table_name, &[p])?,
+            None => affinity_rules::no_affinities().clone(),
+        };
+
         let mut changed = 0usize;
         for row in &rows {
             let bound: Vec<(String, Value)> = table
@@ -1415,6 +1527,7 @@ impl Connection {
                 columns: &bound,
                 context: Some(table_name.to_string()),
                 resolved: Vec::new(),
+                affinities: &affinities,
             };
             if let Some(pred) = where_ {
                 if !truthy(eval(pred, &ctx)?) {
@@ -1457,6 +1570,13 @@ impl Connection {
         for r in &mut rows {
             r.values.resize(table.len(), Value::Null);
         }
+        // As in UPDATE, the WHERE is bound once against a one-source FROM so the
+        // filter's comparisons take the affinity rule: `DELETE FROM t WHERE a =
+        // 5` removes the row whose TEXT column holds '5'.
+        let affinities = match where_ {
+            Some(p) => single_table_affinities(&table, table_name, &[p])?,
+            None => affinity_rules::no_affinities().clone(),
+        };
         let mut removed = 0usize;
         for row in &rows {
             if let Some(pred) = where_ {
@@ -1473,6 +1593,7 @@ impl Connection {
                     columns: &bound,
                     context: Some(table_name.to_string()),
                     resolved: Vec::new(),
+                    affinities: &affinities,
                 };
                 if !truthy(eval(pred, &ctx)?) {
                     continue;
@@ -1510,7 +1631,10 @@ fn is_star(e: &Expr) -> bool {
 /// `1  +  2` and `(1+2)*3` keeps its parentheses. Rebuilding the name from
 /// the parsed tree would print something subtly different, and the suite
 /// compares these names, so the text as written is used.
-fn column_name_with(flags: crate::pragma::ColumnNameFlags, rc: &crate::parser::ResultColumn) -> String {
+fn column_name_with(
+    flags: crate::pragma::ColumnNameFlags,
+    rc: &crate::parser::ResultColumn,
+) -> String {
     // A direct column reference names itself from the schema, and which spelling
     // it takes is what the full and short settings decide; the rest fall back to
     // the text as written.
@@ -1518,7 +1642,11 @@ fn column_name_with(flags: crate::pragma::ColumnNameFlags, rc: &crate::parser::R
         Expr::Column { table, name, .. } => (table.as_deref(), Some(name.as_str())),
         _ => (None, None),
     };
-    let source = if rc.source.is_empty() { render_expr(&rc.expr) } else { rc.source.clone() };
+    let source = if rc.source.is_empty() {
+        render_expr(&rc.expr)
+    } else {
+        rc.source.clone()
+    };
     crate::pragma::column_name(flags, rc.alias.as_deref(), table, column, &source)
 }
 
@@ -1612,7 +1740,12 @@ fn apply_order_by(
                 KeyKind::Expression => {
                     let expr = key.expr.as_ref().expect("an expression key carries one");
                     let bound = crate::join::bind_all(from, &[expr], names)?;
-                    let ctx = build_ctx(jr, from, &bound);
+                    // This key's own references, so the map is the one for *this*
+                    // expression rather than the whole statement's — the two
+                    // agree about the references they share, which is all a key
+                    // that is also in the projection needs.
+                    let affinities = affinity_rules::affinities_of(from, &bound);
+                    let ctx = build_ctx(jr, from, &bound, &affinities);
                     eval(expr, &ctx)?
                 }
             };
@@ -1673,11 +1806,23 @@ fn apply_group_order_by(
     names: &[String],
     groups: &[crate::grouping::GroupOutput],
     rows: &[Row],
+    from: &crate::join::From,
 ) -> Result<Vec<Row>> {
     if sel.order_by.is_empty() {
         return Ok(rows.to_vec());
     }
     let params: Vec<Value> = Vec::new();
+    // The keys' own references, so an ORDER BY expression's comparisons take the
+    // same affinity rule the projection's do. The keys are bound against the
+    // FROM rather than against the group, because a key that is an expression
+    // naming a table column has to resolve the same way it would anywhere else.
+    let key_exprs: Vec<&Expr> = spec.iter().filter_map(|k| k.expr.as_ref()).collect();
+    let affinities = if key_exprs.is_empty() {
+        affinity_rules::no_affinities().clone()
+    } else {
+        let key_bound = crate::join::bind_all(from, &key_exprs, names)?;
+        affinity_rules::affinities_of(from, &key_bound)
+    };
     let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
     for (i, g) in groups.iter().enumerate() {
         let ctx = EvalCtx {
@@ -1686,6 +1831,7 @@ fn apply_group_order_by(
             columns: &[],
             resolved: g.resolved.clone(),
             context: None,
+            affinities: &affinities,
         };
         let mut keys = Vec::with_capacity(spec.len());
         for key in spec {
@@ -1777,10 +1923,18 @@ fn rewrite_aggregates(
 /// the joined row by offset. The named row is carried as well because it is
 /// what a name that was not pre-resolved falls back to, and because it is the
 /// shape the rest of the executor already builds.
+///
+/// The affinity map is built here rather than by the caller because it is a
+/// function of the same two things the context is: the FROM the references were
+/// resolved against and the references themselves. Building it once per row
+/// would be a resolution per row, which for a table scan is a resolution per
+/// row for a map that is the same every time — so it is built where the FROM
+/// and the bound list are, and the row is read under it.
 fn build_ctx<'a>(
     jr: &crate::join::JoinedRow,
     from: &crate::join::From,
     bound: &[crate::join::Bound],
+    affinities: &'a std::collections::HashMap<usize, crate::affinity::Affinity>,
 ) -> EvalCtx<'a> {
     let resolved = crate::join::resolved_values(jr, from, bound);
     EvalCtx {
@@ -1789,7 +1943,37 @@ fn build_ctx<'a>(
         columns: &[],
         context: None,
         resolved,
+        affinities,
     }
+}
+
+/// The affinities a statement's column references contribute, for a statement
+/// whose FROM is a single table.
+///
+/// An UPDATE and a DELETE read their row by name rather than through a join, so
+/// there is no `Bound` list to key a map on. The references are bound against a
+/// one-source FROM built from the same table the row comes from, which gives the
+/// same map the SELECT path has — the offsets are the ones the parser recorded
+/// and they are the ones `eval` looks a value up by, so the two agree on what
+/// "this operand" is without a second resolution.
+///
+/// The FROM is built once, before the rows are read, for the same reason
+/// [`build_ctx`] takes the map rather than making it: it is the same every row.
+fn single_table_affinities(
+    table: &Table,
+    table_name: &str,
+    exprs: &[&Expr],
+) -> Result<std::collections::HashMap<usize, crate::affinity::Affinity>> {
+    let from = crate::join::resolve(vec![crate::join::Source {
+        name: table_name.to_string(),
+        table: table.clone(),
+        join: None,
+        on: None,
+        using: Vec::new(),
+    }])?;
+    let aliases: Vec<String> = Vec::new();
+    let bound = crate::join::bind_all(&from, exprs, &aliases)?;
+    Ok(affinity_rules::affinities_of(&from, &bound))
 }
 
 /// Removes the repeated rows, keeping the first of each run.
@@ -2021,11 +2205,112 @@ mod tests {
         let mut c = mem();
         run(&mut c, "CREATE TABLE t(a, b)");
         let e = c.execute_script("INSERT INTO t VALUES(1)").unwrap_err();
-        assert_eq!(e.code.name(), "MISMATCH");
+        // `SQLITE_ERROR` (1), not `SQLITE_MISMATCH` (20). Read off Python's
+        // `sqlite3`, which reports OperationalError with SQLITE_ERROR for every
+        // count mismatch in both INSERT forms; this used to assert MISMATCH,
+        // which is the code the `SELECT` form did not use and sqlite3 does not
+        // use either. The wording and the code now both come from
+        // `insert_select::count_error`, so the two forms cannot disagree again.
+        assert_eq!(e.code.name(), "ERROR");
         assert_eq!(
             e.message,
             "table t has 2 columns but 1 values were supplied"
         );
+    }
+
+    #[test]
+    fn a_ragged_values_list_is_refused_before_anything_is_written() {
+        // sqlite3 3.53.4, both spellings:
+        //   CREATE TABLE t(a,b,c); INSERT INTO t VALUES(1,2,3),(4,5)
+        //   CREATE TABLE t(a,b,c); INSERT INTO t VALUES(1,2),(3,4,5)
+        //     -> all VALUES must have the same number of terms
+        // and Python's sqlite3 gives SQLITE_ERROR for that as well as for the
+        // count mismatches.
+        //
+        // The `count == 0` is the half that matters. This used to write the
+        // well-formed row and only then notice the second was the wrong width,
+        // so a statement that reported failure had already changed the table.
+        let mut c = mem();
+        run(&mut c, "CREATE TABLE t(a, b, c)");
+        let e = c
+            .execute_script("INSERT INTO t VALUES(1,2,3),(4,5)")
+            .unwrap_err();
+        assert_eq!(e.message, "all VALUES must have the same number of terms");
+        assert_eq!(e.code.name(), "ERROR");
+        let o = run(&mut c, "SELECT count(*) FROM t");
+        assert_eq!(rows_of(&o)[0].values[0], Value::Integer(0));
+
+        let e = c
+            .execute_script("INSERT INTO t VALUES(1,2),(3,4,5)")
+            .unwrap_err();
+        assert_eq!(e.message, "all VALUES must have the same number of terms");
+        let o = run(&mut c, "SELECT count(*) FROM t");
+        assert_eq!(rows_of(&o)[0].values[0], Value::Integer(0));
+    }
+
+    #[test]
+    fn a_values_list_whose_rows_agree_still_reports_the_count() {
+        // The other half of the case above: a list that is internally
+        // consistent is a *count* error, not a ragged one. Checked against
+        // 3.53.4, where `INSERT INTO t(a) VALUES(1,2),(3,4)` on a three-column
+        // `t` reports `2 values for 1 columns`.
+        let mut c = mem();
+        run(&mut c, "CREATE TABLE t(a, b, c)");
+        let e = c
+            .execute_script("INSERT INTO t(a) VALUES(1,2),(3,4)")
+            .unwrap_err();
+        assert_eq!(e.message, "2 values for 1 columns");
+    }
+
+    #[test]
+    fn a_well_formed_values_list_is_not_mistaken_for_a_ragged_one() {
+        // The control for the check above, including the degenerate shapes: one
+        // row, and a named list narrower than the table.
+        let mut c = mem();
+        run(&mut c, "CREATE TABLE t(a, b)");
+        run(&mut c, "INSERT INTO t VALUES(1,2),(3,4),(5,6)");
+        run(&mut c, "INSERT INTO t VALUES(7,8)");
+        run(&mut c, "INSERT INTO t(a) VALUES(9),(10)");
+        let o = run(&mut c, "SELECT count(*) FROM t");
+        assert_eq!(rows_of(&o)[0].values[0], Value::Integer(6));
+    }
+
+    #[test]
+    fn a_not_null_failure_leaves_no_rows_behind() {
+        // The build-then-write split, measured. sqlite3 3.53.4 returns 0 in the
+        // same session for the same statements; this used to return the number
+        // of rows that happened to precede the NULL, because those were written
+        // before it was reached and this engine cannot undo a write.
+        let mut c = mem();
+        run(&mut c, "CREATE TABLE t(a NOT NULL, b)");
+        run(&mut c, "CREATE TABLE s(x, y)");
+        run(&mut c, "INSERT INTO s VALUES(1,1),(NULL,2),(3,3)");
+        let e = c
+            .execute_script("INSERT INTO t SELECT x, y FROM s")
+            .unwrap_err();
+        assert_eq!(e.message, "NOT NULL constraint failed: t.a");
+        let o = run(&mut c, "SELECT count(*) FROM t");
+        assert_eq!(
+            rows_of(&o)[0].values[0],
+            Value::Integer(0),
+            "the rows ahead of the NULL were not written"
+        );
+    }
+
+    #[test]
+    fn a_bad_rowid_alias_value_leaves_no_rows_behind() {
+        // Same split, for the other check that can be made without the b-tree.
+        // sqlite3 3.53.4 returns 0 here too.
+        let mut c = mem();
+        run(&mut c, "CREATE TABLE t(a INTEGER PRIMARY KEY, b)");
+        run(&mut c, "CREATE TABLE s(x, y)");
+        run(&mut c, "INSERT INTO s VALUES(1,'p'),('q','r')");
+        let e = c
+            .execute_script("INSERT INTO t SELECT x, y FROM s")
+            .unwrap_err();
+        assert_eq!(e.code.name(), "MISMATCH");
+        let o = run(&mut c, "SELECT count(*) FROM t");
+        assert_eq!(rows_of(&o)[0].values[0], Value::Integer(0));
     }
 
     #[test]
@@ -2226,9 +2511,7 @@ mod tests {
         // statement says so rather than quietly doing nothing.
         // A compound select parses and is understood, but the executor does
         // not run one yet, which is the case the branch is for.
-        let e = c
-            .execute_script("SELECT 1 UNION SELECT 2")
-            .unwrap_err();
+        let e = c.execute_script("SELECT 1 UNION SELECT 2").unwrap_err();
         assert!(
             e.message.contains("not supported yet"),
             "got: {}",
