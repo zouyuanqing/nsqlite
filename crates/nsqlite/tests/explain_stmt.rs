@@ -619,3 +619,123 @@ fn a_plan_is_a_query_outcome() {
         "a plan is a query, not a change count"
     );
 }
+
+// --- the terminator is part of the slice -----------------------------------
+
+/// The statement's own semicolon has to reach the module, because the module
+/// decides between two different messages on the strength of it.
+///
+/// This is the case that regressed. The parser cut the slice at the *start* of
+/// the semicolon rather than its end, so a written `;` never arrived, and every
+/// statement whose whole content is the terminator was reported as an input
+/// that had run out. Both are SQLite's messages and they are different:
+///
+/// ```text
+/// EXPLAIN;              near ";": syntax error
+/// EXPLAIN QUERY;        near ";": syntax error
+/// EXPLAIN QUERY PLAN;   near ";": syntax error
+/// EXPLAIN               incomplete input
+/// EXPLAIN QUERY         incomplete input
+/// EXPLAIN QUERY PLAN    incomplete input
+/// ```
+///
+/// Measured on 3.53.4, and the eight rows below are read off it in that order.
+///
+/// The bug was invisible to the module's own unit tests because they call
+/// `explain::parse(";")` directly, which is exactly the slice the parser was
+/// supposed to hand over and was not. These cases go through
+/// `parse_one`, so they fail if the parser stops handing it.
+#[test]
+fn a_written_semicolon_is_a_token_and_input_that_ran_out_is_not() {
+    for (sql, expected) in [
+        ("EXPLAIN;", "near \";\": syntax error"),
+        ("EXPLAIN QUERY;", "near \";\": syntax error"),
+        ("EXPLAIN QUERY PLAN;", "near \";\": syntax error"),
+        ("EXPLAIN blah;", "near \"blah\": syntax error"),
+        ("EXPLAIN QUERY FOO;", "near \"FOO\": syntax error"),
+        ("EXPLAIN", "incomplete input"),
+        ("EXPLAIN QUERY", "incomplete input"),
+        ("EXPLAIN QUERY PLAN", "incomplete input"),
+    ] {
+        let err = parse_one(sql).expect_err(&format!("{sql:?} is not a statement"));
+        assert_eq!(err.message, expected, "for {sql}");
+    }
+}
+
+/// The same split is SQLite's for `PRAGMA`, and it comes from the same shared
+/// slice.
+///
+/// `PRAGMA;` is `near ";": syntax error` while a bare `PRAGMA` is `incomplete
+/// input`, and the two are drawn by the same one-line rule in the parser that
+/// fixes the three EXPLAIN cases. It is here so the fix cannot be narrowed to
+/// the EXPLAIN arm later without failing something.
+///
+/// `PRAGMA main.` is the same split one token further in, and it is the second
+/// half of the claim: the message is chosen by whether a token is there to
+/// name, not by where the statement stopped. `PRAGMA main;` is not an error at
+/// all in either engine -- a schema qualifier is optional, so `main` reads as
+/// the pragma's own name -- which is why the two rows that differ are the ones
+/// with a dot.
+#[test]
+fn a_pragma_terminator_is_a_token_too() {
+    for (sql, expected) in [
+        ("PRAGMA;", "near \";\": syntax error"),
+        ("PRAGMA", "incomplete input"),
+        ("PRAGMA main.", "incomplete input"),
+    ] {
+        let err = parse_one(sql).expect_err(&format!("{sql:?} is not a statement"));
+        assert_eq!(err.message, expected, "for {sql}");
+    }
+}
+
+/// Including the terminator in the slice must not eat the statement after it.
+///
+/// The slice grew by one character when the parser was fixed, and the loop
+/// that consumes this statement's tokens is bounded by the same offset. A
+/// `<=` bound would swallow the token that opens the next statement as well,
+/// and `EXPLAIN SELECT 1; SELECT 2` would explain the 2 rather than the 1 --
+/// or stop the script outright. The real engine splits it the same way, which
+/// was measured before the bound was chosen.
+///
+/// Measured on 3.53.4, and asserted here through the outcome list, which is
+/// what actually distinguishes the two splits: three statements in, three
+/// outcomes out, and the middle one is the plan for `SELECT 1`.
+#[test]
+fn including_the_terminator_does_not_swallow_the_next_statement() {
+    let mut c = db();
+    let out = c
+        .execute_script("SELECT 0; EXPLAIN QUERY PLAN SELECT * FROM t1; SELECT 2;")
+        .expect("all three statements run");
+    assert_eq!(out.len(), 3, "three statements, three outcomes");
+    let Outcome::Query { rows, .. } = &out[1] else {
+        panic!("the EXPLAIN produced no query");
+    };
+    assert_eq!(rows.len(), 1, "one plan line for one table");
+    assert_eq!(rows[0].values[3], nsqlite::Value::Text("SCAN t1".into()));
+    let Outcome::Query { rows, .. } = &out[2] else {
+        panic!("the trailing SELECT produced no query");
+    };
+    assert_eq!(rows[0].values[0], nsqlite::Value::Integer(2));
+}
+
+/// `EXPLAIN` alone returns the eight opcode column names and no rows.
+///
+/// The column list is the part that can still be right, and this is the
+/// statement that carries it through the parser to a caller. `sqlite3` 3.53.4
+/// reports exactly these eight names in this order (read from
+/// `cursor.description`), so the assertion is on the names and the order, not
+/// on the absence of rows alone.
+#[test]
+fn a_bare_explain_reports_the_opcode_columns_and_no_rows() {
+    let mut c = db();
+    let out = c.execute_script("EXPLAIN SELECT 1").expect("EXPLAIN runs");
+    let Outcome::Query { columns, rows } = &out[0] else {
+        panic!("EXPLAIN produced no query");
+    };
+    assert_eq!(
+        columns,
+        &nsqlite::explain::OPCODE_COLUMNS,
+        "the 8 opcode columns"
+    );
+    assert!(rows.is_empty(), "this engine has no opcodes to list");
+}

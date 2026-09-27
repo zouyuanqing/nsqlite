@@ -384,7 +384,11 @@ mod tests {
         assert!(c.contains("USERS"));
         assert!(c.contains("Users"));
         assert!(!c.contains("others"));
-        assert_eq!(c.names(), vec!["users"]);
+        // The spelling as declared, not the key. Every lookup folds, so the key
+        // may be; but a message that has to name the table echoes what
+        // `CREATE TABLE` wrote, and `no such column: main.MiXeD.a` is right
+        // where `main.mixed.a` is not. See `parser::query_name`.
+        assert_eq!(c.names(), vec!["Users"]);
         c.remove("USERS");
         assert!(c.is_empty());
     }

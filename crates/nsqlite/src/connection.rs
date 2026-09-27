@@ -19,12 +19,13 @@ use crate::affinity::Affinity;
 use crate::affinity_rules;
 use crate::catalog::{Catalog, Column, Table};
 use crate::error::{Error, Result, ResultCode};
-use crate::msg;
 use crate::eval::{eval, truthy, EvalCtx};
+use crate::msg;
 use crate::pager::Pager;
 use crate::parser::{
     ColumnDef, Constraint, Expr, FromItem, InsertSource, Literal, Select, SelectBody, Stmt,
 };
+use crate::resolve;
 use crate::table_tree::TableTree;
 use crate::value::Value;
 
@@ -52,7 +53,14 @@ fn rebuild_index(
     root: u32,
 ) -> Option<crate::catalog::Index> {
     let stmt = crate::parser::parse_one(sql_text).ok()?;
-    let crate::parser::Stmt::CreateIndex { name: named, table: tbl, columns, unique, .. } = stmt else {
+    let crate::parser::Stmt::CreateIndex {
+        name: named,
+        table: tbl,
+        columns,
+        unique,
+        ..
+    } = stmt
+    else {
         return None;
     };
     Some(crate::catalog::Index {
@@ -202,6 +210,17 @@ pub struct Connection {
     /// directly, because reading the schema b-tree needs the pager borrowed
     /// mutably and the SELECT path wants the outcome by value.
     pending_outcome: Option<Outcome>,
+    /// The double-quoted names in the statement being run, which the resolver
+    /// cannot work out on its own and the `no such column` message needs.
+    ///
+    /// SQLite treats a `"..."` that resolves to nothing as a mistake about
+    /// quoting rather than about the name -- `no such column: "a+b" - should
+    /// this be a string literal in single-quotes?` -- and the same name in
+    /// brackets or backticks is a plain `no such column: a+b`. The quoting is
+    /// gone by the time a name fails to resolve, so the names are collected
+    /// from the statement's own text here, on the way in, and cleared on the
+    /// way out whether the statement ran or failed.
+    double_quoted: Vec<String>,
 }
 
 impl Connection {
@@ -217,6 +236,7 @@ impl Connection {
             auto_rowid: 0,
             column_name_flags: Connection::default_column_name_flags(),
             pending_outcome: None,
+            double_quoted: Vec::new(),
         };
         conn.load_schema()?;
         Ok(conn)
@@ -235,6 +255,7 @@ impl Connection {
             auto_rowid: 0,
             column_name_flags: Connection::default_column_name_flags(),
             pending_outcome: None,
+            double_quoted: Vec::new(),
         };
         conn.load_schema()?;
         Ok(conn)
@@ -288,7 +309,9 @@ impl Connection {
                 // concerned, so PRAGMA index_list came back empty and a query
                 // that should have used the index scanned instead.
                 "index" => {
-                    if let Some(index) = rebuild_index(name, row.values[2].as_str().unwrap_or(name), sql_text, root) {
+                    if let Some(index) =
+                        rebuild_index(name, row.values[2].as_str().unwrap_or(name), sql_text, root)
+                    {
                         self.catalog.put_index(index);
                     }
                 }
@@ -401,18 +424,56 @@ impl Connection {
         self.catalog.names()
     }
 
+    /// The `no such column` error for a name the statement wrote, which is
+    /// either the plain form or SQLite's hint about double quotes.
+    ///
+    /// The two are the same name with different quoting, and the quoting is
+    /// something only the statement's own text still knows, so the list
+    /// collected on the way in is what decides. See [`Connection::
+    /// double_quoted`].
+    ///
+    /// The name is matched the way a name is matched everywhere else --
+    /// folded -- because `"BadCol"` and `BADCOL` are the same name and sqlite3
+    /// says the same thing for both: `SELECT "NOSUCHCOL"` is `no such column:
+    /// "NOSUCHCOL" - should this be a string literal in single-quotes?`, with
+    /// the token's own case inside the quotes.
+    fn no_such_column_for(&self, name: &str) -> Error {
+        if self
+            .double_quoted
+            .iter()
+            .any(|q| q.eq_ignore_ascii_case(name))
+        {
+            msg::no_such_column_double_quoted(name)
+        } else {
+            msg::no_such_column(name)
+        }
+    }
+
     /// Runs a statement, which may be several separated by semicolons.
     pub fn execute_script(&mut self, sql: &str) -> Result<Vec<Outcome>> {
         let stmts = crate::parser::parse_script(sql)?;
         let mut out = Vec::with_capacity(stmts.len());
         for s in stmts {
-            out.push(self.execute(&s)?);
+            // The text goes with the statement, because a statement's spans are
+            // offsets into it and `execute` has only the statement.
+            out.push(self.execute_with_text(&s, sql)?);
         }
         Ok(out)
     }
 
-    /// Runs one statement.
+    /// Runs one statement, which the caller parsed from text it does not have.
+    ///
+    /// A statement's own text only refines two messages -- the double-quoted
+    /// form of `no such column` and the stored `sqlite_schema` text -- and the
+    /// first needs the text, so a caller that has it should reach for
+    /// [`Connection::execute_with_text`] instead. A caller that does not is
+    /// running a statement it built itself, and there is no text to read.
     pub fn execute(&mut self, stmt: &Stmt) -> Result<Outcome> {
+        self.execute_with_text(stmt, "")
+    }
+
+    /// Runs one statement out of `sql`, the text it was parsed from.
+    pub fn execute_with_text(&mut self, stmt: &Stmt, sql: &str) -> Result<Outcome> {
         // `changes` is cleared on entry, and a statement that fails therefore
         // reports zero rather than the count of the statement before it. That
         // was checked against sqlite3 3.53.4 through the C API, and it is what
@@ -421,6 +482,12 @@ impl Connection {
         // statement. The rows themselves are unaffected, which is the
         // statement-journal's job rather than this counter's.
         self.changes = 0;
+        // The double-quoted names, read off the statement's own text before
+        // anything resolves a name. `Stmt` keeps no text, so a statement built
+        // by hand carries none and the list is simply empty -- the resolver
+        // then reports the bare `no such column: x`, which is the reading that
+        // is right whenever no name was written in double quotes.
+        self.double_quoted = stmt.double_quoted_names(sql);
         // The static aggregate checks (arity, scope, nesting, ticket #2526's
         // aliased-aggregate rule) are a property of the parse tree, decided
         // with no row read. So they run here, above the dispatch, and not in a
@@ -438,7 +505,9 @@ impl Connection {
         // `queryable_tables` is the same list the SELECT path resolves a FROM
         // against, so the two agree on which tables exist -- including the
         // schema table, which is not in the catalog.
-        crate::aggcheck::Ctx::new().check(stmt, &self.queryable_tables())?;
+        crate::aggcheck::Ctx::new()
+            .with_double_quoted(&self.double_quoted)
+            .check(stmt, &self.queryable_tables())?;
         // An EXPLAIN wraps a statement, and the wrap changes what the check
         // above is given: it has been handed a node whose arms match none of
         // the shapes it knows, so the whole walk stands aside and the wrapped
@@ -603,6 +672,28 @@ impl Connection {
                 ResultCode::Error,
                 "WITHOUT ROWID is not supported yet",
             ));
+        }
+        // A `CREATE TABLE` that declares the same column twice is a parse
+        // error in SQLite, not a schema this engine is handed, so it is
+        // refused before the table is built.
+        //
+        // The comparison is on the schema's spelling, so `A` and `a` are one
+        // name; the name *reported* is the one that collided rather than the
+        // one already there, which is what sqlite3 echoes:
+        // `CREATE TABLE t1(a,A)` is `duplicate column name: A` and
+        // `CREATE TABLE t1(A,a)` is `duplicate column name: a`. Both were
+        // measured rather than reasoned, and the two are what distinguish the
+        // rule from the obvious one.
+        for (i, col) in columns.iter().enumerate() {
+            if columns[..i]
+                .iter()
+                .any(|earlier| earlier.name.eq_ignore_ascii_case(&col.name))
+            {
+                return Err(Error::new(
+                    ResultCode::Error,
+                    msg::Msg::DuplicateColumnName.render(&[msg::name(&col.name)]),
+                ));
+            }
         }
         if columns.is_empty() {
             return Err(Error::new(
@@ -846,10 +937,7 @@ impl Connection {
             };
             if let Some(v) = full.get(alias) {
                 if !matches!(v, Value::Integer(_) | Value::Null) {
-                    return Err(Error::new(
-                        ResultCode::Mismatch,
-                        format!("datatype mismatch: {v} is not an integer"),
-                    ));
+                    return Err(msg::datatype_mismatch());
                 }
             }
         }
@@ -873,12 +961,7 @@ impl Connection {
             match values.get(i) {
                 Some(Value::Integer(v)) => return Ok(*v),
                 Some(Value::Null) | None => {}
-                Some(other) => {
-                    return Err(Error::new(
-                        ResultCode::Mismatch,
-                        format!("datatype mismatch: {} is not an integer", other.to_string()),
-                    ))
-                }
+                Some(_) => return Err(msg::datatype_mismatch()),
             }
         }
         let max = {
@@ -1547,6 +1630,14 @@ impl Connection {
         // The output column names: the alias, or the column's own name, or the
         // expression's text. A star takes the resolved expansion, which is
         // every table's columns with a USING column counted once.
+        //
+        // The names come *before* the FROM is walked, because a direct
+        // reference is named from the schema and the schema is what the FROM
+        // resolves to -- `SELECT BB FROM Users` reports `Bb` and not `BB`, and
+        // nothing but the FROM can say which of the two the table holds. A
+        // table the FROM could not resolve is reported by the walk below
+        // rather than by the naming here, so a name is never reported for a
+        // query that has no rows to report it for.
         let star = columns.len() == 1 && is_star(&columns[0].expr);
         let mut names: Vec<String> = Vec::with_capacity(columns.len());
         if star {
@@ -1556,13 +1647,12 @@ impl Connection {
             names = from.star.iter().map(|(n, _, _)| n.clone()).collect();
         } else {
             for rc in columns {
-                names.push(match &rc.alias {
-                    Some(a) => a.clone(),
-                    None => match &rc.expr {
-                        Expr::Column { name, .. } => name.clone(),
-                        _ => column_name_with(self.column_name_flags, rc),
-                    },
-                });
+                names.push(column_name_with(
+                    self.column_name_flags,
+                    rc,
+                    &self.catalog,
+                    Some(from),
+                ));
             }
         }
 
@@ -1591,7 +1681,26 @@ impl Connection {
         for (e, _) in &sel.order_by {
             exprs.push(e);
         }
-        let bound = crate::join::bind_all(from, &exprs, &names)?;
+        // An ORDER BY term is resolved here against the FROM *and* the result
+        // columns, because SQLite resolves the two in that order and a key that
+        // names an alias has to be answered by the alias. The result columns'
+        // aliases are the whole of that list rather than the reported names,
+        // which are the schema's spelling for a direct reference: `SELECT b AS
+        // bb FROM t ORDER BY BB` reads the alias `bb`, and only the alias is
+        // written `bb`. The reported names are passed as well, so a key naming
+        // a projected column under its reported name still resolves.
+        //
+        // The keys are resolved *again* below, after grouping, where the
+        // substitution runs. That is not a second answer to the same question:
+        // the pass here only settles which names exist, and a key that names an
+        // alias is bound to the alias's own expression there.
+        let mut aliases: Vec<String> = names.clone();
+        for rc in columns {
+            if let Some(a) = &rc.alias {
+                aliases.push(a.clone());
+            }
+        }
+        let bound = crate::join::bind_all(from, &exprs, &aliases)?;
 
         // The affinity each of those references contributes to a comparison,
         // resolved once from the same FROM and the same bound list, so the
@@ -1662,7 +1771,16 @@ impl Connection {
             // or an aggregate over one, still resolves: a grouped query can
             // order by anything the group has, not only what it projects.
             let spec = crate::orderby::resolve_keys(sel, columns, &names, Some(from))?;
-            let mut sorted = apply_group_order_by(sel, &spec, &plan, &names, &groups, &out, from)?;
+            let mut sorted = apply_group_order_by(
+                sel,
+                &spec,
+                &plan,
+                &names,
+                &groups,
+                &out,
+                from,
+                &self.double_quoted,
+            )?;
             apply_limit(sel, &mut sorted)?;
             return Ok(Outcome::Query {
                 columns: names,
@@ -1724,7 +1842,6 @@ impl Connection {
         }
 
         let mut projected: Vec<Row> = out.iter().map(|(r, _)| r.clone()).collect();
-        crate::orderby::resolve_keys(sel, columns, &names, Some(from))?;
         apply_order_by(sel, columns, from, &names, &out, &mut projected)?;
         // DISTINCT drops the repeats, comparing whole rows rather than any one
         // column. It runs after ORDER BY and LIMIT would matter for the order,
@@ -1769,12 +1886,13 @@ impl Connection {
             }
             out.push(Row { values });
         }
-        let flags = self.column_name_flags;
         let names: Vec<String> = columns
             .iter()
             .map(|rc| match &rc.alias {
                 Some(a) => a.clone(),
-                None => column_name_with(self.column_name_flags, rc),
+                // No FROM, so a qualified reference names no source: the text
+                // as written is the only name it has.
+                None => column_name_with(self.column_name_flags, rc, &self.catalog, None),
             })
             .collect();
         // ORDER BY still applies, and is still resolved. There is one row so
@@ -1782,6 +1900,9 @@ impl Connection {
         // ordinal past the single column is out of range, both decided before
         // the query runs rather than after it produces its row.
         if !sel.order_by.is_empty() {
+            // Settled before the report is built, so a bad key is the error the
+            // statement fails with. The columns are named either side of this,
+            // and the names are not what the error is about.
             crate::orderby::resolve_keys(sel, columns, &names, None)?;
         }
         apply_limit(sel, &mut out)?;
@@ -1813,7 +1934,7 @@ impl Connection {
             for (name, expr) in sets {
                 let idx = table
                     .column_index(name)
-                    .ok_or_else(|| msg::no_such_column(name))?;
+                    .ok_or_else(|| self.no_such_column_for(name))?;
                 v.push((idx, expr));
             }
             v
@@ -1844,6 +1965,7 @@ impl Connection {
                 context: Some(table_name.to_string()),
                 resolved: Vec::new(),
                 affinities: &affinities,
+                double_quoted: &self.double_quoted,
             };
             if let Some(pred) = where_ {
                 if !truthy(eval(pred, &ctx)?) {
@@ -1910,6 +2032,7 @@ impl Connection {
                     context: Some(table_name.to_string()),
                     resolved: Vec::new(),
                     affinities: &affinities,
+                    double_quoted: &self.double_quoted,
                 };
                 if !truthy(eval(pred, &ctx)?) {
                     continue;
@@ -1952,11 +2075,12 @@ fn is_star(e: &Expr) -> bool {
 /// is `table t1 has no column named nosuchcol` while `INSERT INTO t1
 /// VALUES(nosuchcol)` is `no such column: nosuchcol`. A column list is a list
 /// of columns; a values list is expressions.
+///
+/// The wording comes from the catalogue, which holds it next to the messages
+/// it is easiest to confuse it with, so there is one place to change rather
+/// than a copy at every call site.
 fn unknown_column(table: &str, column: &str) -> Error {
-    Error::new(
-        ResultCode::Error,
-        format!("table {table} has no column named {column}"),
-    )
+    msg::no_such_column_for_table(table, column)
 }
 
 /// The name SQLite gives a result column with no alias, which is the text of
@@ -1970,22 +2094,90 @@ fn unknown_column(table: &str, column: &str) -> Error {
 fn column_name_with(
     flags: crate::pragma::ColumnNameFlags,
     rc: &crate::parser::ResultColumn,
+    catalog: &Catalog,
+    from: Option<&crate::join::From>,
 ) -> String {
-    // A direct column reference names itself from the schema, and which spelling
-    // it takes is what the full and short settings decide; the rest fall back to
-    // the text as written.
-    let (table, column) = match &rc.expr {
-        Expr::Column { table, name, .. } => (table.as_deref(), Some(name.as_str())),
-        _ => (None, None),
+    // A direct reference names itself from the SCHEMA, so it needs the schema's
+    // spelling rather than the statement's: `SELECT Bb FROM Users` reports the
+    // column `Bb` whichever way the query wrote it. The statement's spelling
+    // is kept in `rc.source` and is what a message uses, and the two are
+    // different things -- `SELECT b FROM Users` is `no such column: b` because
+    // the table has `Bb`, while a report that folded the name would be `b`.
+    let Expr::Column {
+        table: qualifier,
+        name,
+        ..
+    } = &rc.expr
+    else {
+        // Not a reference, so the name is the text as written. A CAST's type
+        // is one of these, and folding it would fold the source text with it:
+        // `SELECT CAST(1 AS Integer)` is reported `CAST(1 AS Integer)`.
+        let source = if rc.source.is_empty() {
+            render_expr(&rc.expr)
+        } else {
+            rc.source.clone()
+        };
+        return crate::pragma::column_name(flags, rc.alias.as_deref(), None, None, &source);
     };
-    let source = if rc.source.is_empty() {
-        render_expr(&rc.expr)
-    } else {
-        rc.source.clone()
+    if let Some(a) = &rc.alias {
+        return a.clone();
+    }
+    // `srcName` in sqlite3GenerateColumnNames is `short || full`, and the whole
+    // direct-reference branch of that function is guarded by it. A reference
+    // therefore names itself from the SCHEMA whenever either setting is on --
+    // which, with SQLite's default of short=on, is almost always -- and falls
+    // through to the source text only when both are off.
+    if !flags.names_direct() {
+        return rc.source.clone();
+    }
+    // A qualified reference names a column of a *source*, and the qualifier is
+    // the only thing that identifies the source: a query that renamed a table
+    // refers to it by a name the catalog has never heard. So the qualifier is
+    // left as written and the FROM does the looking up -- see
+    // `join::schema_column_name` for the column and
+    // `join::source_table_name` for the table `full` qualifies with.
+    let source = qualifier.clone();
+    // The schema's spelling, with nothing done to it. It is the same string
+    // whether the reference was written `BB`, `bb` or `Bb`, which is what makes
+    // `SELECT BB FROM Users` report `Bb`: the report describes the schema, so
+    // folding the name here would be the one thing it must not do.
+    //
+    // An unqualified reference is looked up across the whole FROM, because it is
+    // the resolution itself that decides which source owns it. There is no
+    // qualifier to narrow the search, and asking the catalog instead would find
+    // a table the query never mentioned.
+    let bound = match source.as_deref() {
+        Some(s) => from
+            .and_then(|f| crate::join::schema_column_name(f, s, name))
+            .or_else(|| resolve::schema_column_name(catalog, s, name)),
+        None => from.and_then(|f| crate::join::schema_column_name(f, "", name)),
     };
-    crate::pragma::column_name(flags, rc.alias.as_deref(), table, column, &source)
+    if flags.qualified_direct() {
+        // `full` on qualifies with the *table*, and the table is the source's
+        // own name rather than the alias a query gave it: `SELECT p.x FROM a
+        // AS p` is `a.x` under `full` and `p.x` with `short` off. The two
+        // halves are therefore both asked of the source the qualifier resolved
+        // to, and the qualifier itself is never one of them. An unqualified
+        // reference asks the same question of the first source holding the
+        // column, which is the one the reference itself resolved to.
+        let table = from
+            .and_then(|f| crate::join::source_table_name(f, qualifier.as_deref().unwrap_or("")));
+        return match (table, bound) {
+            (Some(t), Some(c)) => format!("{t}.{c}"),
+            // The column the schema holds but the FROM does not name, and the
+            // table the catalog holds for a qualifier the FROM does not: each is
+            // the closest thing the reference has to a name, so each is what
+            // the report falls back to.
+            (Some(t), None) => format!("{t}.{name}"),
+            (None, Some(c)) => c,
+            // The source the query named, which is all that is left.
+            (None, None) => rc.source.clone(),
+        };
+    }
+    // `short` on alone: the bare column, named from the schema. The statement's
+    // own spelling is what a *message* echoes, and this is not a message.
+    bound.unwrap_or_else(|| rc.source.clone())
 }
-
 fn render_expr(e: &Expr) -> String {
     match e {
         Expr::Literal(Literal::Integer(i)) => i.to_string(),
@@ -2051,13 +2243,17 @@ fn apply_order_by(
     // rules do not depend on a row: an ordinal is range-checked even when the
     // query matches nothing, and a name resolving to neither a column nor an
     // alias is an error for the same reason.
+    // The keys are the *substituted* terms, not the ones the statement wrote:
+    // a name that reads a result column is bound to the projection, and
+    // binding the written term would look the name up in the table instead.
+    // `resolve_keys` is what performs the substitution, and its `unresolved`
+    // check does not consult the table the way `bind_all` does -- one
+    // substituted for the other, not both -- so a term that survived
+    // resolution is known to be readable and needs no second check.
     let spec = crate::orderby::resolve_keys(sel, columns, names, Some(from))?;
 
-    let mut keys_exprs: Vec<&Expr> = Vec::new();
-    for (e, _) in &sel.order_by {
-        keys_exprs.push(e);
-    }
-    let bound = crate::join::bind_all(from, &keys_exprs, names)?;
+    let keys_exprs: Vec<&Expr> = spec.iter().filter_map(|k| k.expr.as_ref()).collect();
+    crate::join::bind_all_lenient(from, &keys_exprs)?;
     // Each row carries its sort keys alongside it, computed once, so a
     // comparison never re-evaluates an expression.
     let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
@@ -2143,6 +2339,7 @@ fn apply_group_order_by(
     groups: &[crate::grouping::GroupOutput],
     rows: &[Row],
     from: &crate::join::From,
+    double_quoted: &[String],
 ) -> Result<Vec<Row>> {
     if sel.order_by.is_empty() {
         return Ok(rows.to_vec());
@@ -2168,6 +2365,7 @@ fn apply_group_order_by(
             resolved: g.resolved.clone(),
             context: None,
             affinities: &affinities,
+            double_quoted,
         };
         let mut keys = Vec::with_capacity(spec.len());
         for key in spec {
@@ -2280,6 +2478,7 @@ fn build_ctx<'a>(
         context: None,
         resolved,
         affinities,
+        double_quoted: &[],
     }
 }
 

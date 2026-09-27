@@ -437,7 +437,11 @@ impl Pager {
         })?;
         self.nonce = self.nonce.wrapping_add(1);
         let mut j = Journal::create(&path, self.page_size, 512, self.nonce)?;
-        j.set_original_size(self.header.db_size_pages)?;
+        // Page 1 exists before any page is allocated, because it holds the
+        // file header. Recording a size of zero would mean the rollback skips
+        // every page including that one, and a file whose header page was never
+        // restored is not a database at all.
+        j.set_original_size(self.header.db_size_pages.max(1))?;
         self.journal = Some(j);
         Ok(())
     }

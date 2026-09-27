@@ -18,7 +18,7 @@
 //! hole can never drift from the format string. A message with no holes is in
 //! [`Msg::FIXED`] and takes no arguments.
 //!
-//! # Case: where a name comes from decides whether it keeps its case
+//! # Case: where a name comes from decides which spelling it echoes
 //!
 //! This is the whole point of the module, and the rule is *not* uniform.
 //!
@@ -33,6 +33,8 @@
 //! SELECT * FROM Foo;      ->  no such table: Foo
 //! SELECT XYZZY(1);        ->  no such function: XYZZY
 //! SELECT ABS(1,2);        ->  wrong number of arguments to function ABS()
+//! SELECT BadCol;          ->  no such column: BadCol
+//! SELECT NOSUCHCOL;       ->  no such column: NOSUCHCOL
 //! SELECT * FROM "Foo";    ->  no such table: Foo
 //! SELECT * FROM [Foo];    ->  no such table: Foo
 //! SELECT * FROM `Foo`;    ->  no such table: Foo
@@ -43,8 +45,19 @@
 //! the statement wrote.** The parser recovers that spelling by span -- see
 //! `parser::written_name` -- rather than reading it back off the folded token,
 //! which is what `after_identifier` already had to do for a function call.
-//! That is the whole of the gap the roadmap called out: the message never had
-//! a case rule to get wrong, the *caller* did not have the spelling.
+//!
+//! The roadmap described the gap as an inconsistency in the *rule* -- an
+//! unknown function keeping the case a table name was folded away from. It is
+//! not a rule but a *caller*: the function name was read back off the source by
+//! span, and every other name was read off the folded token, so the same
+//! statement folded in one place and not the other. `msg` has nothing to decide
+//! here, because it never folds anything -- the disagreement was always
+//! upstream of [`Msg::render`], and `the_two_case_rules_cannot_be_confused` plus
+//! the `n*` rows below are the measurement of both directions. A column name is
+//! on the keeping side too (`SELECT BadCol` is `no such column: BadCol`), which
+//! is a second row the roadmap's framing did not anticipate; folding a column
+//! name was tried here and reverted precisely because the oracle does not do
+//! it.
 //!
 //! The second half of the rule is the one that looks like an exception and is
 //! not. A **constraint** message echoes the spelling the *schema* holds, which
@@ -125,6 +138,44 @@
 //! No message mixes the two sources. Every one of them is wholly query-sourced
 //! or wholly schema-sourced, which is what lets [`Msg::case_rule`] answer with
 //! a list of the same length for all of them.
+//!
+//! # Case is the whole rule, and quoting is a second axis of it
+//!
+//! The rule above is about one thing: whether a name keeps the case the
+//! statement wrote. There is a second question a caller can get wrong, and it
+//! is about *which characters* were written, not which case: the same name in
+//! double quotes is a different message from the same name bare. The oracle
+//! says so, and the two are the only place in the family where the quoting
+//! reaches the message:
+//!
+//! ```text
+//! SELECT "a+b";           ->  no such column: "a+b" - should this be a string
+//!                              literal in single-quotes?
+//! SELECT [a+b];           ->  no such column: a+b
+//! SELECT `a+b`;           ->  no such column: a+b
+//! SELECT t."a+b" FROM t;  ->  no such table: t
+//! ```
+//!
+//! So [`Msg::NoSuchColumnDoubleQuoted`] is a message about the quoting rather
+//! than about the name, and no amount of keeping the right case produces it.
+//! Three decisions follow, and each is one place rather than a rule spread over
+//! call sites:
+//!
+//! * the tokenizer marks a `"..."` as [`tokenizer::Token::DoubleQuotedIdentifier`]
+//!   rather than folding it into `Identifier`, because the quoting is gone by
+//!   the time a name fails to resolve and nothing downstream can recover it;
+//! * the parser reads a `"..."` wherever a name is read, and answers
+//!   `parser::double_quoted_names` for the names a statement wrote that way --
+//!   the two DDL shapes out of the text they store, every other shape out of
+//!   the range its expressions cover;
+//! * the connection collects that list before it runs anything, and the two
+//!   places that raise `no such column` -- `Connection::no_such_column_for` and
+//!   `aggcheck::name_error` -- ask it before falling back to the plain form.
+//!
+//! A qualified name is never the quoting's fault, which is the fourth row above
+//! and the one exception: `no such column: t.a` is the plain message whatever
+//! was written, because the qualifier already says where the name was looked
+//! for.
 //!
 //! # Nothing the engine chose is a name
 //!
@@ -513,6 +564,26 @@ pub enum Msg {
     UnsupportedYetIn,
 }
 
+/// The rule for every name hole in a message whose names all came out of the
+/// statement.
+///
+/// A message with two or three names lists one entry for each, so the group
+/// below shares this list rather than repeating it. `every_case_rule_entry_is_a_
+/// name_hole` is what keeps the shared list the right length: a count here is a
+/// count of *name holes*, not of messages in the group.
+///
+/// Each list below is shared by every message with that many names. Three
+/// arities occur, so three lists, and `every_case_rule_entry_is_a_name_hole`
+/// holds each of them to the length the render arms say it must be -- a list
+/// that is one entry too long would otherwise answer for a message it does not
+/// cover without anything noticing.
+const ONE_NAME_QUERY: &[CaseRule] = &[CaseRule::Query];
+const ONE_NAME_SCHEMA: &[CaseRule] = &[CaseRule::Schema];
+const TWO_NAMES_QUERY: &[CaseRule] = &[CaseRule::Query, CaseRule::Query];
+const THREE_NAMES_QUERY: &[CaseRule] = &[CaseRule::Query, CaseRule::Query, CaseRule::Query];
+const TWO_NAMES_SCHEMA: &[CaseRule] = &[CaseRule::Schema, CaseRule::Schema];
+const THREE_NAMES_SCHEMA: &[CaseRule] = &[CaseRule::Schema, CaseRule::Schema, CaseRule::Schema];
+
 impl Msg {
     /// The result code this message is raised under.
     pub const fn code(self) -> MsgCode {
@@ -578,7 +649,6 @@ impl Msg {
     /// reason, and `every_case_rule_entry_is_a_name_hole` keeps the list and
     /// the render arms agreeing about which is which.
     pub const fn case_rule(self) -> &'static [CaseRule] {
-        use CaseRule::{Query, Schema};
         match self {
             // Query-sourced: the name came out of the statement, spelled the
             // way the statement wrote it.
@@ -606,38 +676,32 @@ impl Msg {
             | Msg::TableNamedExists
             | Msg::IndexNamedExists
             | Msg::DuplicateColumnName
-            | Msg::NoSuchColumnForTable
+            // One name hole and two count holes, so one entry.
             | Msg::ColumnCountMismatch
             | Msg::SyntaxError
-            | Msg::UnrecognizedToken
-            | Msg::NoSuchTableSchemaQualified
+            | Msg::UnrecognizedToken => ONE_NAME_QUERY,
+            // Two names: a qualifier and the name it qualifies, or a schema and
+            // the table inside it.
+            Msg::NoSuchTableSchemaQualified
             | Msg::NoSuchColumnQualified
-            | Msg::NoSuchColumnSchemaQualified => &[
-                Query, Query, Query, Query, Query, Query, Query, Query, Query, Query, Query, Query,
-                Query, Query, Query, Query, Query, Query, Query, Query, Query, Query, Query, Query,
-                Query, Query, Query,
-            ],
+            | Msg::NoSuchColumnForTable => TWO_NAMES_QUERY,
+            // Schema, table, column.
+            Msg::NoSuchColumnSchemaQualified => THREE_NAMES_QUERY,
 
-            // Schema-sourced: the name came out of the schema, fixed when the
-            // table was created. A statement spelling it differently changes
-            // nothing. This is the block a uniform "always keep the case" rule
-            // gets wrong, and the one docs/testing.md 5.3 item 9 turns on.
-            //
-            // Three of the six take a single name and three take two, so the
-            // list holds nine entries: one each for `UniqueConstraintRowid`,
-            // `CheckConstraint` and `ForeignKeyMismatch`, and two each for
-            // `NotNullConstraint`, `UniqueConstraint` and `AmbiguousColumnStar`.
-            Msg::NotNullConstraint
-            | Msg::UniqueConstraint
-            | Msg::UniqueConstraintRowid
-            | Msg::CheckConstraint
-            | Msg::ForeignKeyMismatch
-            | Msg::AmbiguousColumnStar => &[
-                Schema, Schema, Schema, Schema, Schema, Schema, Schema, Schema, Schema,
-            ],
+            // One name: the constraint's own text, or the table of a duplicate
+            // rowid. A foreign key names two, and so is below.
+            Msg::UniqueConstraintRowid | Msg::CheckConstraint => ONE_NAME_SCHEMA,
+            // Two: the table a duplicate rowid belongs to is one, and a foreign
+            // key names the child and the parent.
+            Msg::ForeignKeyMismatch => TWO_NAMES_SCHEMA,
+            // Two names: a table and a column.
+            Msg::NotNullConstraint | Msg::UniqueConstraint => TWO_NAMES_SCHEMA,
+            // Three: a schema, a table and the column the star collided on.
+            Msg::AmbiguousColumnStar => THREE_NAMES_SCHEMA,
 
             // No names: a fixed phrase, nothing but counts, or a hole that is
-            // neither -- an operator, or the literal schema name `main`.
+            // neither -- an operator, the literal schema name `main`, or a
+            // count. None of them is a name, and so none appears above.
             Msg::ForeignKeyConstraint
             | Msg::DatatypeMismatch
             | Msg::AggregateNotAllowedInGroupBy
@@ -654,22 +718,6 @@ impl Msg {
             | Msg::UnsupportedYetIn => &[],
         }
     }
-
-    /// The messages with no holes, in the order the walk test quotes them.
-    ///
-    /// A message with a hole is deliberately not in this list: the walk test
-    /// asserts a fixed message against a literal, and a message with a hole has
-    /// no single wording to assert. The messages with holes are asserted
-    /// individually, one test per catalogue entry.
-    pub const FIXED: &'static [Msg] = &[
-        Msg::ForeignKeyConstraint,
-        Msg::DatatypeMismatch,
-        Msg::AggregateNotAllowedInGroupBy,
-        Msg::HavingOnNonAggregate,
-        Msg::IntegerOverflow,
-        Msg::TooManyCompoundTerms,
-        Msg::IncompleteInput,
-    ];
 
     /// Every message in the catalogue, holes and all.
     ///
@@ -720,6 +768,21 @@ impl Msg {
         Msg::UnrecognizedToken,
         Msg::UnsupportedYet,
         Msg::UnsupportedYetIn,
+    ];
+    /// The messages with no holes, in the order the walk test quotes them.
+    ///
+    /// A message with a hole is deliberately not in this list: the walk test
+    /// asserts a fixed message against a literal, and a message with a hole has
+    /// no single wording to assert. The messages with holes are asserted
+    /// individually, one test per catalogue entry.
+    pub const FIXED: &'static [Msg] = &[
+        Msg::ForeignKeyConstraint,
+        Msg::DatatypeMismatch,
+        Msg::AggregateNotAllowedInGroupBy,
+        Msg::HavingOnNonAggregate,
+        Msg::IntegerOverflow,
+        Msg::TooManyCompoundTerms,
+        Msg::IncompleteInput,
     ];
 
     /// Whether this message has a hole in it, and so takes arguments.
@@ -1071,8 +1134,33 @@ pub fn misuse_of_aliased_aggregate(alias: &str) -> Error {
 }
 
 /// A `near "TOKEN": syntax error` error, token as written.
+///
+/// A statement that simply ran out has no token to name, and SQLite says
+/// [`incomplete_input`] for that instead. Which of the two a stopped statement
+/// gets is a decision the caller makes by looking at what the cursor is on; see
+/// `parser::syntax_error_here`.
 pub fn syntax_error(token: &str) -> Error {
     Msg::SyntaxError.error(&[token.into()])
+}
+
+/// An `incomplete input` error: a statement that stopped before it was finished,
+/// with no token left to blame.
+///
+/// Measured against sqlite3 3.53.4, and the whole text -- SQLite's own comment
+/// on the format string in `parse.y` says so:
+///
+/// ```text
+/// SELECT * FROM;            ->  near ";": syntax error
+/// SELECT * FROM             ->  incomplete input
+/// SELECT 1 ORDER BY         ->  incomplete input
+/// SELECT CASE END;          ->  near ";": syntax error
+/// ```
+///
+/// So the two are not interchangeable, and a caller that reached this one has
+/// already decided the statement ran out rather than hit a token it could not
+/// use.
+pub fn incomplete_input() -> Error {
+    Msg::IncompleteInput.error(&[])
 }
 
 /// A `Nth ORDER BY term out of range` error.
@@ -1341,6 +1429,9 @@ mod tests {
         c(Msg::NoSuchColumnDoubleQuoted, vec![name("select")], "SELECT \"select\";", "no such column: \"select\" - should this be a string literal in single-quotes?"),
         c(Msg::NoSuchColumnDoubleQuoted, vec![name("a+b")], "CREATE TABLE t(a); SELECT 1 FROM t WHERE \"a+b\"=1;", "no such column: \"a+b\" - should this be a string literal in single-quotes?"),
         c(Msg::NoSuchColumnDoubleQuoted, vec![name("a+b")], "CREATE TABLE t(a); SELECT 1 FROM t ORDER BY \"a+b\";", "no such column: \"a+b\" - should this be a string literal in single-quotes?"),
+        c(Msg::NoSuchColumnDoubleQuoted, vec![name("NOSUCHCOL")], "SELECT \"NOSUCHCOL\";", "no such column: \"NOSUCHCOL\" - should this be a string literal in single-quotes?"),
+        c(Msg::NoSuchColumnDoubleQuoted, vec![name("a+b")], "CREATE TABLE t(a); SELECT 1 FROM t GROUP BY \"a+b\";", "no such column: \"a+b\" - should this be a string literal in single-quotes?"),
+        c(Msg::NoSuchColumnDoubleQuoted, vec![name("zz")], "SELECT 1 WHERE \"zz\"=1;", "no such column: \"zz\" - should this be a string literal in single-quotes?"),
         c(Msg::AmbiguousColumn, vec![name("x")], "CREATE TABLE p1(x); CREATE TABLE p2(x); SELECT x FROM p1, p2;", "ambiguous column name: x"),
         c(Msg::AmbiguousColumn, vec![name("X")], "CREATE TABLE p1(X); CREATE TABLE p2(X); SELECT X FROM p1, p2;", "ambiguous column name: X"),
         c(Msg::AmbiguousColumn, vec![name("A.f1")], "CREATE TABLE test1(f1); SELECT A.f1, f1 FROM test1 as A, test1 as A ORDER BY f2;", "ambiguous column name: A.f1"),
@@ -1444,6 +1535,15 @@ mod tests {
         c(Msg::IndexNamedExists, vec![name("i")], "CREATE TABLE t(a); CREATE INDEX i ON t(a); CREATE TABLE i(b);", "there is already an index named i"),
         c(Msg::DuplicateColumnName, vec![name("B")], "CREATE TABLE MiXeD(a,b,B);", "duplicate column name: B"),
         c(Msg::DuplicateColumnName, vec![name("XyZzY")], "CREATE TABLE t(XyZzY, XyZzY);", "duplicate column name: XyZzY"),
+        // The name compared is the schema's, so `A` and `a` are one name, and
+        // the name printed is the *later* of the two -- the one that collided,
+        // not the one already in the table. `CREATE TABLE t1(a,A)` says `A`
+        // and `CREATE TABLE t1(A,a)` says `a`, which is the only thing that
+        // tells the two apart.
+        c(Msg::DuplicateColumnName, vec![name("A")], "CREATE TABLE t1(a,A);", "duplicate column name: A"),
+        c(Msg::DuplicateColumnName, vec![name("a")], "CREATE TABLE t1(A,a);", "duplicate column name: a"),
+        c(Msg::DuplicateColumnName, vec![name("A")], "CREATE TABLE t1(\"a\",A);", "duplicate column name: A"),
+        c(Msg::DuplicateColumnName, vec![name("a")], "CREATE TABLE t1(a,b,a);", "duplicate column name: a"),
         // --- aggregates ------------------------------------------------------
         c(Msg::MisuseOfAggregate, vec![name("count")], "CREATE TABLE t(a); SELECT count(a) FROM t WHERE count(a);", "misuse of aggregate: count()"),
         c(Msg::MisuseOfAggregate, vec![name("COUNT")], "CREATE TABLE t(a); SELECT COUNT(a) FROM t WHERE COUNT(a);", "misuse of aggregate: COUNT()"),
@@ -1599,6 +1699,8 @@ mod tests {
                 n180 = 180, n181 = 181, n182 = 182,
                 n183 = 183, n184 = 184, n185 = 185, n186 = 186,
                 n187 = 187, n188 = 188, n189 = 189, n190 = 190,
+                n191 = 191, n192 = 192, n193 = 193, n194 = 194,
+                n195 = 195, n196 = 196, n197 = 197,
             }
         };
     }
@@ -1606,7 +1708,7 @@ mod tests {
     /// The number of rows [`build_cases`] builds, and the number of generated
     /// tests there are. They have to be equal: one test per row, each reaching
     /// its own row and no other.
-    const CASE_COUNT: usize = 191;
+    const CASE_COUNT: usize = 198;
 
     /// The case at `index`, or a panic that says the table and the index
     /// disagree.
@@ -1740,6 +1842,175 @@ mod tests {
                 "{msg:?} is quoted by the walk but is not in Msg::FIXED"
             );
             assert_eq!(msg.render(&[]), *text, "{msg:?} does not match {ORACLE}");
+        }
+    }
+
+    /// Every message in the catalogue, asserted against a literal.
+    ///
+    /// This is the test that makes a change to a message a visible failure
+    /// rather than a silent disagreement with the suite. It walks
+    /// [`Msg::ALL`] -- not [`Msg::FIXED`] -- and asserts each message twice:
+    ///
+    /// * against a literal that is its *fixed shape*: the message a caller gets
+    ///   from [`Msg::render`] with the holes filled by [`name`], [`count`] and
+    ///   [`value`]. Every message has one, and it is the whole sentence rather
+    ///   than one row of a table, so a wording change fails here whatever the
+    ///   holes are.
+    /// * against the oracle rows for that message, which are the same sentence
+    ///   seen on statements the real sqlite3 was run on.
+    ///
+    /// The first is the walk the module promises; the second is what the module
+    /// is *for*. Both are keyed on the enum, so a message added without a shape
+    /// or without a row fails the test that names it.
+    #[test]
+    fn every_message_says_what_sqlite3_says() {
+        for msg in Msg::ALL {
+            assert_eq!(
+                msg.render(&fixed_shape(*msg)),
+                shape_text(*msg),
+                "{msg:?} does not say what {ORACLE} says"
+            );
+            assert!(
+                cases().iter().any(|c| c.msg == *msg),
+                "{msg:?} is in Msg::ALL but no oracle row covers it"
+            );
+        }
+    }
+
+    /// The holes a message's fixed shape is filled with.
+    ///
+    /// One per hole, in argument order, so a message with three names gets
+    /// three names. The names are distinctive enough that a render arm taking
+    /// them in the wrong order is a visible difference rather than the same
+    /// word twice, and the counts are the smallest numbers that are not zero,
+    /// so a swapped count shows up too.
+    fn fixed_shape(msg: Msg) -> Vec<Arg> {
+        let one = || vec![name("Table")];
+        let two = || vec![name("Table"), name("Column")];
+        let three = || vec![name("Schema"), name("Table"), name("Column")];
+        match msg {
+            Msg::NoSuchTable
+            | Msg::NoSuchColumn
+            | Msg::NoSuchColumnDoubleQuoted
+            | Msg::AmbiguousColumn
+            | Msg::NoSuchFunction
+            | Msg::NoSuchCollation
+            | Msg::NoSuchIndex
+            | Msg::WrongArgumentCount
+            | Msg::MisuseOfAggregate
+            | Msg::MisuseOfAggregateFunction
+            | Msg::MisuseOfAliasedAggregate
+            | Msg::TableExists
+            | Msg::IndexExists
+            | Msg::TableNamedExists
+            | Msg::IndexNamedExists
+            | Msg::DuplicateColumnName
+            | Msg::SyntaxError
+            | Msg::UnrecognizedToken
+            | Msg::UniqueConstraintRowid
+            | Msg::CheckConstraint => one(),
+            Msg::NoSuchTableSchemaQualified
+            | Msg::NoSuchColumnQualified
+            | Msg::NoSuchColumnForTable
+            | Msg::NotNullConstraint
+            | Msg::UniqueConstraint
+            | Msg::ForeignKeyMismatch => two(),
+            Msg::NoSuchColumnSchemaQualified | Msg::AmbiguousColumnStar => three(),
+            Msg::ColumnCountMismatch => vec![name("Table"), count(2), count(3)],
+            Msg::ValuesForColumnsCount => vec![count(2), count(3)],
+            Msg::OrderByTermOutOfRange | Msg::GroupByTermOutOfRange => vec![count(1), count(2)],
+            Msg::SubSelectColumnCount => vec![count(2)],
+            Msg::CompoundColumnCount => vec![name("UNION")],
+            Msg::UnsupportedYet => vec![name("Widget")],
+            Msg::UnsupportedYetIn => vec![name("Reason"), name("Widget")],
+            Msg::ForeignKeyConstraint
+            | Msg::DatatypeMismatch
+            | Msg::AggregateNotAllowedInGroupBy
+            | Msg::HavingOnNonAggregate
+            | Msg::IntegerOverflow
+            | Msg::TooManyCompoundTerms
+            | Msg::IncompleteInput => Vec::new(),
+        }
+    }
+
+    /// What [`fixed_shape`] renders to, written out in full.
+    ///
+    /// The literal the walk above asserts against. It is written here rather
+    /// than derived from the render arms, so a change to [`Msg::render`] and a
+    /// change to this list are two changes and the one that is wrong fails.
+    fn shape_text(msg: Msg) -> String {
+        match msg {
+            Msg::NoSuchTable => "no such table: Table".to_string(),
+            Msg::NoSuchTableSchemaQualified => "no such table: Table.Column".to_string(),
+            Msg::NoSuchColumn => "no such column: Table".to_string(),
+            Msg::NoSuchColumnQualified => "no such column: Table.Column".to_string(),
+            Msg::NoSuchColumnSchemaQualified => {
+                "no such column: Schema.Table.Column".to_string()
+            }
+            Msg::NoSuchColumnDoubleQuoted => {
+                "no such column: \"Table\" - should this be a string literal in single-quotes?"
+                    .to_string()
+            }
+            Msg::AmbiguousColumn => "ambiguous column name: Table".to_string(),
+            Msg::AmbiguousColumnStar => {
+                "ambiguous column name: Schema.Table.Column".to_string()
+            }
+            Msg::NoSuchFunction => "no such function: Table".to_string(),
+            Msg::NoSuchCollation => "no such collation sequence: Table".to_string(),
+            Msg::NoSuchIndex => "no such index: Table".to_string(),
+            Msg::WrongArgumentCount => {
+                "wrong number of arguments to function Table()".to_string()
+            }
+            Msg::NotNullConstraint => "NOT NULL constraint failed: Table.Column".to_string(),
+            Msg::UniqueConstraint => "UNIQUE constraint failed: Table.Column".to_string(),
+            Msg::UniqueConstraintRowid => "UNIQUE constraint failed: Table.rowid".to_string(),
+            Msg::CheckConstraint => "CHECK constraint failed: Table".to_string(),
+            Msg::ForeignKeyConstraint => "FOREIGN KEY constraint failed".to_string(),
+            Msg::ForeignKeyMismatch => {
+                "foreign key mismatch - \"Table\" referencing \"Column\"".to_string()
+            }
+            Msg::DatatypeMismatch => "datatype mismatch".to_string(),
+            Msg::NoSuchColumnForTable => {
+                "table Table has no column named Column".to_string()
+            }
+            Msg::ColumnCountMismatch => {
+                "table Table has 2 columns but 3 values were supplied".to_string()
+            }
+            Msg::ValuesForColumnsCount => "2 values for 3 columns".to_string(),
+            Msg::TableExists => "table Table already exists".to_string(),
+            Msg::IndexExists => "index Table already exists".to_string(),
+            Msg::TableNamedExists => "there is already a table named Table".to_string(),
+            Msg::IndexNamedExists => "there is already an index named Table".to_string(),
+            Msg::DuplicateColumnName => "duplicate column name: Table".to_string(),
+            Msg::MisuseOfAggregate => "misuse of aggregate: Table()".to_string(),
+            Msg::MisuseOfAggregateFunction => {
+                "misuse of aggregate function Table()".to_string()
+            }
+            Msg::MisuseOfAliasedAggregate => "misuse of aliased aggregate Table".to_string(),
+            Msg::AggregateNotAllowedInGroupBy => {
+                "aggregate functions are not allowed in the GROUP BY clause".to_string()
+            }
+            Msg::HavingOnNonAggregate => {
+                "HAVING clause on a non-aggregate query".to_string()
+            }
+            Msg::IntegerOverflow => "integer overflow".to_string(),
+            Msg::OrderByTermOutOfRange => {
+                "1st ORDER BY term out of range - should be between 1 and 2".to_string()
+            }
+            Msg::GroupByTermOutOfRange => {
+                "1st GROUP BY term out of range - should be between 1 and 2".to_string()
+            }
+            Msg::SubSelectColumnCount => "sub-select returns 2 columns - expected 1".to_string(),
+            Msg::CompoundColumnCount => {
+                "SELECTs to the left and right of UNION do not have the same number of result columns"
+                    .to_string()
+            }
+            Msg::TooManyCompoundTerms => "too many terms in compound SELECT".to_string(),
+            Msg::SyntaxError => "near \"Table\": syntax error".to_string(),
+            Msg::IncompleteInput => "incomplete input".to_string(),
+            Msg::UnrecognizedToken => "unrecognized token: \"Table\"".to_string(),
+            Msg::UnsupportedYet => "Widget is not supported yet".to_string(),
+            Msg::UnsupportedYetIn => "Reason: Widget is not supported yet".to_string(),
         }
     }
 
@@ -2089,6 +2360,140 @@ mod tests {
             not_null_constraint("tbl", "bb").message,
             "NOT NULL constraint failed: tbl.bb"
         );
+    }
+
+    /// Every query-sourced name is the spelling the statement wrote, and the
+    /// engine reaches the message with that spelling rather than the token's.
+    ///
+    /// The rule is one sentence because the oracle makes it one sentence, and
+    /// this is the pair of families the roadmap held up as the inconsistency:
+    /// `no such function: XYZZY` keeps the case and `no such table: XYZZY`
+    /// keeps it too. What differed was not the rule but the *caller* -- the
+    /// function name was read back off the source by span (`parser::
+    /// written_name`) while every other name was read off the folded token, so
+    /// the same statement folded in one place and not the other.
+    ///
+    /// Both directions are quoted, because a rule that only ever kept the case
+    /// would pass the first half and be wrong about a name that is already
+    /// lower case.
+    #[test]
+    fn a_query_sourced_name_is_the_spelling_the_statement_wrote() {
+        use crate::msg::CaseRule::Query;
+
+        // What sqlite3 says, for these spellings. Every one was run against
+        // 3.53.4; the transcript is the table above and the case rows in it.
+        for written in ["XYZZY", "XyZzY", "MiXeD", "FOO", "t", "A"] {
+            let spelled = format!("no such table: {written}");
+            assert_eq!(
+                Msg::NoSuchTable.render(&[written.into()]),
+                spelled,
+                "a table name is the spelling the statement wrote"
+            );
+            assert_eq!(
+                Msg::NoSuchFunction.render(&[written.into()]),
+                format!("no such function: {written}"),
+                "a function name is the spelling the statement wrote, not a folded one"
+            );
+            assert_eq!(
+                Msg::NoSuchColumn.render(&[written.into()]),
+                format!("no such column: {written}"),
+                "a column name is the spelling the statement wrote"
+            );
+            assert_eq!(
+                Msg::WrongArgumentCount.render(&[written.into()]),
+                format!("wrong number of arguments to function {written}()"),
+                "an arity error echoes the function's own spelling"
+            );
+        }
+        // And a name that is already folded comes back folded, which is what
+        // makes the rule a spelling rule rather than a "never fold" one.
+        assert_eq!(no_such_table("foo").message, "no such table: foo");
+        assert_eq!(no_such_function("foo").message, "no such function: foo");
+
+        // The two families agree about where the name came from, so a caller
+        // cannot pick one and get the other's rule.
+        for msg in [Msg::NoSuchTable, Msg::NoSuchFunction, Msg::NoSuchColumn] {
+            assert!(
+                !msg.case_rule().is_empty() && msg.case_rule().iter().all(|r| *r == Query),
+                "{msg:?} is query-sourced, so it keeps the statement's spelling"
+            );
+        }
+    }
+
+    /// `Msg::case_rule` has exactly one entry per **name** hole.
+    ///
+    /// The list is documented as one entry per name, and a list of the wrong
+    /// length is a claim about the message that nothing else checks: the
+    /// render arms are tested against the oracle, and this function is tested
+    /// against its own documentation. So the two are compared directly, and
+    /// the messages whose holes are *not* names are named here -- the compound
+    /// operator, the two ordinals, and the literal `main` a schema-qualified
+    /// `no such column` carries. Those three are the ones a count-by-eye gets
+    /// wrong, and they are the ones this test exists for.
+    #[test]
+    fn every_case_rule_entry_is_a_name_hole() {
+        // The name holes, and only those, per the render arms. A hole is a name
+        // when the render arm matches `Arg::Name` for it.
+        fn name_holes(msg: Msg) -> usize {
+            match msg {
+                Msg::NoSuchTable
+                | Msg::NoSuchColumn
+                | Msg::NoSuchColumnDoubleQuoted
+                | Msg::AmbiguousColumn
+                | Msg::NoSuchFunction
+                | Msg::NoSuchCollation
+                | Msg::NoSuchIndex
+                | Msg::WrongArgumentCount
+                | Msg::MisuseOfAggregate
+                | Msg::MisuseOfAggregateFunction
+                | Msg::MisuseOfAliasedAggregate
+                | Msg::TableExists
+                | Msg::IndexExists
+                | Msg::TableNamedExists
+                | Msg::IndexNamedExists
+                | Msg::DuplicateColumnName => 1,
+                Msg::NoSuchTableSchemaQualified
+                | Msg::NoSuchColumnQualified
+                | Msg::NoSuchColumnForTable => 2,
+                Msg::NoSuchColumnSchemaQualified | Msg::AmbiguousColumnStar => 3,
+                Msg::ColumnCountMismatch => 1,
+                // One hole, and it is the table; the other two are counts.
+                Msg::CheckConstraint | Msg::UniqueConstraintRowid => 1,
+                // The token a parse stopped on. It is a name the message
+                // echoes as written, so it gets a rule, but it is not a hole
+                // the grammar asked for a name -- `render` supplies the quotes
+                // itself. The distinction the two `*_SCHEMA` lists above lean
+                // on is the same one.
+                Msg::SyntaxError | Msg::UnrecognizedToken => 1,
+                Msg::NotNullConstraint | Msg::UniqueConstraint | Msg::ForeignKeyMismatch => 2,
+                // No name hole at all.
+                _ => 0,
+            }
+        }
+        for msg in Msg::ALL {
+            assert_eq!(
+                msg.case_rule().len(),
+                name_holes(*msg),
+                "{msg:?} has {} rule entries but {msg:?} has {} name holes",
+                msg.case_rule().len(),
+                name_holes(*msg)
+            );
+        }
+        // The three that a count by eye gets wrong, called out so the reason
+        // they are empty is on the record next to the assertion that they are.
+        for msg in [
+            Msg::CompoundColumnCount,
+            Msg::OrderByTermOutOfRange,
+            Msg::GroupByTermOutOfRange,
+        ] {
+            assert!(
+                msg.case_rule().is_empty(),
+                "{msg:?} has a hole, but it is an operator or a count rather than                  a name, and a name is what the list is about"
+            );
+        }
+        // And a message with a name hole and a count hole is listed for the
+        // name alone, which is the case a whole-message count would get wrong.
+        assert_eq!(Msg::ColumnCountMismatch.case_rule().len(), 1);
     }
 
     /// Building a message with the wrong number of parts is a mistake in the

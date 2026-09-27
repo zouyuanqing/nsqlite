@@ -440,30 +440,30 @@ fn clauses_are_checked_in_sqlites_order() {
     );
 }
 
-/// A name written in mixed case is reported as the tokenizer hands it over.
+/// A name written in mixed case is reported as it was written.
 ///
-/// sqlite3 echoes the case as it was *written* -- `SELECT BadCol FROM t` is
-/// `no such column: BadCol` -- and this engine's tokenizer folds an unquoted
-/// identifier to lower case before anything sees it, so it answers
-/// `no such column: badcol`. The divergence is in the tokenizer, which is not
-/// this module's file, so it is asserted here rather than fixed here: what
-/// matters for this track is that the error is *raised*, and it is. The
-/// expectation is the engine's own behaviour, not the oracle's, and the comment
-/// says so.
+/// sqlite3 echoes the case as the statement spelled it -- `SELECT BadCol FROM
+/// t` is `no such column: BadCol`, and the qualified form keeps the case of
+/// both halves -- so the engine does the same. Getting there is the parser's
+/// job: the tokenizer still folds an unquoted identifier to lower case, and the
+/// spelling is recovered from the statement's own text by span, which is what
+/// keeps the two from drifting apart. An earlier version of this test asserted
+/// the *folded* form and said so in its own name; the fold was wrong, and both
+/// the expectation and the comment now follow the oracle.
 #[test]
-fn a_mixed_case_name_is_reported_as_the_tokenizer_folds_it() {
+fn a_mixed_case_name_is_reported_as_it_was_written() {
     let Some(mut c) = fixture("case") else {
         return;
     };
     // oracle: no such column: BadCol
     assert_eq!(
         run(&mut c, "SELECT BadCol FROM t;"),
-        Err("no such column: badcol".into())
+        Err("no such column: BadCol".into())
     );
     // oracle: no such column: t.BadCol
     assert_eq!(
         run(&mut c, "SELECT t.BadCol FROM t;"),
-        Err("no such column: t.badcol".into())
+        Err("no such column: t.BadCol".into())
     );
 }
 

@@ -374,6 +374,262 @@ pub enum Stmt {
     Explain(Box<crate::explain::Explain>),
 }
 
+impl Stmt {
+    /// The double-quoted names this statement wrote, with the quotes removed.
+    ///
+    /// `text` is the text the statement was parsed from, which is what the
+    /// span a statement records points into. The two shapes that keep their own
+    /// copy of it answer from that instead, so a caller that has the text and
+    /// a caller that does not both get the right answer.
+    ///
+    /// A statement with neither -- a hand-built [`Stmt`], or one of the shapes
+    /// that does not record a span -- reports an empty list, which is the safe
+    /// answer: the plain `no such column: x` is right whenever no name was
+    /// written in double quotes.
+    pub fn double_quoted_names(&self, text: &str) -> Vec<String> {
+        crate::parser::double_quoted_names(&self.statement_text(text))
+    }
+
+    /// The statement's own text, out of `text`.
+    ///
+    /// `text` is what the statement was parsed from. Only a statement that has
+    /// been through the grammar can answer, because only the grammar knows
+    /// where a statement began and ended.
+    ///
+    /// A statement that cannot answer produces an empty string rather than a
+    /// panic, because the answer is only ever a refinement of a message the
+    /// caller is about to raise anyway, and a hand-built [`Stmt`] is the one
+    /// case where a range would be a guess. The two DDL shapes answer from the
+    /// text they carry, so they are right whether or not `text` is.
+    pub fn statement_text(&self, text: &str) -> String {
+        let sql = match self {
+            Stmt::CreateTable { sql, .. } | Stmt::CreateIndex { sql, .. } => sql.as_str(),
+            Stmt::Select(s) => {
+                let span = select_span(s);
+                text.get(span.start..span.end).unwrap_or("")
+            }
+            Stmt::Insert { source, .. } => match source {
+                InsertSource::Select(inner) => {
+                    let span = select_span(inner);
+                    text.get(span.start..span.end).unwrap_or("")
+                }
+                // A VALUES list has no names of its own; its expressions do, and
+                // they are read off the same tokens either way.
+                InsertSource::Values(_) => "",
+            },
+            Stmt::Update { where_, .. } | Stmt::Delete { where_, .. } => match where_ {
+                Some(w) => {
+                    let mut span: Option<Span> = None;
+                    expr_spans(w, &mut |s| {
+                        span = Some(match span {
+                            Some(cur) => Span {
+                                start: cur.start.min(s.start),
+                                end: cur.end.max(s.end),
+                                line: cur.line,
+                                col: cur.col,
+                            },
+                            None => s,
+                        });
+                    });
+                    match span {
+                        Some(s) => text.get(s.start..s.end).unwrap_or(""),
+                        None => "",
+                    }
+                }
+                None => "",
+            },
+            Stmt::DropTable { name, .. } => {
+                // The name is a token's text, and the quoting it was written
+                // with is gone by the time the statement exists.
+                let _ = name;
+                ""
+            }
+            Stmt::Unsupported(_)
+            | Stmt::Pragma(_)
+            | Stmt::Begin
+            | Stmt::Commit
+            | Stmt::Rollback
+            | Stmt::Analyze
+            | Stmt::Explain(_) => "",
+        };
+        sql.to_string()
+    }
+}
+
+/// The range a SELECT occupies in the text it was parsed from.
+///
+/// The smallest range that holds every expression in the statement, which is
+/// the first token of its first arm through the last token of its last. A name
+/// is inside the range exactly when it was written inside the statement, which
+/// is the only question the caller asks of it, and a range wider than the
+/// statement could only pick up a name from a *different* statement.
+fn select_span(sel: &Select) -> Span {
+    let mut span = None::<Span>;
+    let mut widen = |s: Span| {
+        span = Some(match span {
+            Some(cur) => Span {
+                start: cur.start.min(s.start),
+                end: cur.end.max(s.end),
+                line: cur.line,
+                col: cur.col,
+            },
+            None => s,
+        });
+    };
+    select_body_spans(&sel.body, &mut widen);
+    for (e, _) in &sel.order_by {
+        expr_spans(e, &mut widen);
+    }
+    if let Some(l) = &sel.limit {
+        expr_spans(l, &mut widen);
+    }
+    if let Some(o) = &sel.offset {
+        expr_spans(o, &mut widen);
+    }
+    span.unwrap_or(Span {
+        start: 0,
+        end: 0,
+        line: 1,
+        col: 1,
+    })
+}
+
+/// Every expression span a SELECT body holds.
+fn select_body_spans(body: &SelectBody, visit: &mut impl FnMut(Span)) {
+    match body {
+        SelectBody::Simple {
+            columns,
+            from,
+            where_,
+            group_by,
+            having,
+            values,
+            ..
+        } => {
+            for c in columns {
+                expr_spans(&c.expr, visit);
+            }
+            for f in from {
+                from_item_spans(f, visit);
+            }
+            if let Some(w) = where_ {
+                expr_spans(w, visit);
+            }
+            for g in group_by {
+                expr_spans(g, visit);
+            }
+            if let Some(h) = having {
+                expr_spans(h, visit);
+            }
+            if let Some(rows) = values {
+                for row in rows {
+                    for v in row {
+                        expr_spans(v, visit);
+                    }
+                }
+            }
+        }
+        SelectBody::Compound { left, right, .. } => {
+            select_body_spans(left, visit);
+            select_body_spans(right, visit);
+        }
+        SelectBody::Nested(inner) => select_body_spans(&inner.body, visit),
+    }
+}
+
+/// Every expression span a FROM item holds.
+///
+/// A named table has none of its own: its name is a string, not a reference
+/// with a span, and by the time a name is resolved the quoting it was written
+/// with is gone.
+fn from_item_spans(item: &FromItem, visit: &mut impl FnMut(Span)) {
+    match item {
+        FromItem::Table(t) => {
+            if let Some(on) = &t.on {
+                expr_spans(on, visit);
+            }
+        }
+        FromItem::Subquery { select, .. } => {
+            let span = select_span(select);
+            visit(span);
+        }
+    }
+}
+
+/// Every expression span an expression holds, deepest child first.
+///
+/// A `Column` is the only node that records its own span -- every other node's
+/// span is a range between its operands' -- so the walk stops wherever it finds
+/// one. A node with no operands at all contributes nothing, which is why a
+/// `CASE` and a literal are not walked: neither can hold a name.
+fn expr_spans(e: &Expr, visit: &mut impl FnMut(Span)) {
+    match e {
+        Expr::Column { span, .. } | Expr::NamedParameter(_, span) => visit(*span),
+        Expr::Literal(_) => {}
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            expr_spans(expr, visit);
+        }
+        Expr::Collate { expr, .. } => expr_spans(expr, visit),
+        Expr::Binary { left, right, .. } => {
+            expr_spans(left, visit);
+            expr_spans(right, visit);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_spans(expr, visit);
+            expr_spans(pattern, visit);
+            if let Some(x) = escape {
+                expr_spans(x, visit);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_spans(expr, visit);
+            expr_spans(low, visit);
+            expr_spans(high, visit);
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_spans(expr, visit);
+            for i in list {
+                expr_spans(i, visit);
+            }
+        }
+        Expr::InSelect { expr, select, .. } => {
+            expr_spans(expr, visit);
+            select_body_spans(&select.body, visit);
+        }
+        Expr::Exists { select, .. } | Expr::Subquery { select } => {
+            select_body_spans(&select.body, visit);
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                expr_spans(a, visit);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => {
+            if let Some(o) = operand {
+                expr_spans(o, visit);
+            }
+            for (w, t) in whens {
+                expr_spans(w, visit);
+                expr_spans(t, visit);
+            }
+            if let Some(o) = otherwise {
+                expr_spans(o, visit);
+            }
+        }
+    }
+}
+
 /// Where an INSERT takes its rows from.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InsertSource {
@@ -386,9 +642,9 @@ pub fn parse_script(sql: &str) -> Result<Vec<Stmt>> {
     let mut p = Parser::new(sql)?;
     let mut out = Vec::new();
     while p.peek_token()?.is_some() {
-        let before = p.pos;
+        let before = p.index;
         out.push(p.statement()?);
-        if p.pos == before {
+        if p.index == before {
             // A statement that consumed nothing would spin the loop for ever.
             return Err(msg::syntax_error(&p.text_at(p.span())));
         }
@@ -416,6 +672,40 @@ pub fn parse_one(sql: &str) -> Result<Stmt> {
     }
 }
 
+/// The double-quoted names in `sql`, with the quotes already removed.
+///
+/// A `"..."` that resolves to nothing is a mistake about quoting, not about
+/// the name, and SQLite says so: `no such column: "a+b" - should this be a
+/// string literal in single-quotes?`. The name is resolved long after the
+/// quoting is gone, so the names are collected here, where the tokens are
+/// still what the statement wrote, and the result is a plain [`String`]s
+/// vector a caller can match a failed name against without a borrow of a
+/// [`Parser`].
+///
+/// A name written twice is collected twice, and a name inside a string
+/// literal is not in the list at all: only the tokenizer's
+/// [`Token::DoubleQuotedIdentifier`] counts, which is the same decision the
+/// token itself made.
+///
+/// The tokens are not scanned beyond the last statement's terminator, so
+/// text that is not a statement -- a comment tail, or a second script pasted
+/// after the one being run -- is not searched.
+pub fn double_quoted_names(sql: &str) -> Vec<String> {
+    let Ok(mut p) = Parser::new(sql) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    while let Ok(Some(token)) = p.peek_token() {
+        if let Token::DoubleQuotedIdentifier(name) = token {
+            out.push(name.clone());
+        }
+        if p.advance().is_none() {
+            break;
+        }
+    }
+    out
+}
+
 thread_local! {
     static TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ADVANCE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -438,7 +728,13 @@ impl Drop for DepthGuard<'_> {
 /// A token with its position, plus the parser state that walks them.
 struct Parser<'a> {
     tokens: Vec<(Token, Span)>,
-    pos: usize,
+    /// The cursor: the index of the token `peek` would hand back.
+    ///
+    /// Every place that needs a token by position goes through it -- `peek`, the
+    /// `describe` helpers, `lookup_name` -- rather than reading the field
+    /// directly, so that a site cannot be right about the token at hand and
+    /// wrong about the cursor that names it.
+    index: usize,
     depth: usize,
     sql: &'a str,
     _marker: std::marker::PhantomData<&'a ()>,
@@ -449,15 +745,21 @@ impl<'a> Parser<'a> {
         let tokens = Tokenizer::tokenize_all(sql)?;
         Ok(Parser {
             tokens,
-            pos: 0,
+            index: 0,
             depth: 0,
             sql,
             _marker: std::marker::PhantomData,
         })
     }
 
+    /// The token under the cursor, without moving it.
     fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.pos).map(|(t, _)| t)
+        self.tokens.get(self.index).map(|(t, _)| t)
+    }
+
+    /// The token `ahead` places past the cursor, without moving it.
+    fn peek_at(&self, ahead: usize) -> Option<&Token> {
+        self.tokens.get(self.index + ahead).map(|(t, _)| t)
     }
 
     fn peek_token(&self) -> Result<Option<&Token>> {
@@ -466,7 +768,7 @@ impl<'a> Parser<'a> {
 
     fn span(&self) -> Span {
         self.tokens
-            .get(self.pos)
+            .get(self.index)
             .map(|(_, s)| *s)
             .or_else(|| self.tokens.last().map(|(_, s)| *s))
             .unwrap_or(Span {
@@ -477,15 +779,79 @@ impl<'a> Parser<'a> {
             })
     }
 
+    /// The offset a statement's own text starts at.
+    ///
+    /// A statement's text -- the one `CREATE TABLE` stores in `sqlite_schema` --
+    /// begins at its first token, and by the time the grammar has read a
+    /// `CREATE TEMP TABLE` the cursor is two tokens past it, so the span of the
+    /// token at the cursor is not where the text starts. A caller that wants
+    /// the text asks here.
+    ///
+    /// The search is for the `;` that ended the statement before this one,
+    /// because the script loop consumes a terminator itself and hands the
+    /// parser the token after it: the statement's first token is the one whose
+    /// span begins where that `;` ends. A script that opens on whitespace or a
+    /// comment has its first token at or after offset 0, and a script with no
+    /// terminator at all before this statement -- which `parse_script` will not
+    /// produce, because it requires one -- falls back to the cursor's own
+    /// token.
+    fn statement_start_offset(&self) -> usize {
+        let Some((_, span)) = self.tokens.get(self.index) else {
+            return 0;
+        };
+        if let Some(prev) = self
+            .tokens
+            .iter()
+            .rposition(|(_, s)| s.end > 0 && s.end <= span.start)
+        {
+            let after = self.tokens[prev].1.end;
+            if matches!(self.tokens[prev].0, Token::Punct(Punct::Semicolon)) {
+                // The token after the `;` starts the statement. It is the one
+                // in hand, unless the cursor has already moved past it, in
+                // which case the next one after it does.
+                let first = self
+                    .tokens
+                    .iter()
+                    .position(|(_, s)| s.start >= after)
+                    .unwrap_or(self.tokens.len());
+                if first <= self.index {
+                    return self.tokens[first].1.start;
+                }
+            }
+        }
+        // A statement that opens the text has no `;` before it, and its own
+        // first token is the only one that can begin it. A statement that is
+        // neither is not one `parse_script` produces, and falls back to the
+        // cursor's token.
+        match self.tokens.first() {
+            Some((_, s)) if s.start == 0 => 0,
+            _ => span.start,
+        }
+    }
+
     fn advance(&mut self) -> Option<Token> {
-        let t = self.tokens.get(self.pos).map(|(t, _)| t.clone());
+        let t = self.tokens.get(self.index).map(|(t, _)| t.clone());
         if t.is_some() {
-            self.pos += 1;
+            self.index += 1;
         }
         t
     }
 
     fn at_keyword(&self, kw: Keyword) -> bool {
+        matches!(self.peek(), Some(Token::Keyword(k)) if *k == kw)
+    }
+
+    /// Whether the cursor is on the *word* `kw`, spelled that way and not
+    /// quoted.
+    ///
+    /// A quoted name that happens to spell a keyword is a name and not the
+    /// keyword: `SELECT CASE "WHEN";` is `near ";": syntax error` because
+    /// sqlite3 read `"WHEN"` as the CASE operand and then wanted a `WHEN` arm
+    /// it did not find, while an unquoted `WHEN` would have ended the operand.
+    /// The two spellings therefore have to be told apart, and a quoted
+    /// identifier is an [`Token::Identifier`] even when the tokenizer could
+    /// have read it as the keyword.
+    fn spells_keyword_ahead(&self, kw: Keyword) -> bool {
         matches!(self.peek(), Some(Token::Keyword(k)) if *k == kw)
     }
 
@@ -528,12 +894,70 @@ impl<'a> Parser<'a> {
     }
 
     /// SQLite's wording for a token it cannot use here.
-    fn unexpected(&self, context: &str) -> Error {
-        let found = self.describe_token_here();
-        Error::new(
-            crate::error::ResultCode::Error,
-            format!("near \"{found}\": syntax error while {context}"),
-        )
+    ///
+    /// `context` is this engine's own note about which clause wanted the token
+    /// and is deliberately not part of the message. sqlite3 has no
+    /// `while <clause>` wording at all -- the format string it owns is
+    /// `near "%T": syntax error` and nothing longer -- so the clause used to be
+    /// appended here, which made every one of these a message the catalogue did
+    /// not have. The clause names are still worth having at the call sites,
+    /// where they say what the parser was doing, so the argument stays and is
+    /// simply not read here.
+    ///
+    /// The `;` is the one exception the general rule makes, and it is made here
+    /// rather than in [`syntax_error_here`] because the two spellings differ:
+    /// SQLite's own comment on `near "%T": syntax error` says a stopped
+    /// statement is `incomplete input` whatever the clause, so
+    /// `SELECT * FROM` is `incomplete input` and not the `near "FROM": syntax
+    /// error` the cursor alone would give. `SELECT * FROM;` is the other way
+    /// round -- `near ";": syntax error` -- because the terminator is a token
+    /// the parser could not use rather than an absence.
+    fn unexpected(&self, _context: &str) -> Error {
+        match self.peek() {
+            None => msg::incomplete_input(),
+            _ => self.syntax_error_here(),
+        }
+    }
+
+    /// `near "TOKEN": syntax error` for whatever the cursor is on, and
+    /// `incomplete input` for a statement that ran out.
+    ///
+    /// The two are one decision, and it is SQLite's rather than this engine's.
+    /// A statement with nothing left is `incomplete input`; a statement with a
+    /// *further* token in it is `near "that token": syntax error`. Which is
+    /// which is not a question about the clause, and measuring it says the
+    /// clause is not consulted at all:
+    ///
+    /// ```text
+    /// SELECT 1 *          ->  incomplete input
+    /// SELECT 1 .          ->  near ".": syntax error
+    /// SELECT * FROM t t2 t3;
+    ///                     ->  near "t3": syntax error
+    /// SELECT * FROM;      ->  near ";": syntax error
+    /// SELECT * FROM       ->  incomplete input
+    /// SELECT a FROM       ->  incomplete input
+    /// ```
+    ///
+    /// A trailing `*` and a trailing `,` are both `incomplete input` while a
+    /// trailing `.` is a named syntax error, so the answer is not "the token is
+    /// punctuation" either. What separates them is where the *cursor* sits when
+    /// the parser gives up: a `*` or a `,` has already been consumed as part of
+    /// the grammar and its operand is what is missing, so the cursor is at the
+    /// end of the input, while a `.` is a token the parser cannot start an
+    /// operand with and names outright. The `;` is the one token that is
+    /// genuinely there and genuinely unusable, and it is the one that decided
+    /// `SELECT * FROM;` is `near ";"` where the same words without it are
+    /// `incomplete input`.
+    fn syntax_error_here(&self) -> Error {
+        match self.peek() {
+            // Past the end, or stopped on the terminator. Both are a statement
+            // that ran out, and `SELECT * FROM;` is the one case where the
+            // terminator itself is named: see `describe_token_here` on why a
+            // `;` is the exception the general rule makes.
+            None => msg::incomplete_input(),
+            Some(Token::Punct(Punct::Semicolon)) => msg::syntax_error(&self.describe_token_here()),
+            _ => msg::syntax_error(&self.describe_token_here()),
+        }
     }
 
     /// What sqlite3 would name as the token it choked on at the current
@@ -544,15 +968,23 @@ impl<'a> Parser<'a> {
     /// wrote rather than the token's folded form. `describe_token` on its own
     /// cannot: it is given a `Token`, and by the time a name is a `Token` the
     /// tokenizer has already folded it -- so `SELECT FROM t` came out
-    /// `near "from"` where sqlite3 says `near "FROM"`. `unexpected` is only
-    /// this engine's own "while <clause>" wording rather than sqlite3's bare
-    /// `near "X": syntax error`, so it stays inline; the catalogue gets the
-    /// sites whose text does match.
+    /// `near "from"` where sqlite3 says `near "FROM"`.
+    ///
+    /// Punctuation is the one kind the token cannot answer for either, because
+    /// the spelling is the punctuation: sqlite3 names `near ";"`, not
+    /// `near "punctuation"`, and the span is where the character was written.
     fn describe_token_here(&self) -> String {
         match self.peek() {
-            Some(Token::Identifier(_)) | Some(Token::Keyword(_)) => {
-                self.written_name(self.pos).unwrap_or_else(|| "end of input".to_string())
-            }
+            Some(Token::Identifier(_))
+            | Some(Token::DoubleQuotedIdentifier(_))
+            | Some(Token::Keyword(_)) => self
+                .written_name(self.index)
+                .unwrap_or_else(|| "end of input".to_string()),
+            Some(Token::Punct(_)) => self
+                .tokens
+                .get(self.index)
+                .map(|(_, span)| self.text_at(*span))
+                .unwrap_or_default(),
             other => other.map_or_else(|| "end of input".to_string(), describe_token),
         }
     }
@@ -564,12 +996,32 @@ impl<'a> Parser<'a> {
     /// `AS 'f1'` is how the suite spells an alias whose text is a keyword, and
     /// rejecting it as a string literal in that position would refuse a
     /// statement sqlite3 accepts.
+    /// The index of the first token in a run of them, which for a statement
+    /// that begins `CREATE` is the `CREATE` itself.
+    ///
+    /// The grammar reaches `CREATE TEMP TABLE` with the cursor two tokens past
+    /// its `CREATE`, so a fixed step back is right for one spelling and wrong
+    /// for the other; asking for the run's own start is right for both.
+    fn create_keyword_index(&self) -> usize {
+        self.index.saturating_sub(2)
+    }
+
     fn quoted_name(&mut self, context: &str) -> Result<String> {
+        let start = self.index;
         match self.peek() {
             Some(Token::String(s)) => {
                 let s = s.clone();
                 self.advance();
                 Ok(s)
+            }
+            // The spelling the statement wrote, with the quotes stripped, which
+            // is the same rule `name` follows: a `"..."` alias is spelled as it
+            // was written. It matters for the result column a statement reports:
+            // `SELECT 1 AS "Xy Zz"` is named `Xy Zz`, not `xy zz`.
+            Some(Token::DoubleQuotedIdentifier(_)) => {
+                let n = self.token_name_at(start);
+                self.advance();
+                Ok(n)
             }
             _ => self.name(context),
         }
@@ -577,16 +1029,35 @@ impl<'a> Parser<'a> {
 
     /// The offset where the statement at the cursor ends.
     ///
-    /// That is the next semicolon that is not inside parentheses, or the end of
-    /// the input, since a script is tokenised up front and the pragma module
-    /// needs a slice rather than a position.
+    /// That is the end of the next semicolon that is not inside parentheses, or
+    /// the end of the input, since a script is tokenised up front and the
+    /// pragma and explain modules need a slice rather than a position.
+    ///
+    /// The semicolon is *included*, and that is the whole point of returning
+    /// its end rather than its start. Both modules that re-parse this slice
+    /// decide between two different error messages on the strength of it: a
+    /// token the parser dislikes is `near "<token>": syntax error`, while an
+    /// input that simply ran out is `incomplete input`. A `;` that was
+    /// actually written is a token, so it is named, and only a slice that
+    /// stopped because the input did is the other one:
+    ///
+    /// ```text
+    /// PRAGMA;                near ";": syntax error      (input ran out after)
+    /// PRAGMA page_size;      -- nothing to name
+    /// ```
+    ///
+    /// Dropping the semicolon collapsed those two into one, and the collapse
+    /// was silent: both arms reported `incomplete input` for input SQLite
+    /// words differently. Measured on 3.53.4, `EXPLAIN;`, `EXPLAIN QUERY;`,
+    /// `EXPLAIN QUERY PLAN;` and `PRAGMA;` are all `near ";": syntax error`
+    /// while the same words with the semicolon left off are `incomplete input`.
     fn statement_end(&self) -> usize {
         let mut depth = 0i32;
-        for (tok, span) in self.tokens.iter().skip(self.pos) {
+        for (tok, span) in self.tokens.iter().skip(self.index) {
             match tok {
                 Token::Punct(Punct::LParen) => depth += 1,
                 Token::Punct(Punct::RParen) => depth -= 1,
-                Token::Punct(Punct::Semicolon) if depth <= 0 => return span.start,
+                Token::Punct(Punct::Semicolon) if depth <= 0 => return span.end,
                 _ => {}
             }
         }
@@ -598,7 +1069,7 @@ impl<'a> Parser<'a> {
             Some(Token::Identifier(n)) => Ok(n),
             Some(Token::Keyword(k)) => Ok(k.as_str().to_string()),
             _ => {
-                self.pos = self.pos.saturating_sub(1);
+                self.index = self.index.saturating_sub(1);
                 Err(self.unexpected(context))
             }
         }
@@ -611,16 +1082,51 @@ impl<'a> Parser<'a> {
     /// against the schema. Only a token that cannot be a name at all is an
     /// error here.
     fn name(&mut self, context: &str) -> Result<String> {
-        let start = self.pos;
+        let start = self.index;
         match self.advance() {
             Some(Token::Identifier(n)) => Ok(self.written_name(start).unwrap_or(n)),
-            Some(Token::Keyword(k)) => Ok(self
-                .written_name(start)
-                .unwrap_or_else(|| k.as_str().to_string())),
+            Some(Token::Keyword(k)) => Ok(k.as_str().to_string()),
             _ => {
-                self.pos = self.pos.saturating_sub(1);
+                self.index = self.index.saturating_sub(1);
                 Err(self.unexpected(context))
             }
+        }
+    }
+
+    /// A name read where a query may spell it any way it likes, so the message
+    /// that has to echo it gets the spelling the statement used.
+    ///
+    /// Every read goes through [`Parser::name`], which folds a bare identifier
+    /// because the catalog is keyed on the fold. This is the other half: the
+    /// places whose name reaches a *message* want the fold undone. The two are
+    /// not in conflict -- `SELECT * FROM Foo` finds no table (it is folded for
+    /// the lookup and un-folded for the text) and says `no such table: Foo`.
+    ///
+    /// A *keyword* is never routed through here, and that is deliberate: a
+    /// keyword is written one way, so its token spelling is the whole of it.
+    /// `SELECT CAST(1 AS Integer)` reports its result column as
+    /// `CAST(1 AS Integer)`, which is the source text and not a name, and the
+    /// declared type is compared folded, so there is nothing to un-fold.
+    fn query_name(&mut self, context: &str) -> Result<String> {
+        let start = self.index;
+        match self.advance() {
+            Some(Token::Identifier(_)) | Some(Token::DoubleQuotedIdentifier(_)) => Ok(self
+                .written_name(start)
+                .unwrap_or_else(|| self.token_name_at(start))),
+            Some(Token::Keyword(k)) => Ok(k.as_str().to_string()),
+            _ => {
+                self.index = self.index.saturating_sub(1);
+                Err(self.unexpected(context))
+            }
+        }
+    }
+
+    /// The token's own spelling, for a name whose source text is unusable.
+    fn token_name_at(&self, pos: usize) -> String {
+        match self.tokens.get(pos).map(|(t, _)| t) {
+            Some(Token::Identifier(n)) | Some(Token::DoubleQuotedIdentifier(n)) => n.clone(),
+            Some(Token::Keyword(k)) => k.as_str().to_string(),
+            _ => String::new(),
         }
     }
 
@@ -656,6 +1162,40 @@ impl<'a> Parser<'a> {
                 .unwrap_or(w)
                 .to_string()
         })
+    }
+
+    /// Whether the token at the cursor is a double-quoted name.
+    ///
+    /// A `"..."` is an identifier everywhere a name is read, exactly like the
+    /// bracketed and back-quoted forms, so the grammar asks about it in the
+    /// same places -- but not with a `Token::Identifier` pattern, because that
+    /// would hide the quoting the `no such column` message is about.
+    fn at_double_quoted(&self) -> bool {
+        self.at_double_quoted_at(self.index)
+    }
+
+    /// Whether the token at `pos` is a double-quoted name.
+    pub fn at_double_quoted_at(&self, pos: usize) -> bool {
+        matches!(
+            self.tokens.get(pos).map(|(t, _)| t),
+            Some(Token::DoubleQuotedIdentifier(_))
+        )
+    }
+
+    /// Whether the token at `pos` was a double-quoted name.
+    ///
+    /// SQLite treats a `"..."` that resolves to nothing as a mistake about
+    /// quoting rather than about the name, and says so:
+    /// `no such column: "a+b" - should this be a string literal in
+    /// single-quotes?`. The same name in brackets or backticks is a plain
+    /// `no such column: a+b`, so the quoting -- not the name -- is what the
+    /// message turns on, and the resolver that raises the message has to be
+    /// able to ask.
+    pub fn is_double_quoted(&self, pos: usize) -> bool {
+        matches!(
+            self.tokens.get(pos).map(|(t, _)| t),
+            Some(Token::DoubleQuotedIdentifier(_))
+        )
     }
 
     /// Consumes an identifier whose text is exactly `word`, case-insensitively.
@@ -709,9 +1249,13 @@ impl<'a> Parser<'a> {
                 // either nothing, a parenthesised argument, or an assignment.
                 // It wants the statement text starting AT the keyword, not
                 // after it, because it parses the whole shape itself.
-                // match self.peek() did not advance, so self.pos is still
+                // match self.peek() did not advance, so self.index is still
                 // pointing AT the keyword. Its span is where the text starts.
-                let from = self.tokens.get(self.pos).map(|(_, s)| s.start).unwrap_or(0);
+                let from = self
+                    .tokens
+                    .get(self.index)
+                    .map(|(_, s)| s.start)
+                    .unwrap_or(0);
                 // The pragma module re-parses the text, so it has to be this
                 // statement's text and not the whole script: a script is
                 // tokenised up front, and handing over the rest of it would
@@ -721,8 +1265,8 @@ impl<'a> Parser<'a> {
                 let stmt = crate::pragma::parse_pragma(&text)?;
                 // The tokens for this statement still have to be consumed, or
                 // the script loop would see the same PRAGMA for ever.
-                while self.pos < self.tokens.len() && self.tokens[self.pos].1.start < to {
-                    self.pos += 1;
+                while self.index < self.tokens.len() && self.tokens[self.index].1.start < to {
+                    self.index += 1;
                 }
                 return Ok(Stmt::Pragma(stmt));
             }
@@ -732,14 +1276,18 @@ impl<'a> Parser<'a> {
                 // statement's slice rather than the whole script: a script is
                 // tokenised up front and handing over the rest would make the
                 // pragma swallow the statements that follow.
-                let from = self.tokens.get(self.pos).map(|(_, s)| s.start).unwrap_or(0);
+                let from = self
+                    .tokens
+                    .get(self.index)
+                    .map(|(_, s)| s.start)
+                    .unwrap_or(0);
                 let to = self.statement_end();
                 let text = self.sql.get(from..to).unwrap_or("").to_string();
                 let stmt = crate::pragma::parse_pragma(&text)?;
                 // The tokens still have to be consumed, or the script loop would
                 // see the same PRAGMA for ever.
-                while self.pos < self.tokens.len() && self.tokens[self.pos].1.start < to {
-                    self.pos += 1;
+                while self.index < self.tokens.len() && self.tokens[self.index].1.start < to {
+                    self.index += 1;
                 }
                 return Ok(Stmt::Pragma(stmt));
             }
@@ -810,11 +1358,13 @@ impl<'a> Parser<'a> {
         let text = self.sql.get(from..to).unwrap_or("").to_string();
         let stmt = crate::explain::parse(&text)?;
         // The tokens for this statement still have to be consumed, or the
-        // script loop would see the same EXPLAIN for ever. `<=` and not `<`:
-        // the slice ends *at* the semicolon, so the terminator is one of the
-        // tokens that has to go.
-        while self.pos < self.tokens.len() && self.tokens[self.pos].1.start <= to {
-            self.pos += 1;
+        // script loop would see the same EXPLAIN for ever. `<` and not `<=`:
+        // the slice ends *after* the semicolon, so every token in it starts
+        // strictly before that offset. Comparing with `<=` would swallow the
+        // token after the terminator as well, which for `EXPLAIN SELECT 1;
+        // SELECT 2` is the `SELECT` that opens the next statement.
+        while self.index < self.tokens.len() && self.tokens[self.index].1.start < to {
+            self.index += 1;
         }
         Ok(Stmt::Explain(Box::new(stmt)))
     }
@@ -889,11 +1439,11 @@ impl<'a> Parser<'a> {
         // change planning, not results.
         self.eat_keyword(Keyword::Recursive)?;
         loop {
-            let name = self.name("parsing a CTE name")?;
+            let name = self.quoted_name("parsing a CTE name")?;
             let mut columns = Vec::new();
             if self.eat_punct(Punct::LParen)? {
                 loop {
-                    columns.push(self.name("parsing a CTE column name")?);
+                    columns.push(self.quoted_name("parsing a CTE column name")?);
                     if !self.eat_punct(Punct::Comma)? {
                         break;
                     }
@@ -937,13 +1487,13 @@ impl<'a> Parser<'a> {
         let columns = self.result_columns()?;
         let from = self.from_clause()?;
         let where_ = if self.eat_keyword(Keyword::Where)? {
-            Some(self.expr()?)
+            Some(self.resolve_expr()?)
         } else {
             None
         };
         let group_by = self.group_by_clause()?;
         let having = if self.eat_keyword(Keyword::Having)? {
-            Some(self.expr()?)
+            Some(self.resolve_expr()?)
         } else {
             None
         };
@@ -983,7 +1533,7 @@ impl<'a> Parser<'a> {
             // no alias, and it ends where the expression did, before any alias.
             let expr_end = self
                 .tokens
-                .get(self.pos.saturating_sub(1))
+                .get(self.index.saturating_sub(1))
                 .map(|(_, s)| s.end)
                 .unwrap_or(expr_start);
             let source = self
@@ -999,6 +1549,7 @@ impl<'a> Parser<'a> {
                 Some(self.quoted_name("after AS")?)
             } else if matches!(self.peek(), Some(Token::Identifier(_)))
                 || matches!(self.peek(), Some(Token::Keyword(k)) if k.as_identable())
+                || self.at_double_quoted()
             {
                 Some(self.quoted_name("after a result column")?)
             } else {
@@ -1101,7 +1652,7 @@ impl<'a> Parser<'a> {
         // nothing after it is a table named `left`, which SQLite allows, so
         // nothing is consumed until the `JOIN` is confirmed. The same holds for
         // `NATURAL`, which is also a usable table name.
-        let save = self.pos;
+        let save = self.index;
         // `NATURAL` may stand alone in front of `JOIN` or in front of a type, so
         // it is eaten here and the type loop below runs either way. What decides
         // whether this is an operator at all is the `JOIN` that has to follow
@@ -1148,7 +1699,7 @@ impl<'a> Parser<'a> {
             bad_outer = !(have_type && type_allows_outer);
         }
         if !self.at_keyword(Keyword::Join) {
-            self.pos = save;
+            self.index = save;
             return Ok(None);
         }
         self.advance();
@@ -1168,13 +1719,13 @@ impl<'a> Parser<'a> {
     /// decide what an unconstrained join means.
     fn join_constraint(&mut self) -> Result<(Option<Expr>, Vec<String>)> {
         if self.eat_keyword(Keyword::On)? {
-            return Ok((Some(self.expr()?), Vec::new()));
+            return Ok((Some(self.resolve_expr()?), Vec::new()));
         }
         if self.eat_keyword(Keyword::Using)? {
             self.expect_punct(Punct::LParen, "after USING")?;
             let mut cols = Vec::new();
             loop {
-                cols.push(self.name("in a USING clause")?);
+                cols.push(self.quoted_name("in a USING clause")?);
                 if !self.eat_punct(Punct::Comma)? {
                     break;
                 }
@@ -1198,18 +1749,29 @@ impl<'a> Parser<'a> {
                 alias,
             });
         }
-        let name = self.name("after FROM")?;
+        // The name is not optional, but an absent one is not a `near` message
+        // either: sqlite3 stops at the clause keyword and says the input ran
+        // out, so `SELECT * FROM` and `SELECT * FROM;` differ only in the
+        // terminator while both blame the input rather than a token. The check
+        // has to be the *keyword* and not the token, because `SELECT * FROM
+        // where;` is `near "where": syntax error` -- the word is not a name
+        // there either, but a token of it is a real one the parser can go on
+        // to use.
+        if self.at_keyword(Keyword::From) || self.at_keyword(Keyword::Where) {
+            return Err(msg::incomplete_input());
+        }
+        let name = self.query_name("after FROM")?;
         // A qualified name is written schema.table, which the engine treats as
         // the table part with the schema ignored for now.
         let mut full = name.clone();
         while self.eat_punct(Punct::Dot)? {
             full.push('.');
-            full.push_str(&self.name("after a table qualifier")?);
+            full.push_str(&self.query_name("after a table qualifier")?);
         }
         let alias = self.optional_alias()?;
         let indexed_by = if self.eat_keyword(Keyword::Indexed)? {
             self.eat_keyword(Keyword::By)?;
-            Some(self.name("after INDEXED BY")?)
+            Some(self.quoted_name("after INDEXED BY")?)
         } else if self.eat_keyword(Keyword::Not)? {
             self.eat_keyword(Keyword::Indexed)?;
             self.eat_keyword(Keyword::By)?;
@@ -1229,8 +1791,14 @@ impl<'a> Parser<'a> {
     }
 
     fn optional_alias(&mut self) -> Result<Option<String>> {
+        // A result alias is the one name a statement may spell in any case and
+        // still mean the same column: `SELECT b AS bb ... ORDER BY BB` reads
+        // the alias, and both spellings have to reach the match for it to be
+        // found. An alias is matched, never echoed, so it keeps the fold like
+        // every other name in the schema -- which is the opposite of
+        // `query_name` and the reason the two are not the same function.
         if self.eat_keyword(Keyword::As)? {
-            return Ok(Some(self.name("after AS")?));
+            return Ok(Some(self.quoted_name("after AS")?));
         }
         // `OUTER` is a valid alias but also the second word of a join type, so
         // `a outer JOIN b` is a join and `a outer` is an alias. A `JOIN` after
@@ -1240,10 +1808,12 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         match self.peek() {
-            Some(Token::Identifier(_)) => Ok(Some(
+            // A `"..."` is an alias like any other, and is spelled as it was
+            // written: `SELECT 1 AS a FROM t AS "Xy"` names the table `Xy`.
+            Some(Token::Identifier(_)) | Some(Token::DoubleQuotedIdentifier(_)) => Ok(Some(
                 self.advance()
                     .and_then(|t| match t {
-                        Token::Identifier(n) => Some(n),
+                        Token::Identifier(n) | Token::DoubleQuotedIdentifier(n) => Some(n),
                         _ => None,
                     })
                     .unwrap_or_default(),
@@ -1259,7 +1829,7 @@ impl<'a> Parser<'a> {
 
     /// Whether the token after the one at the cursor is `kw`.
     fn token_after_is(&self, kw: Keyword) -> bool {
-        matches!(self.tokens.get(self.pos + 1), Some((Token::Keyword(k), _)) if *k == kw)
+        matches!(self.tokens.get(self.index + 1), Some((Token::Keyword(k), _)) if *k == kw)
     }
 
     fn group_by_clause(&mut self) -> Result<Vec<Expr>> {
@@ -1269,7 +1839,7 @@ impl<'a> Parser<'a> {
         }
         self.eat_keyword(Keyword::By)?;
         loop {
-            out.push(self.expr()?);
+            out.push(self.resolve_expr()?);
             if !self.eat_punct(Punct::Comma)? {
                 break;
             }
@@ -1284,7 +1854,7 @@ impl<'a> Parser<'a> {
         }
         self.eat_keyword(Keyword::By)?;
         loop {
-            let expr = self.expr()?;
+            let expr = self.resolve_expr()?;
             // Ascending is the default and is often left unstated.
             let ascending = if self.eat_keyword(Keyword::Desc)? {
                 false
@@ -1298,6 +1868,194 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// The whole of a resolution context: the qualified name or function call
+    /// SQLite looks up before the expression grammar is consulted, or `None` to
+    /// say the expression grammar is the only way in.
+    ///
+    /// The seven callers are the seven places SQLite resolves a name before it
+    /// parses an expression -- the SELECT list, WHERE, GROUP BY, ORDER BY,
+    /// HAVING, a join's ON, and the second WHERE -- and in all of them a name is
+    /// the thing the statement wrote, matched against a list rather than
+    /// resolved by the expression grammar. The distinction matters because the
+    /// two routes spell a name differently: `expr_primary` gives a bare column
+    /// reference the statement's spelling, because a `no such column` message
+    /// echoes it, and it gives a *function call* that spelling too
+    /// (`no such function: XYZZY`). But the qualified reference `expr_primary`
+    /// builds is a different shape: its qualifier is read by `self::name`, which
+    /// folds, and a message for one is the folded form -- which is what
+    /// `SELECT 1 FROM t ORDER BY t.NOSUCHCOL` says. So the head of a name in a
+    /// resolution context is read here, where the fold is right, and everything
+    /// else is left to the expression grammar.
+    fn lookup_name(&mut self) -> Result<Option<Expr>> {
+        let span = self.span();
+        let Some(first) = self.peek_token()? else {
+            return Ok(None);
+        };
+        let named = matches!(
+            first,
+            Token::Identifier(_) | Token::DoubleQuotedIdentifier(_) | Token::Keyword(_)
+        );
+        // The token *after* the head decides which of the two shapes this is.
+        let after = self.peek_at(self.index + 1);
+        if !named {
+            return Ok(None);
+        }
+        match after {
+            Some(Token::Punct(Punct::Dot)) => {
+                // `t.x`: the qualifier, the dot, then the column -- the same
+                // three reads `after_identifier` makes, and for the same reason.
+                // The qualifier is matched on its fold while the column keeps the
+                // spelling the statement wrote, so `ORDER BY t.NOSUCHCOL` says
+                // what `SELECT t.NOSUCHCOL` says.
+                //
+                // Nothing has been consumed yet, so the head is the token *at*
+                // the cursor and reading it leaves the cursor on the dot. The
+                // dot is then consumed in its own right. Advancing past the head
+                // first instead would leave the cursor sitting on the dot, and
+                // the read after it would try to make a name of the dot and say
+                // `near ".": syntax error`.
+                let table = self.quoted_name("at the head of a qualified name")?;
+                self.advance();
+                if self.eat_punct(Punct::Star)? {
+                    return Ok(Some(Expr::Function {
+                        name: format!("{table}.*"),
+                        args: vec![],
+                        star: true,
+                        distinct: false,
+                    }));
+                }
+                let column = self.query_name("after a column qualifier")?;
+                // A third part makes it `schema.table.column`: the two read so
+                // far are the schema and the table, and the column comes last.
+                if self.at_punct(Punct::Dot) {
+                    self.advance();
+                    let second = self.query_name("after a schema qualifier")?;
+                    return Ok(Some(Expr::Column {
+                        table: Some(format!("{table}.{column}")),
+                        name: second,
+                        span,
+                    }));
+                }
+                Ok(Some(Expr::Column {
+                    table: Some(table),
+                    name: column,
+                    span,
+                }))
+            }
+            Some(Token::Punct(Punct::LParen)) => {
+                // `f(`, and the call's name is echoed by `no such function` and
+                // by `wrong number of arguments to function f()`, so it is read
+                // the way `after_identifier` reads a call's name -- by the span
+                // the head was written with, which is the token at the cursor
+                // because nothing has been consumed yet. Reading the *next*
+                // token instead would take the open paren's span and name the
+                // call `(`, which is not a name the statement wrote.
+                let start = self.index;
+                let name = self
+                    .written_name(start)
+                    .unwrap_or_else(|| self.token_name_at(start));
+                self.advance();
+                Ok(Some(self.function_call(name, span)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// An expression in one of the resolution contexts, parsing the whole of it.
+    ///
+    /// [`Parser::lookup_name`] reads a leading qualified name or function call
+    /// so that the name it echoes is the statement's spelling, but a name in one
+    /// of these positions is only the *first operand*: `ON a.x = b.x` and `WHERE
+    /// t.x IS NULL` are both expressions, and handing back the bare name would
+    /// leave the operator and everything after it unread, so the statement would
+    /// fail on the operator with `near "=": syntax error`.
+    ///
+    /// So the name seeds the expression and the grammar carries on from it. The
+    /// seed goes in at the additive level rather than at the top, because that
+    /// is the innermost level that still lets `=`, `<`, `IS NULL` and the
+    /// bitwise operators bind it -- the same shape `expr_primary` has when it
+    /// is reached the ordinary way.
+    fn resolve_expr(&mut self) -> Result<Expr> {
+        let Some(seed) = self.lookup_name()? else {
+            return self.expr();
+        };
+        let seed = self.expr_additive_tail(seed)?;
+        let seed = self.expr_bitwise_tail(seed)?;
+        self.expr_comparison_tail(seed)
+    }
+
+    /// The rest of [`Parser::expr_additive`], for an operand already in hand.
+    fn expr_additive_tail(&mut self, mut left: Expr) -> Result<Expr> {
+        loop {
+            let op = if self.eat_punct(Punct::Plus)? {
+                BinOp::Add
+            } else if self.eat_punct(Punct::Minus)? {
+                BinOp::Sub
+            } else if self.eat_punct(Punct::Concat)? {
+                BinOp::Concat
+            } else {
+                break;
+            };
+            let right = self.expr_multiplicative()?;
+            left = Expr::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// The rest of [`Parser::expr_bitwise`], for an operand already in hand.
+    fn expr_bitwise_tail(&mut self, mut left: Expr) -> Result<Expr> {
+        loop {
+            let op = if self.eat_punct(Punct::BitOr)? {
+                BinOp::BitwiseOr
+            } else if self.eat_punct(Punct::BitAnd)? {
+                BinOp::BitwiseAnd
+            } else if self.eat_punct(Punct::BitShiftLeft)? {
+                BinOp::LeftShift
+            } else if self.eat_punct(Punct::BitShiftRight)? {
+                BinOp::RightShift
+            } else {
+                break;
+            };
+            let right = self.expr_additive()?;
+            left = Expr::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// The rest of [`Parser::expr_comparison`], for an operand already in hand.
+    fn expr_comparison_tail(&mut self, left: Expr) -> Result<Expr> {
+        let op = if self.eat_punct(Punct::Eq)? || self.eat_punct(Punct::EqEq)? {
+            BinOp::Eq
+        } else if self.eat_punct(Punct::Ne)? || self.eat_punct(Punct::NeBracket)? {
+            BinOp::Ne
+        } else if self.eat_punct(Punct::Le)? {
+            BinOp::Le
+        } else if self.eat_punct(Punct::Lt)? {
+            BinOp::Lt
+        } else if self.eat_punct(Punct::Ge)? {
+            BinOp::Ge
+        } else if self.eat_punct(Punct::Gt)? {
+            BinOp::Gt
+        } else {
+            return self.postfix_predicates(left);
+        };
+        let right = self.expr_bitwise()?;
+        let combined = Expr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+        self.postfix_predicates(combined)
     }
 
     fn limit_clause(&mut self) -> Result<(Option<Expr>, Option<Expr>)> {
@@ -1436,7 +2194,7 @@ impl<'a> Parser<'a> {
             }
             let negated = if self.at_keyword(Keyword::Not)
                 && matches!(
-                    self.tokens.get(self.pos + 1).map(|(t, _)| t),
+                    self.tokens.get(self.index + 1).map(|(t, _)| t),
                     Some(Token::Keyword(Keyword::In))
                         | Some(Token::Keyword(Keyword::Like))
                         | Some(Token::Keyword(Keyword::Glob))
@@ -1665,6 +2423,7 @@ impl<'a> Parser<'a> {
 
     fn expr_primary(&mut self) -> Result<Expr> {
         let span = self.span();
+        let start = self.index;
         match self.advance() {
             Some(Token::Integer(i)) => Ok(Expr::Literal(Literal::Integer(i))),
             Some(Token::Float(v)) => Ok(Expr::Literal(Literal::Real(v))),
@@ -1728,10 +2487,23 @@ impl<'a> Parser<'a> {
                 self.expect_punct(Punct::RParen, "closing a parenthesised expression")?;
                 Ok(inner)
             }
-            Some(Token::Identifier(name)) => self.after_identifier(name, span),
+            Some(Token::Identifier(name)) | Some(Token::DoubleQuotedIdentifier(name)) => {
+                // A bare column reference carries the spelling the statement
+                // wrote, because a `no such column` message echoes the name that
+                // did not resolve rather than the token: sqlite3 answers
+                // `SELECT BadCol` with `no such column: BadCol` and
+                // `SELECT 1 FROM t ORDER BY NOSUCHCOL` with
+                // `no such column: NOSUCHCOL`. A function call is already read
+                // this way just below, for the same reason and the same
+                // sentence, so the two are the same rule. The fold is still
+                // what every lookup matches on, so nothing downstream is
+                // affected.
+                let name = self.written_name(start).unwrap_or(name);
+                self.after_identifier(name, span)
+            }
             Some(Token::Keyword(kw)) => self.after_keyword(kw, span),
             _ => {
-                self.pos = self.pos.saturating_sub(1);
+                self.index = self.index.saturating_sub(1);
                 Err(self.unexpected("parsing an expression"))
             }
         }
@@ -1750,7 +2522,7 @@ impl<'a> Parser<'a> {
             // covers the quotes, so the quotes are trimmed here -- sqlite3
             // answers `SELECT "AbC"(1)` with `no such function: AbC`, without
             // them.
-            let name = self.written_name(self.pos - 1).unwrap_or(name);
+            let name = self.written_name(self.index - 1).unwrap_or(name);
             return self.function_call(name, span);
         }
         // A qualified column is `table.column` or `schema.table.column`.
@@ -1759,7 +2531,7 @@ impl<'a> Parser<'a> {
             // consumed, so the qualifier is the *last* token read rather than
             // the one after it. `name` is the folded token spelling, which is
             // what a lookup wants and the wrong thing to echo.
-            let mut qualifier = self.written_name(self.pos - 1).unwrap_or(name);
+            let mut qualifier = self.written_name(self.index - 1).unwrap_or(name);
             self.advance();
             if self.eat_punct(Punct::Star)? {
                 return Ok(Expr::Function {
@@ -1769,7 +2541,7 @@ impl<'a> Parser<'a> {
                     distinct: false,
                 });
             }
-            let column = self.name("after a column qualifier")?;
+            let column = self.query_name("after a column qualifier")?;
             if self.at_punct(Punct::Dot) {
                 // The name read so far is the *column*, not the table, so a
                 // third part is the table and the part already in hand has to
@@ -1777,7 +2549,7 @@ impl<'a> Parser<'a> {
                 // table `Foo` in schema `main`, and this used to read it as
                 // the table `main.Foo` and the column `x`.
                 self.advance();
-                let table = self.name("after a schema qualifier")?;
+                let table = self.query_name("after a schema qualifier")?;
                 // `schema.table.column`, and the order is schema, table,
                 // column: `main.T.x` is the column `x` of table `T`. The
                 // name read above as the "column" is the table, so the two
@@ -1856,7 +2628,18 @@ impl<'a> Parser<'a> {
 
     fn case_expr(&mut self) -> Result<Expr> {
         // The optional operand form is `CASE x WHEN a THEN b ...`.
-        let operand = if self.at_keyword(Keyword::When) {
+        //
+        // Whether the operand is there is decided by *looking ahead* for the
+        // `WHEN`, not by asking whether the next token can begin an expression.
+        // The two disagree exactly where it matters: `end` is a keyword SQLite
+        // allows as a column name, so `SELECT CASE END;` parses `END` as the
+        // operand and the failure comes one token later, at the `;` -- which is
+        // the message sqlite3 gives. Deciding it the other way round is what
+        // made this one `near "end"` where the oracle says `near ";"`. Only
+        // `WHEN` itself ends the operand, and the test is spelled `WHEN` because
+        // sqlite3 takes the word, not the token: `SELECT CASE "WHEN";` is
+        // `no such column: WHEN` and names the quoted name, not the keyword.
+        let operand = if self.spells_keyword_ahead(Keyword::When) {
             None
         } else {
             Some(Box::new(self.expr()?))
@@ -1869,11 +2652,16 @@ impl<'a> Parser<'a> {
             whens.push((cond, result));
         }
         if whens.is_empty() {
-            // sqlite3 stops at the token after the last WHEN, not at the word
-            // `end`: `SELECT CASE END;` is `near ";": syntax error`. The
-            // clause this used to raise is not a format string in the binary
-            // at all, so there is no text to match it against.
-            return Err(msg::syntax_error(&self.describe_token_here()));
+            // sqlite3 stops at the token *after* the last WHEN, not at the word
+            // `end`: `SELECT CASE END;` is `near ";": syntax error`, where the
+            // `end` is still perfectly good -- it is only useless without a WHEN
+            // arm, and the parser has to have consumed one before it can reach
+            // the END. So the message names whatever the cursor is on, which is
+            // the semicolon there and the word that was meant to be a WHEN here
+            // (`SELECT CASE WHEN THEN 1 END;` is `near "THEN": syntax error`).
+            // The clause this used to raise is not a format string in the
+            // binary at all, so there is no text to match it against.
+            return Err(self.syntax_error_here());
         }
         let otherwise = if self.eat_keyword(Keyword::Else)? {
             Some(Box::new(self.expr()?))
@@ -1952,16 +2740,16 @@ impl<'a> Parser<'a> {
         }
         // INTO is optional.
         self.eat_keyword(Keyword::Into)?;
-        let table = self.name("after INTO")?;
+        let table = self.query_name("after INTO")?;
         let mut full = table.clone();
         while self.eat_punct(Punct::Dot)? {
             full.push('.');
-            full.push_str(&self.name("after a table qualifier")?);
+            full.push_str(&self.query_name("after a table qualifier")?);
         }
         let columns = if self.eat_punct(Punct::LParen)? {
             let mut names = Vec::new();
             loop {
-                names.push(self.name("in a column list")?);
+                names.push(self.quoted_name("in a column list")?);
                 if !self.eat_punct(Punct::Comma)? {
                     break;
                 }
@@ -2042,20 +2830,20 @@ impl<'a> Parser<'a> {
         if self.eat_keyword(Keyword::Or)? {
             self.advance();
         }
-        let table = self.name("after UPDATE")?;
+        let table = self.query_name("after UPDATE")?;
         let mut full = table;
         while self.eat_punct(Punct::Dot)? {
             full.push('.');
-            full.push_str(&self.name("after a table qualifier")?);
+            full.push_str(&self.query_name("after a table qualifier")?);
         }
         self.expect_keyword(Keyword::Set, "after a table name")?;
         let mut sets = Vec::new();
         loop {
-            let column = self.name("in a SET clause")?;
+            let column = self.quoted_name("in a SET clause")?;
             // An optional table qualifier on the target column.
             if self.at_punct(Punct::Dot) {
                 self.advance();
-                self.name("after a column qualifier")?;
+                self.quoted_name("after a column qualifier")?;
             }
             self.expect_punct(Punct::Eq, "in a SET clause")?;
             let value = self.expr()?;
@@ -2065,7 +2853,7 @@ impl<'a> Parser<'a> {
             }
         }
         let where_ = if self.eat_keyword(Keyword::Where)? {
-            Some(self.expr()?)
+            Some(self.resolve_expr()?)
         } else {
             None
         };
@@ -2079,14 +2867,14 @@ impl<'a> Parser<'a> {
     fn delete(&mut self) -> Result<Stmt> {
         self.advance();
         self.expect_keyword(Keyword::From, "after DELETE")?;
-        let table = self.name("after FROM")?;
+        let table = self.query_name("after FROM")?;
         let mut full = table;
         while self.eat_punct(Punct::Dot)? {
             full.push('.');
-            full.push_str(&self.name("after a table qualifier")?);
+            full.push_str(&self.query_name("after a table qualifier")?);
         }
         let where_ = if self.eat_keyword(Keyword::Where)? {
-            Some(self.expr()?)
+            Some(self.resolve_expr()?)
         } else {
             None
         };
@@ -2112,7 +2900,7 @@ impl<'a> Parser<'a> {
             return self.create_index();
         }
         if self.eat_keyword(Keyword::View)? {
-            let name = self.name("after CREATE VIEW")?;
+            let name = self.quoted_name("after CREATE VIEW")?;
             if self.eat_punct(Punct::LParen)? {
                 let mut depth = 1;
                 while depth > 0 {
@@ -2142,17 +2930,22 @@ impl<'a> Parser<'a> {
         // one the caller consumed.
         let start = self
             .tokens
-            .get(self.pos.saturating_sub(2))
+            .get(self.create_keyword_index())
             .map(|(t, s)| match t {
+                // `CREATE TABLE`: the caller consumed `TABLE` and this is
+                // still on `CREATE`.
                 Token::Keyword(Keyword::Create) => s.start,
-                _ => s.start,
+                // `CREATE TEMP TABLE`: two tokens were consumed, so counting
+                // back two lands on `TEMP` and the text would start there.
+                // The statement's own first token is the `CREATE`.
+                _ => self.statement_start_offset(),
             });
         let if_not_exists = self.if_not_exists()?;
-        let name = self.name("after CREATE TABLE")?;
+        let name = self.query_name("after CREATE TABLE")?;
         let mut full = name;
         while self.eat_punct(Punct::Dot)? {
             full.push('.');
-            full.push_str(&self.name("after a table qualifier")?);
+            full.push_str(&self.query_name("after a table qualifier")?);
         }
         // A table may be given AS SELECT.
         if self.eat_keyword(Keyword::As)? {
@@ -2205,7 +2998,7 @@ impl<'a> Parser<'a> {
         // spelling, which is what a schema dump is expected to show.
         let end = self
             .tokens
-            .get(self.pos.saturating_sub(1))
+            .get(self.index.saturating_sub(1))
             .map(|(_, s)| s.end)
             .unwrap_or(0);
         let sql = match start {
@@ -2249,7 +3042,7 @@ impl<'a> Parser<'a> {
     }
 
     fn column_def(&mut self) -> Result<ColumnDef> {
-        let name = self.name("parsing a column name")?;
+        let name = self.quoted_name("parsing a column name")?;
         // A declared type is a run of words, optionally followed by a
         // parenthesised length as in VARCHAR(255) or DECIMAL(10,5). The length
         // comes after the name, so the words are read first and a paren is only
@@ -2280,7 +3073,7 @@ impl<'a> Parser<'a> {
                         inner.push_str(&i.to_string());
                         first = false;
                     }
-                    Some(Token::Identifier(n)) => {
+                    Some(Token::Identifier(n)) | Some(Token::DoubleQuotedIdentifier(n)) => {
                         if !first {
                             inner.push(' ');
                         }
@@ -2327,7 +3120,10 @@ impl<'a> Parser<'a> {
     /// constraint or ends the definition.
     fn type_word(&mut self) -> Option<String> {
         match self.peek() {
-            Some(Token::Identifier(n)) => {
+            // A declared type may be written in any of the four quotings, and a
+            // `"..."` one is read here rather than refused: `c "Weird Type"`
+            // is a column c whose type is `Weird Type`.
+            Some(Token::Identifier(n)) | Some(Token::DoubleQuotedIdentifier(n)) => {
                 let n = n.clone();
                 self.advance();
                 Some(n)
@@ -2413,11 +3209,11 @@ impl<'a> Parser<'a> {
             return Ok(Some(Constraint::Collate(c)));
         }
         if self.eat_keyword(Keyword::References)? {
-            let table = self.name("after REFERENCES")?;
+            let table = self.quoted_name("after REFERENCES")?;
             let mut columns = Vec::new();
             if self.eat_punct(Punct::LParen)? {
                 loop {
-                    columns.push(self.name("in a foreign key column list")?);
+                    columns.push(self.quoted_name("in a foreign key column list")?);
                     if !self.eat_punct(Punct::Comma)? {
                         break;
                     }
@@ -2431,7 +3227,7 @@ impl<'a> Parser<'a> {
         // A bare constraint name introduced by CONSTRAINT applies to whatever
         // follows, which the caller already consumed.
         if self.eat_keyword(Keyword::Constraint)? {
-            self.name("after CONSTRAINT")?;
+            self.quoted_name("after CONSTRAINT")?;
             return self.column_constraint();
         }
         Ok(None)
@@ -2451,7 +3247,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.eat_keyword(Keyword::Match)? {
-                self.name("after MATCH")?;
+                self.quoted_name("after MATCH")?;
                 continue;
             }
             if self.eat_keyword(Keyword::Deferrable)? {
@@ -2472,7 +3268,7 @@ impl<'a> Parser<'a> {
 
     fn table_constraint(&mut self) -> Result<Constraint> {
         if self.eat_keyword(Keyword::Constraint)? {
-            self.name("after CONSTRAINT")?;
+            self.quoted_name("after CONSTRAINT")?;
             return self.table_constraint();
         }
         if self.eat_keyword(Keyword::Primary)? {
@@ -2541,11 +3337,11 @@ impl<'a> Parser<'a> {
                     None => break,
                 }
             }
-            let table = self.name("after REFERENCES")?;
+            let table = self.quoted_name("after REFERENCES")?;
             let mut columns = Vec::new();
             if self.eat_punct(Punct::LParen)? {
                 loop {
-                    columns.push(self.name("in a foreign key column list")?);
+                    columns.push(self.quoted_name("in a foreign key column list")?);
                     if !self.eat_punct(Punct::Comma)? {
                         break;
                     }
@@ -2562,7 +3358,7 @@ impl<'a> Parser<'a> {
         // The statement's own text starts at CREATE. By the time this runs the
         // cursor has moved past CREATE and possibly past UNIQUE and INDEX, so
         // the keyword is looked for backwards from where the cursor is.
-        let start = self.tokens[..self.pos]
+        let start = self.tokens[..self.index]
             .iter()
             .rposition(|(t, _)| matches!(t, Token::Keyword(Keyword::Create)))
             .map(|i| self.tokens[i].1.start);
@@ -2572,10 +3368,10 @@ impl<'a> Parser<'a> {
         let name = if self.at_keyword(Keyword::On) {
             None
         } else {
-            Some(self.name("after CREATE INDEX")?)
+            Some(self.quoted_name("after CREATE INDEX")?)
         };
         self.expect_keyword(Keyword::On, "after an index name")?;
-        let table = self.name("after ON")?;
+        let table = self.quoted_name("after ON")?;
         self.expect_punct(Punct::LParen, "opening an index column list")?;
         let mut columns = Vec::new();
         loop {
@@ -2586,7 +3382,7 @@ impl<'a> Parser<'a> {
                 self.expect_punct(Punct::RParen, "closing an index expression")?;
                 String::new()
             } else {
-                self.name("in an index column list")?
+                self.quoted_name("in an index column list")?
             };
             let ascending = if self.eat_keyword(Keyword::Desc)? {
                 false
@@ -2618,7 +3414,7 @@ impl<'a> Parser<'a> {
             Some(a) => {
                 let to = self
                     .tokens
-                    .get(self.pos.saturating_sub(1))
+                    .get(self.index.saturating_sub(1))
                     .map(|(_, s)| s.end)
                     .unwrap_or(a);
                 let text = self.sql.get(a..to.max(a)).unwrap_or_default();
@@ -2645,7 +3441,7 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            let name = self.name("after DROP TABLE")?;
+            let name = self.quoted_name("after DROP TABLE")?;
             return Ok(Stmt::DropTable { name, if_exists });
         }
         let kind = self
@@ -2707,6 +3503,7 @@ fn set_natural(item: &mut FromItem, kind: Option<JoinKind>) -> Result<()> {
 fn describe_token(t: &Token) -> String {
     match t {
         Token::Identifier(n) => n.clone(),
+        Token::DoubleQuotedIdentifier(n) => n.clone(),
         Token::Keyword(k) => k.as_str().to_string(),
         Token::String(s) => format!("'{s}'"),
         Token::Integer(i) => i.to_string(),

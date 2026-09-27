@@ -156,7 +156,7 @@ pub fn resolve_keys(
         // name that is left over once the substitution has run answers to
         // nothing at all, which SQLite reports rather than evaluating.
         let expr = substitute(columns, names, from, expr);
-        if let Some(err) = unresolved(&expr, names, from) {
+        if let Some(err) = unresolved(&expr, columns, names, from) {
             return Err(err);
         }
         keys.push(Key {
@@ -186,14 +186,26 @@ pub fn resolve_keys(
 ///
 /// A qualified name is never an alias, so `ORDER BY t.zzz` is reported under its
 /// written form, `no such column: t.zzz`, whatever the result is called.
-fn unresolved(expr: &Expr, names: &[String], from: Option<&From>) -> Option<Error> {
+fn unresolved(
+    expr: &Expr,
+    columns: &[ResultColumn],
+    names: &[String],
+    from: Option<&From>,
+) -> Option<Error> {
     let mut found = None;
     let mut refs = Vec::new();
     collect_columns(expr, &mut refs);
     for (table, name) in refs {
         // A result column may stand in for a name, but only an unqualified one,
-        // and only a name that is absent rather than ambiguous.
-        if table.is_none() && position_of(names, &name).is_some() {
+        // and only a name that is absent rather than ambiguous. `names` is the
+        // reported names, which for a direct reference is the *schema's*
+        // spelling rather than the one the statement wrote, so a name that is
+        // really an alias is looked for under the alias as well. `SELECT b AS
+        // bb FROM t ORDER BY BB+0` reads the alias `bb`, and the reported name
+        // is `b`, so only the alias answers to `BB`.
+        if table.is_none()
+            && (position_of(names, &name).is_some() || alias_position(columns, &name).is_some())
+        {
             continue;
         }
         let from = match from {
@@ -333,37 +345,37 @@ pub fn ordinal_of(expr: &Expr) -> Option<i64> {
 
 /// The `Nth ORDER BY term out of range` error for the `n`th term of a query
 /// whose result has `width` columns.
-pub fn out_of_range(n: usize, width: usize) -> Error {
-    Error::new(
-        ResultCode::Error,
-        format!(
-            "{} ORDER BY term out of range - should be between 1 and {}",
-            ordinal_suffix(n),
-            width
-        ),
-    )
-}
-
-/// A count as an English ordinal: 1st, 2nd, 3rd, 4th, 11th, 21st, 112th.
 ///
-/// The teens are the exception the last digit alone would get wrong, so they
-/// are checked before the digit decides.
-fn ordinal_suffix(n: usize) -> String {
-    if (11..=13).contains(&(n % 100)) {
-        return format!("{n}th");
-    }
-    let suffix = match n % 10 {
-        1 => "st",
-        2 => "nd",
-        3 => "rd",
-        _ => "th",
-    };
-    format!("{n}{suffix}")
+/// The wording and the `%r` ordinal come from the catalogue, next to the
+/// GROUP BY message they are the same message with a different word in it, so
+/// there is one place either could be changed and the two cannot drift apart.
+pub fn out_of_range(n: usize, width: usize) -> Error {
+    crate::msg::Msg::OrderByTermOutOfRange
+        .error(&[crate::msg::count(n as u64), crate::msg::count(width as u64)])
 }
 
 /// The first result column with that name, matching case-insensitively.
 pub fn position_of(names: &[String], name: &str) -> Option<usize> {
     names.iter().position(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// The first result column the author *named* that, under an explicit `AS` or
+/// a bare alias.
+///
+/// An alias is the one result-column name a statement may spell in any case and
+/// still mean the same column, because SQLite matches it without regard to
+/// case: `SELECT b AS bb FROM t ORDER BY BB` reads the alias `bb`. It is looked
+/// for separately from [`position_of`] because the two can answer differently
+/// for the same column -- a direct reference is reported under the *schema's*
+/// spelling rather than the alias's, so for `SELECT b AS bb` the reported name
+/// is `b` while the name the statement wrote is `bb`, and only the alias
+/// answers to `BB`.
+fn alias_position(columns: &[ResultColumn], name: &str) -> Option<usize> {
+    columns.iter().position(|rc| {
+        rc.alias
+            .as_ref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(name))
+    })
 }
 
 /// The result column a bare ORDER BY name reads, which is not always the first
@@ -381,23 +393,22 @@ pub fn position_of(names: &[String], name: &str) -> Option<usize> {
 /// says what each column is called, not whether it was called that by an author
 /// or by being a column. The SELECT list is what settles that.
 fn position_under(columns: &[ResultColumn], names: &[String], name: &str) -> Option<usize> {
+    // The alias is asked first, and asked of the SELECT list rather than of
+    // `names`, because `names` reports a direct reference under the schema's
+    // spelling rather than the alias's. `SELECT b AS bb FROM t ORDER BY BB` is
+    // that case: the reported name is `b` and only the alias answers to `BB`.
+    if let Some(a) = alias_position(columns, name) {
+        return Some(a);
+    }
     let at = position_of(names, name)?;
     // A star is a single result column reported under many names, and every one
     // of them is a table column, so there is no author-written name to prefer.
     if is_star(columns) {
         return Some(at);
     }
-    let aliased = columns.iter().position(|rc| {
-        rc.alias
-            .as_ref()
-            .is_some_and(|a| a.eq_ignore_ascii_case(name))
-    });
-    match aliased {
-        Some(a) => Some(a),
-        // Nothing carries the name under an explicit alias, so the name was
-        // only ever a column of its own, and the first such column is it.
-        None => Some(at),
-    }
+    // Nothing carries the name under an explicit alias, so the name was only
+    // ever a column of its own, and the first such column is it.
+    Some(at)
 }
 
 /// Replaces every output alias named inside an ORDER BY expression with the
@@ -447,7 +458,16 @@ fn substitute(
         // The first result column with that name is the one an alias names, so
         // `SELECT a AS b, b FROM t ORDER BY b+1` reads the table's b and
         // `SELECT a+1 AS c, c*2 ... ORDER BY c*2` reads the first c.
-        let Some(at) = position_of(names, name) else {
+        //
+        // The result column is looked up under its **alias** rather than under
+        // the name the list reports, and the two are not always the same: a
+        // direct reference is reported under the schema's spelling, which a
+        // statement may write any way. `SELECT b AS bb FROM t ORDER BY BB+0`
+        // is answered by the alias and not by the reported name `b`, and
+        // sqlite3 answers it, so the alias has to be tried as well. See
+        // `position_under` for the bare-name form of the same rule.
+        let at = position_of(names, name).or_else(|| alias_position(columns, name));
+        let Some(at) = at else {
             return false;
         };
         let Some(rc) = columns.get(at) else {

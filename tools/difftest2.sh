@@ -231,9 +231,65 @@ WEAK=0
 # from both so that it neither inflates the pass rate nor buries the refusals
 # where exactly one engine refused.
 WORDING=0
+# SELFREFUSED counts a statement both engines refused the same way. CORPUSGAP
+# counts one that ran on its own but whose DERIVED probe -- the single-layer
+# quote() rewrite the fallback asks -- was refused, which is what a statement
+# that reads a table an earlier section created looks like. Neither is an
+# agreement and neither is a disagreement, and both are reported apart from
+# both, because counting them as agreements would let a corpus that named every
+# table wrongly report a clean run, and counting them as disagreements would
+# blame an engine for the corpus's shape.
+SELFREFUSED=0
+CORPUSGAP=0
+# Per-section tallies of the same two things, so a WHOLELY suppressed section is
+# a failure rather than a line in a summary. A section whose every statement was
+# refused -- by both engines the same way, or because its derived probe could not
+# be built -- compared nothing at all, and the summary line is the last thing
+# anyone reads.
+#
+#   SEC_AGREE / SEC_TOTAL   agreements and statements in the current section
+#   SEC_DIFFS                disagreements in the current section
+#   SEC_SELF / SEC_GAP       SELFREFUSED and CORPUSGAP in the current section
+#
+# Measured on the corpus that motivated it: section m of tools/gen2.sql reads a
+# table section l creates, so all twelve of its statements were refused, and the
+# run reported `PASS: 12/12 statements agreed, 0 disagreed, 12 refusals worded
+# differently`. Nothing was compared and the run said PASS.
+SEC_AGREE=0; SEC_TOTAL=0; SEC_DIFFS=0; SEC_SELF=0; SEC_GAP=0
 SECTION_NAME=""
 SECTION_IDX=0
 STMT=""
+
+# 0 unless every statement of a section was refused without being compared.
+#
+# $1 the section's agreements, $2 its statement count, $3 its disagreements.
+#
+# A disagreement means something WAS compared and came out different, so the
+# section is not a green hole. An empty section is not a hole either -- it has
+# nothing in it, which is the corpus author's business and not a suppressed
+# verdict. So this is the four-argument form, used by the self-test; the runner
+# uses the six-argument one below, which is the same question with the two
+# refusal counters broken out.
+section_is_suppressed() {
+    _sec_is_suppressed "${1:-0}" "${2:-0}" "${3:-0}" 0 0
+}
+
+# The same question, with all five tallies.
+#
+# $1 agreements, $2 statements, $3 disagreements, $4 SELFREFUSED, $5 CORPUSGAP.
+#
+# A section fails when NOTHING in it was verified: no agreement, no
+# disagreement, and at least one statement that was only refused. That is the
+# shape of a section that reads a table another section created, and reporting
+# it as anything else -- an agreement, a pass, a line in a summary -- is the
+# defect this exists to stop.
+_sec_is_suppressed() {
+    local agree="${1:-0}" total="${2:-0}" diffs="${3:-0}"
+    [ "$agree" -gt 0 ] && return 1
+    [ "$diffs" -gt 0 ] && return 1
+    [ "$total" -gt 0 ] || return 1
+    return 0
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -824,9 +880,15 @@ strip_alias() {
 # everything from FROM onwards. Returns 1 when there is no top-level FROM, which
 # means the query is a bare SELECT of expressions.
 find_result_list() {
-    local rest i ch d=0 q j
+    local rest i ch d=0 q j start
     LIST=(); RTAIL=""
     rest="$1"
+    [ -n "$rest" ] || return 1
+
+    # The character before the keyword has to END a token. A keyword in the
+    # MIDDLE of a token is not a keyword, and the three-letter test alone cannot
+    # tell the two apart: `FROMY` is three letters that are not FROM, and
+    # `quote(1)FROM t` has a FROM that is not a clause.
     for ((i = 0; i < ${#rest}; i++)); do
         ch="${rest:$i:1}"
         case "$ch" in
@@ -842,16 +904,120 @@ find_result_list() {
             '(') d=$((d + 1)) ;;
             ')') d=$((d - 1)) ;;
         esac
-        if [ "$d" -eq 0 ] && [ "$ch" = 'F' ] && [ "${rest:$((i+1)):3}" = 'ROM' ]; then
+        if [ "$d" -eq 0 ] && [ "$ch" = 'F' ] && [ "${rest:$((i+1)):3}" = 'ROM' ] \
+           && [ "${rest:$((i-1)):1}" = ' ' ]; then
             split_top_level "${rest:0:$i}" LIST
             RTAIL=" FROM${rest:$((i + 4))}"
             [ "${#LIST[@]}" -gt 0 ] && return 0
             return 1
         fi
     done
+
+    # No FROM. The result list is a list only when it is the WHOLE of what
+    # follows SELECT, so a trailing WHERE, GROUP BY, HAVING, ORDER BY, LIMIT or
+    # OFFSET has to be split off as the tail and re-attached outside the quote()
+    # of each expression.
+    #
+    # There was no second pass before, so the loop fell out with the ENTIRE
+    # remainder as the one and only result item and every derived probe over a
+    # FROM-less query with a tail was malformed. Measured:
+    #
+    #     build_token_query "SELECT 1 WHERE 0"  ->  "SELECT quote(1 WHERE 0)"
+    #
+    # and that is a SYNTAX ERROR on both engines, which the runner recorded as
+    # CORPUSGAP -- the corpus statement is "not self-contained" -- and counted as
+    # neither an agreement nor a disagreement. A whole section of FROM-less
+    # queries with a WHERE, an ORDER BY or a LIMIT came out as
+    #
+    #     PASS: 0/31 statements agreed, 0 disagreed, 31 ... not self-contained
+    #
+    # which says nothing was wrong when in fact nothing was compared, and the
+    # engine defects the section was written to find were underneath it.
+    #
+    # The keyword needs the same two-sided boundary here. The trailing one is
+    # the one that matters: `a_group`, `x.limit` and `count_group` are column
+    # names whose quoting is the value under test, so a word boundary that is
+    # not an end-of-token test folds a column into the clause.
+    for ((i = 0; i < ${#rest}; i++)); do
+        ch="${rest:$i:1}"
+        case "$ch" in
+            "'"|'"'|'`')
+                q="$ch"
+                for ((j = i + 1; j < ${#rest}; j++)); do
+                    ch="${rest:$j:1}"
+                    if [ "$ch" = "$q" ]; then
+                        if [ "${rest:$((j+1)):1}" = "$q" ]; then j=$((j + 1))
+                        else i=$((j - 1)); break; fi
+                    fi
+                done ;;
+            '(') d=$((d + 1)) ;;
+            ')') d=$((d - 1)) ;;
+        esac
+        [ "$d" -eq 0 ] || continue
+        # `kwlen` is how many characters the CLAUSE header occupies, which for
+        # GROUP BY and ORDER BY is the WHOLE eight-byte header and not the five
+        # of the word alone.
+        #
+        # Two ways of getting that wrong, both silent and both measured:
+        #
+        #   * the length of `ORDER`, five, puts the end-of-token test on the
+        #     space between ORDER and BY, so the clause never matches at all;
+        #   * the length of `ORDER BY`, SEVEN -- which is what this first said,
+        #     because the space between the words looks like a separator rather
+        #     than a character -- takes seven bytes of `a  ORDER BY a` and gets
+        #     ` ORDER `, which is not `ORDER BY`, so it does not match either.
+        #
+        # Neither shows up as an error. The clause simply never matches, the
+        # query falls through to the no-tail path, and the whole tail is folded
+        # into the result list. It is counted in the self-test for that reason.
+        #
+        # The headers are written with an underscore because a list of `N:word`
+        # pairs cannot hold a space: with them written as `7:GROUP BY' 7:'ORDER
+        # BY'`, ${kw#*:} cuts at the FIRST colon, the two entries collapse into
+        # one -- `7:GROUP BY' 7:'ORDER` -- and `ORDER BY` is never a candidate
+        # at all. The underscore is put back into a space before the comparison.
+        for kwn in 5:WHERE 6:HAVING 5:LIMIT 6:OFFSET 8:GROUP_BY 8:ORDER_BY; do
+            kwlen="${kwn%%:*}"; kw="${kwn#*:}"
+            kw="${kw//_/ }"
+            [ "${rest:$i:$kwlen}" = "$kw" ] || continue
+            is_token_end "${rest:$((i + kwlen)):1}" || continue
+            # The result list is `${rest:0:i}` and the tail starts exactly at
+            # $i, so RTAIL can be cut by INDEX. It cannot be cut out of a
+            # trimmed copy of the list: trim drops the run of spaces in front of
+            # the keyword, and then `${tail:0:n}` no longer lands on the
+            # keyword. That is not a style question, it is a wrong answer, and it
+            # was measured:
+            #
+            #     find_result_list "a, b  ORDER BY a, b LIMIT 2"
+            #         LIST=(a b  ORDER BY a b)  RTAIL=" LIMIT"
+            #
+            # -- three result items instead of two, a RTAIL that says LIMIT
+            # rather than `LIMIT 2`, and a derived probe that is a syntax error
+            # on both engines. Which is the shape of every statement in the
+            # corpus's own LIMIT section, so all eight of them were recorded as
+            # "both engines refused, worded differently" and the section reported
+            # PASS 8/8 while statement six, `LIMIT -1 OFFSET 2`, is a real
+            # disagreement: three rows on sqlite3, none here.
+            split_top_level "${rest:0:$i}" LIST
+            [ "${#LIST[@]}" -gt 0 ] || continue
+            RTAIL="${rest:i}"
+            return 0
+        done
+    done
+
     split_top_level "$rest" LIST
     [ "${#LIST[@]}" -gt 0 ] && return 0
     return 1
+}
+
+# 0 when $1 is a character that can CONTINUE an identifier -- a letter, a digit
+# or an underscore -- and 1 when it cannot, so a caller can `|| continue` past a
+# word that is really the middle of a longer one.
+is_token_end() {
+    case "${1-}" in
+        ''|[A-Za-z0-9_]) return 1 ;;
+        *)               return 0 ;;
+    esac
 }
 
 # A leading DISTINCT lifted off the result list so it can be re-attached in
@@ -1010,12 +1176,23 @@ build_token_query() {
         # text '1' is the string '''1''' and the two engines would then be
         # asked a different question than the corpus asked.
         #
-        # The closing paren must be the LAST character of the item, not merely
-        # present somewhere in it. `quote(a) || b` also starts with `quote(` and
-        # also contains a `)`, and testing for the pair accepted it and produced
-        # `quote(quote(a) || b)`.
-        if [ "${item#quote(}" != "$item" ] && [ "${item%)}" = ')' ] \
-           && [ "$(paren_balanced "${item#quote()}")" = 1 ]; then
+        # The item must END in a paren, which is what makes it a whole call:
+        # `quote(a) || b` starts the same way but does not end in one.
+        # `${item%)}` REMOVES a trailing `)`, so it comes back different from the
+        # item exactly when the item ended in one. The first version asked the
+        # opposite question -- `[ "${item%)}" = ')' ]` -- which holds only when
+        # there is NO trailing paren, so the guard never fired.
+        #
+        # The balance check runs on the string INSIDE the parens, and the two
+        # strips are two steps rather than the nested `${item#quote(}%)}`. Bash
+        # parses that nested form as the literal `)}` -- it is a pattern, not a
+        # second expansion -- so it tested the string `a)%)}`, whose unbalanced
+        # paren made the guard answer no and every quote() in the corpus was
+        # wrapped a second time.
+        inner="${item#quote(}"
+        inner="${inner%)}"
+        if [ "$inner" != "$item" ] && [ "$inner" != "${item#quote(}" ] \
+           && [ "$(paren_balanced "$inner")" = 1 ]; then
             tok="$item"
         else
             # The alias is KEPT, and that is what makes ORDER BY work. The
@@ -1047,7 +1224,12 @@ build_token_query() {
     printf 'SELECT %s%s%s' "$lead" "$out" "$RTAIL"
 }
 
-# True when $1 has balanced parentheses outside of any quoted run.
+# Prints 1 when $1 has balanced parentheses outside of any quoted run, 0 when it
+# does not. It PRINTS its answer rather than returning a status, and every
+# branch has to reach the print: the first version used a bare `return 1` on the
+# unbalanced-close branch, which left that path printing nothing, so a caller
+# testing for the word `1` saw the empty string and the guard it guarded could
+# not have fired on the malformed input it exists to reject.
 paren_balanced() {
     local s="$1" i ch d=0 q=""
     for ((i = 0; i < ${#s}; i++)); do
@@ -1060,12 +1242,37 @@ paren_balanced() {
             "'"|'"'|'`') q="$ch" ;;
             '(') d=$((d + 1)) ;;
             ')') d=$((d - 1))
-                 [ "$d" -lt 0 ] && return 1 ;;
+                 [ "$d" -lt 0 ] && { printf '0'; return 0; } ;;
         esac
     done
-    [ "$d" -eq 0 ]
+    [ "$d" -eq 0 ] && printf '1' || printf '0'
+    return 0
 }
 
+# Sets the exit status: 0 when the two framed results are equal, 1 when they are
+# not, and PRINTS the reason when they are not.
+#
+# The printing is what makes the next function necessary. It used to be called
+# three times in a row on the same pair -- once for the raw comparison, once for
+# the token comparison, and once more to capture the reason into `$reason` -- and
+# because it reports on stdout, the last call put the message into `$reason`
+# three times over with no separator, AND the two earlier calls printed it
+# outside the report frame entirely.
+#
+# Measured, on the statement this runner is expected to get right:
+#
+#     $ bash tools/difftest2.sh probe.sql
+#     row counts differ: sqlite3 1, nsqlited 0
+#       first row only sqlite3 has: 0^_0^_'a'row counts differ: sqlite3 1, nsqlited 0
+#       first row only sqlite3 has: 0^_0^_'a'
+#     === disagreement #1 (section 1, statement 3) ===
+#       ...
+#       row counts differ: sqlite3 1, nsqlited 0
+#       first row only sqlite3 has: 0^_0^_'a'
+#
+# -- the first two lines at column zero are the leak, and the third is the same
+# text again inside a report that already says which rows differ. compare_rows
+# is asked whether two results are equal; it is never asked to narrate.
 compare_rows() {
     local r="$1" n="$2" cr cn
     # A result is ONE string of US-separated fields with a NEWLINE between rows,
@@ -1101,6 +1308,88 @@ compare_rows() {
         return 1
     fi
     return 0
+}
+
+# Which of the three section shapes a name selects. Named so the self-test can
+# check the dispatch without an engine: a section whose name begins with
+# `script2` is a plain section, and the prefix has to be `script` followed by
+# something that is not a word character.
+section_kind() {
+    case "${1-}" in
+        interop*) printf 'interop' ;;
+        script?*) printf 'script' ;;
+        script*)  printf 'script' ;;
+        *)        printf 'plain' ;;
+    esac
+}
+
+# The tables a script created, one name per line, for the row counts a script
+# section is judged on.
+#
+# The substitution is ONE `s` with the optional `IF NOT EXISTS` as an optional
+# GROUP and the name in group 3, which is what makes the name the same
+# reference whether the clause is there or not. Two shapes of this were wrong
+# first and both were silent:
+#
+#   * `CREATE TABLE` spelled in upper case only, with `*` where a run of
+#     whitespace was meant. `CREATE TABLE IF NOT EXISTS b(y)` then matched the
+#     word `IF` and reported a table called IF, and the row count asked of a
+#     table that does not exist is an error on both engines -- so the section
+#     scored a disagreement about a table it had invented.
+#   * the name captured as group 2 with the optional clause as group 1. When the
+#     clause is absent group 1 is empty and the name IS group 2, but the
+#     backreference is still written ``, and sed rejects an out-of-range one:
+#     `invalid reference  on 's' command's RHS`. Every table name came back
+#     empty and the row counts were of nothing.
+#
+# The keyword is spelled in upper case and the whitespace is written out as
+# `[[:space:]][[:space:]]*` because this has to work on whatever sed is on PATH:
+# BRE has no `I` flag and this machine's sed has no `-E`.
+#
+# It reads the CREATE TABLE statements out of the script rather than the schema
+# of the database afterwards, for two reasons: a table the script DROPPED is not
+# asked about, and a table a LATER statement renamed or replaced is asked about
+# by the name it still has.
+script_tables() {
+    # \ is the TEXT of the script, not a path. It was "$1"\ with
+    # a FILE PATH, so the function printed the path, sed found no CREATE TABLE
+    # in it, and every script section came back with no tables at all -- which
+    # means the row counts, the one thing that makes a transaction visible, were
+    # never asked. The section still reported the last result, so the h1 section
+    # disagreed and the h4 section did not, and the difference between those two
+    # answers was the extraction, not the engine.
+    printf '%s' "$1" \
+        | sed -n 's/^[[:space:]]*CREATE[[:space:]][[:space:]]*TABLE[[:space:]][[:space:]]*//p' \
+        | sed -n 's/^[[:space:]]*//p' \
+        | sed -n 's/^\(IF[[:space:]][[:space:]]*NOT[[:space:]][[:space:]]*EXISTS[[:space:]][[:space:]]*\)*//p' \
+        | sed -n 's/^[[:space:]]*//p' \
+        | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\).*/\1/p'
+}
+
+# Whether two framed results are equal, and PRINTS NOTHING.
+#
+# The wrapper exists because compare_rows reports its reason on stdout, which is
+# the same stream the run's own report is written to. A caller that wants the
+# answer and not the explanation has to say so, and the way it says so used to be
+# `if compare_rows ...; then`, which leaked both lines of the reason at column
+# zero before the report frame opened. This says it in one place instead.
+rows_equal() {
+    compare_rows "$1" "$2" >/dev/null
+}
+
+# Why two framed results differ, on STDOUT, for a `$( )` to capture.
+#
+# This is the only place a reason is captured, and it exists because
+# compare_rows writes to the same stream it is compared on: capturing the reason
+# with `reason="$(compare_rows ... || true)"` also runs the printing path a third
+# time, and the reason string comes back as the message three times over with no
+# separator. Here the reason is produced in a SUBSTITUTION OF ITS OWN -- stdout of
+# the subshell is the reason, and compare_rows' own stdout is thrown away -- so
+# asking for the reason has no second effect on the report.
+compare_rows_reason() {
+    local out
+    out="$(compare_rows "$1" "$2")"
+    printf '%s' "$out"
 }
 
 # The number of rows in a framed result: the row separators plus one, and zero
@@ -1162,6 +1451,7 @@ compare_row_fields() {
 report() {
     local reason="$1" r="$2" n="$3" detail="${4:-}"
     DIFFS=$((DIFFS + 1))
+    SEC_DIFFS=$((SEC_DIFFS + 1))
     if [ "$STOP" -eq 1 ]; then return 0; fi
     if [ "$MAXDIFF" -gt 0 ] && [ "$DIFFS" -ge "$MAXDIFF" ]; then
         STOP=1
@@ -1192,9 +1482,10 @@ report() {
 # is tallied separately, and the difference is that a token carries the storage
 # class on BOTH sides, so a blob and a text value of the same bytes still differ.
 compare_query() {
-    local sql="$1" ntoks="$2" rrows="$3" proj="$4"
+    local sql="$1" ntoks="$2" rrows="$3" proj="$4" praw="$5"
     local pn2 rproj nproj nc rc reason nrows nc1 nc2
     local tok rtok ntok nctok trrows tntoks
+    [ -n "$praw" ] || praw="$ntoks"
 
     # The typed path, when a projection could be built. Both engines are asked
     # the SAME question -- quote() of every output expression, under a generated
@@ -1224,11 +1515,11 @@ compare_query() {
                     "  the row values may still agree; the shape of the result does not"
                 return 0
             fi
-            if compare_rows "$rrows" "$ntoks"; then
+            if rows_equal "$rrows" "$ntoks"; then
                 AGREE=$((AGREE + 1)); STRICT=$((STRICT + 1))
                 return 0
             fi
-            reason="$(compare_rows "$rrows" "$ntoks" || true)"
+            reason="$(compare_rows_reason "$rrows" "$ntoks")"
             report "values differ (quote projection)" "$rrows" "$ntoks" \
                 "  $reason"$'\n'"  both sides are the engine's own quote() of the value" \
                 "  the comparison is exact: same rows, same order, same fields"
@@ -1253,27 +1544,68 @@ compare_query() {
         rtok="$(run_sqlite "$RDB" "$WORKDIR/tok.sql")"
         ntok="$("$NSQLITED" --testsuite "$NDB" 2>"$WORKDIR/n.err" < "$WORKDIR/tok.sql")"
         nctok="$(ncols_record "$ntok")"
+        if [ -s "$WORKDIR/r.err" ] || [ "$nctok" -lt 1 ]; then
+            # The derived question was refused. If the ORIGINAL statement was
+            # refused the same way, the two engines agree and there is nothing
+            # to say. If the original ran and the derived one did not, the
+            # corpus statement is not self-contained -- it reads a table an
+            # earlier section created -- and the databases being reset between
+            # sections is why. That is a property of the corpus, and reporting
+            # it as "the real engine returned no rows" against a correct answer
+            # is the runner lying about which side is wrong.
+            IN="$(cat "$WORKDIR/r.err" 2>/dev/null)"; rerr="$(norm_err)"
+            IN="$(cat "$WORKDIR/n.err" 2>/dev/null)"; nerr="$(norm_err)"
+            if [ -n "$rerr" ] && [ -n "$nerr" ] && same_refusal "$rerr" "$nerr"; then
+                SELFREFUSED=$((SELFREFUSED + 1)); SEC_SELF=$((SEC_SELF + 1))
+                [ "$VERBOSE" -eq 1 ] && printf '  (both engines refused this the same way: %s)\n' "$rerr"
+            else
+                CORPUSGAP=$((CORPUSGAP + 1)); SEC_GAP=$((SEC_GAP + 1))
+                [ "$VERBOSE" -eq 1 ] && printf '  (statement is not self-contained: the derived probe says %s)\n' "$rerr"
+                # Falling through to the last-resort comparison here would
+                # compare the real engine's EMPTY answer for the derived probe
+                # against this engine's rows for the ORIGINAL statement, and
+                # report the difference as an engine defect. It is not one: the
+                # original statement is answered correctly and is reported as
+                # unverified, which is what a corpus that reads another
+                # section's table deserves.
+                return 0
+            fi
+        fi
         if [ ! -s "$WORKDIR/r.err" ] && [ "$nctok" -ge 1 ]; then
             trrows="$(quote_rows "$rtok")"
             tntoks="$(record_tokens "$ntok")"
-            if compare_rows "$trrows" "$tntoks"; then
+            if rows_equal "$trrows" "$tntoks"; then
                 AGREE=$((AGREE + 1)); WEAK=$((WEAK + 1))
                 return 0
             fi
-            reason="$(compare_rows "$trrows" "$tntoks" || true)"
+            reason="$(compare_rows_reason "$trrows" "$tntoks")"
             report "values differ (quote() of each output expression)" "$trrows" "$tntoks" \
                 "  $reason"$'\n'"  both sides are the engine's own quote() of the value" \
                 "  the compared statement was: $tok"
             return 0
         fi
     fi
-    if compare_rows "$rrows" "$ntoks"; then
+    # The token query itself could not be built or was refused by both engines.
+    # The LAST resort still has to put the two sides in one alphabet, so the
+    # statement is compared through record_tokens rather than record_rows: the
+    # real engine is asked for quote() by the corpus statement itself, and this
+    # engine's raw record fields are hex, so comparing them to `.mode quote`
+    # output reports a difference for every value. The report says which
+    # transport was used, because this path is the weakest of the three.
+    if rows_equal "$rrows" "$(record_tokens "$praw")"; then
         AGREE=$((AGREE + 1)); WEAK=$((WEAK + 1))
         return 0
     fi
-    reason="$(compare_rows "$rrows" "$ntoks" || true)"
+    if rows_equal "$rrows" "$ntoks"; then
+        AGREE=$((AGREE + 1)); WEAK=$((WEAK + 1))
+        return 0
+    fi
+    reason="$(compare_rows_reason "$rrows" "$ntoks")"
     report "values differ (statement asked for quote() directly)" "$rrows" "$ntoks" \
-        "  $reason"$'\n'"  both sides are the engine's own quote() of the value"
+        "  $reason"$'\n'"  both sides are the engine's own quote() of the value" \
+        "  no single-layer token query could be built for this statement, so the" \
+        "  comparison is this engine's RAW record fields against sqlite3's quote" \
+        "  rendering -- a difference here is a token-format difference first"
     return 0
 }
 
@@ -1316,6 +1648,138 @@ AFTER() {
     cp -f "$WORKDIR/n.snap" "$NDB" 2>/dev/null
     cp -f "$WORKDIR/r.snap" "$RDB" 2>/dev/null
     rm -f "$NDB-journal" "$RDB-journal" 2>/dev/null
+    return 0
+}
+
+# --- a section that is ONE SCRIPT -------------------------------------------
+#
+# Everything above runs a section one statement at a time, and for almost every
+# question that is the right shape. It is the wrong shape for a TRANSACTION, and
+# wrong in a way that cannot be fixed by adding a statement to the corpus.
+#
+# A statement-by-statement run opens a connection per statement, so BEGIN and
+# ROLLBACK are two connections and a transaction is two single statements. The
+# read-back then reports what the engine did with the statements, and this engine
+# happens to refuse the two out of connection state -- `cannot start a
+# transaction within a transaction` on the BEGIN, and the same on the ROLLBACK --
+# which is a CORRECT refusal for two connections. So the section passes:
+#
+#     PASS: 27/27 statements agreed, 0 disagreed, 5 refusals worded differently
+#
+# for a transaction that is not a transaction. Both engines leave a table holding
+# 0 rows after `BEGIN; INSERT INTO tx VALUES(1); ROLLBACK;` on sqlite3, and 1
+# row here, and the section above compared neither.
+#
+# So a section whose name begins with `script` is run as ONE script per engine --
+# one spawn, one session, one connection -- and the LAST result each engine
+# prints is compared, plus the row count of the database afterwards. That is the
+# only shape in which a transaction is visible, and it is also the shape that
+# sees a failure PART WAY through: the state a script leaves is the state the
+# last few statements made, not the state the final statement alone would make.
+#
+# What this shape gives up, and what it is given instead:
+#
+#   * a statement in a script has no result of its own compared, so a script is
+#     compared by its ENDING -- the last result, and the row count of every table
+#     the script created. A script that ends in the right state is an agreement
+#     about the ending, not about each statement;
+#   * a disagreement inside a script is not attributed to a statement. The
+#     report says so, and names the script, so the next step is to bisect it by
+#     hand rather than to re-run a section;
+#   * the row counts are asked of the engine as VALUES, one query per table, and
+#     they are compared, so "the table ends up with the right number of rows" is
+#     a thing this runner can say rather than infer.
+#
+# The row-count query is built from the tables the script itself created, so
+# there is nothing to configure and a table the script dropped is not asked
+# about. It is `SELECT count(*) FROM <name>`, the two engines are asked the same
+# question, and the answers are compared as tokens by the same path every other
+# comparison uses.
+run_script_section() {
+    local idx="$1" body="$2" name="$3" f tbl
+    SECTION_IDX="$idx"; SECTION_NAME="$name"
+    SEC_AGREE=0; SEC_TOTAL=0; SEC_DIFFS=0; SEC_SELF=0; SEC_GAP=0
+    f="$WORKDIR/script.sql"
+    printf '%s' "$body" > "$f"
+    reset_pair
+
+    TOTAL=$((TOTAL + 1)); SEC_TOTAL=$((SEC_TOTAL + 1))
+    STMT="$(printf '%s' "$body" | tr '\n' ' ')"
+
+    local rerr nerr
+    rerr="$(run_sqlite "$RDB" "$f" 2>"$WORKDIR/r.err"; true)"
+    nerr="$("$NSQLITED" --testsuite "$NDB" < "$f" 2>"$WORKDIR/n.err")"
+
+    # A crash is not a disagreement and not an agreement: the engine died and
+    # there is no result to compare. It is counted separately, as everywhere
+    # else in this runner.
+    if grep -q 'panicked at' "$WORKDIR/n.err" 2>/dev/null; then
+        CRASH=$((CRASH + 1)); DIFFS=$((DIFFS + 1)); SEC_DIFFS=$((SEC_DIFFS + 1))
+        report "the engine PANICKED running the script: the process died, so there is no result to compare" \
+            "a result" "panicked: $(sed -n 's/.*panicked at //p' "$WORKDIR/n.err" | sed -n 1p)" \
+            "  a panic is a crash, not a wrong answer: the CLI exits non-zero"
+        return 0
+    fi
+
+    # The LAST result each engine printed. A script's ending is what its
+    # statements add up to, and comparing the ending is the only question a
+    # one-spawn-per-engine run can ask. The two streams are put in one alphabet
+    # first -- quote() on the real engine, the record tags decoded here -- so a
+    # difference is a difference in VALUES and not a difference in rendering.
+    local rrows nrows
+    # record_TOKENS on this side, for the same reason as the row counts below:
+    # the real engine's stream came through .mode quote, so it is already in the
+    # token alphabet, and record_rows decodes a record stream to its RAW fields
+    # instead. The last result of a script then came out as sqlite3=1 against
+    # nsqlited=I31 for the same single integer.
+    IN="$rerr"; rrows="$(quote_rows)"
+    IN="$nerr"; nrows="$(record_tokens)"
+
+    # The row count of every table the script created, asked of both engines.
+    # This is what makes a transaction visible: a rolled-back INSERT leaves a
+    # table with the row count it had before, and the count is a value.
+    local -a tables=()
+    while IFS= read -r tbl; do
+        [ -n "$tbl" ] || continue
+        tables+=("$tbl")
+    done < <(script_tables "$body")
+    for tbl in "${tables[@]}"; do
+        printf 'SELECT count(*) FROM %s;\n' "$tbl" > "$WORKDIR/one.sql"
+        local rc nc
+        IN="$(run_sqlite "$RDB" "$WORKDIR/one.sql")"; rc="$(quote_rows)"
+        # record_TOKENS, not record_rows. The count on the real engine side came
+        # through .mode quote, so it is a token -- a bare 2 -- and record_rows
+        # decodes this engine's record stream to its RAW fields, which for an
+        # integer is the hex payload I32. The two are in different alphabets and
+        # every row count of a script section came out as a disagreement, with
+        # sqlite3=2 against nsqlited=I32 for two rows either engine agrees on.
+        IN="$("$NSQLITED" --testsuite "$NDB" < "$WORKDIR/one.sql" 2>/dev/null)"
+        nc="$(record_tokens)"
+        if [ -z "$rc" ] && [ -z "$nc" ]; then continue; fi
+        STMT="SELECT count(*) FROM $tbl   (after the script)"
+        if rows_equal "$rc" "$nc"; then
+            AGREE=$((AGREE + 1)); SEC_AGREE=$((SEC_AGREE + 1))
+        else
+            local why
+            why="$(compare_rows_reason "$rc" "$nc")"
+            report "the script leaves $tbl with a different number of rows" "$rc" "$nc" \
+                "  $why"$'\n'"  this is a whole-script comparison, so a difference here is about" \
+                "  what the SCRIPT left, not about one statement"
+        fi
+        TOTAL=$((TOTAL + 1)); SEC_TOTAL=$((SEC_TOTAL + 1))
+    done
+
+    STMT="$(printf '%s' "$body" | tr '\n' ' ')"
+    if rows_equal "$rrows" "$nrows"; then
+        AGREE=$((AGREE + 1)); SEC_AGREE=$((SEC_AGREE + 1))
+    else
+        local why
+        why="$(compare_rows_reason "$rrows" "$nrows")"
+        report "the script leaves a different last result" "$rrows" "$nrows" \
+            "  $why"$'\n'"  both engines ran the WHOLE script in one session, one connection each," \
+            "  and this is the last result each printed" \
+            "  a disagreement here is about the script as a whole; bisect it by hand"
+    fi
     return 0
 }
 
@@ -1373,6 +1837,7 @@ run_section() {
     local idx="$1" body="$2" name="$3" f
     SECTION_IDX="$idx"
     SECTION_NAME="$name"
+    SEC_AGREE=0; SEC_TOTAL=0; SEC_DIFFS=0; SEC_SELF=0; SEC_GAP=0
     f="$WORKDIR/section.sql"
     printf '%s' "$body" > "$f"
     reset_pair
@@ -1402,6 +1867,48 @@ run_section() {
     for ((i = 0; i < nstmts; i++)); do
         run_one "${stmts[$i]}"
     done
+    close_section
+    return 0
+}
+
+# The verdict on the section that has just run: a section in which NOTHING was
+# verified is a FAILURE, counted as one, and named with both of its reasons.
+#
+# This is the gate the CORPUSGAP counter was missing. The counter suppresses a
+# symptom -- it stops a non-self-contained statement being reported as an engine
+# defect -- but it records nothing per statement, so a section made entirely of
+# such statements came out as a clean run:
+#
+#     $ bash tools/difftest2.sh tools/gen2.sql --section 13
+#     PASS: 12/12 statements agreed, 0 disagreed, 12 refusals worded differently
+#
+# for twelve statements that were never evaluated, because section m reads `ord`
+# and section l is what creates it, and the runner resets both databases between
+# sections. The summary said PASS and nothing was compared.
+#
+# The corpus is not in this file and is not this runner's to change, so the gate
+# reports the shape of the hole rather than only counting it: a reader is told
+# which section compared nothing and why its statements were refused. Fixing the
+# corpus is one line -- add the CREATE the section is missing -- and the gate
+# says so.
+close_section() {
+    section_is_suppressed "$SEC_AGREE" "$SEC_TOTAL" "$SEC_DIFFS" "$SEC_SELF" "$SEC_GAP" \
+        || return 0
+    [ "$SEC_TOTAL" -gt 0 ] || return 0
+    DIFFS=$((DIFFS + 1))
+    [ "$STOP" -eq 1 ] && return 0
+    printf '\n=== unsuppressed section #%d (section %d) ===\n' \
+        "$DIFFS" "$SECTION_IDX"
+    printf '  section:   %s\n' "$SECTION_NAME"
+    printf '  reason:    nothing in this section was verified: %d statements, %d agreed, %d disagreed, %d refused the same way on both engines, %d whose derived probe was refused\n' \
+        "$SEC_TOTAL" "$SEC_AGREE" "$SEC_DIFFS" "$SEC_SELF" "$SEC_GAP"
+    printf '  %s\n' "  every statement here was refused, so this section compared no value at all."
+    printf '  %s\n' "  the usual cause is a section that reads a table another section created,"
+    printf '  %s\n' "  and this runner resets both databases between sections. The fix is in the"
+    printf '  %s\n' "  corpus: make the section create everything it reads."
+    if [ -n "$WANT_SECTION" ]; then
+        printf '  %s\n' "  (only this section was run, so the table it reads may be in another one)"
+    fi
     return 0
 }
 
@@ -1411,6 +1918,7 @@ run_one() {
     STMT="$sql"
     CHECKPOINT
     TOTAL=$((TOTAL + 1))
+    SEC_TOTAL=$((SEC_TOTAL + 1))
     [ "$VERBOSE" -eq 1 ] && printf '\n[%d] %s\n' "$TOTAL" "$sql"
 
     printf '%s;%s' "$sql" "$NL" > "$WORKDIR/one.sql"
@@ -1430,11 +1938,27 @@ run_one() {
 
     # A statement that PRINTS A RESULT: the `C` record is there, and both sides
     # are asked for the same projection of the same expression.
+    #
+    # The token path asks the ENGINES a second, derived question, and that
+    # derived question can fail where the original one did not -- not because
+    # either engine is wrong but because the corpus statement is not
+    # self-contained. A section that reads a table an EARLIER section created is
+    # one: the databases are reset between sections, so the derived probe
+    # reports `no such table` on both sides and the raw comparison then reports
+    # "the real engine returned no rows" against a perfectly good answer.
+    # Measured on the corpus, section m reads `ord` from section l and creates
+    # nothing: eight of its twelve statements were reported that way.
+    #
+    # So before anything is compared, if BOTH engines refused the derived
+    # question the same way, that is the CORPUS's fault and it is reported as
+    # such -- not scored as a disagreement, and not silently counted as an
+    # agreement either, because then a corpus that named every table wrongly
+    # would report a clean run.
     if [ "${pn:0:2}" = 'C ' ]; then
         IN="$pr"; rrows="$(quote_rows)"
         IN="$pn"; nrows="$(record_rows)"
         proj="$(build_projection "$sql")"
-        compare_query "$sql" "$nrows" "$rrows" "$proj"
+        compare_query "$sql" "$nrows" "$rrows" "$proj" "$pn"
         AFTER "$?"
         return 0
     fi
@@ -1469,7 +1993,7 @@ run_one() {
     # Both accepted it. The STATE is not read here: a statement that succeeds
     # identically but leaves the table different is a difference in the answer,
     # and the next statement in the section is what sees it.
-    AGREE=$((AGREE + 1))
+    AGREE=$((AGREE + 1)); SEC_AGREE=$((SEC_AGREE + 1))
     AFTER 0
     return 0
 }
@@ -1590,10 +2114,10 @@ run_interop() {
                     continue
                 fi
                 r_out="$(printf '%s' "$r_out" | tr -d '\r')"
-                if compare_rows "$r_out" "$n_out"; then
+                if rows_equal "$r_out" "$n_out"; then
                     AGREE=$((AGREE + 1))
                 else
-                    local why; why="$(compare_rows "$r_out" "$n_out" || true)"
+                    local why; why="$(compare_rows_reason "$r_out" "$n_out")"
                     report "cross-engine read-back differs" "$r_out" "$n_out" \
                         "  $why"$'\n'"  left:  sqlite3, reading the file nsqlited wrote"$'\n'"  right: nsqlited, reading the file sqlite3 wrote" || true
                 fi ;;
@@ -1693,7 +2217,8 @@ self_test() {
     IN="$stream"; rrows="$(record_rows)"; IN="$rrows"; nf="$(count_fields)"
     check "a record row keeps one field per tag" "$nf" "3"
     IN="$(printf 'R -%s' "$NL")"; IN="$IN"; nf="$(count_fields)"
-    check "a row of one NULL tag is one field" "$nf" "1"    IN="$(printf 'C 1 T61%sR I31' "$NL")"; nf="$(record_rows)"
+    check "a row of one NULL tag is one field" "$nf" "1"
+    IN="$(printf 'C 1 T61%sR I31' "$NL")"; nf="$(record_rows)"
     check "record_rows drops the C record" "$nf" "I31"
     IN="$(printf 'C 1 T61')"; nf="$(record_rows)"
     check "record_rows on a stream with no rows is empty" "$nf" ""
@@ -1722,12 +2247,11 @@ self_test() {
     # two-column result was two strings that could never be equal, so every
     # multi-column comparison was a guaranteed difference.
     IN=""; fr="$(record_rows "$(printf 'C 2 T61%sR I31 I34%sR I35 I36' "$NL" "$NL")")"
-    fr="$(record_rows "$(printf 'C 2 T61%sR I31 I34%sR I35 I36' "$NL" "$NL")")"
-    fq="$(quote_rows "$(printf '31%s34%s35%s36' "$NL" "$US" "$US" "$NL" "$US")")"
+    fq="$(quote_rows "$(printf '31%s34\n35%s36' "$US" "$US")")"
     check "record_rows puts a newline between rows" "$fr" "I31${US}I34${NL}I35${US}I36"
     check "quote_rows puts a newline between rows" "$fq" "31${US}34${NL}35${US}36"
     check "the two transports frame a result identically" \
-        "$(compare_rows "$fq" "$(printf '31%s34%s35%s36' "$NL" "$US" "$US" "$NL" "$US")" >/dev/null 2>&1; echo $?)" "0"
+        "$(compare_rows "$fq" "31${US}34${NL}35${US}36" >/dev/null 2>&1; echo $?)" "0"
     # A row count counts ROWS. Dividing the byte length by the field separator
     # reports a one-row two-column result as four rows, and the count is what
     # every "row counts differ" message in a report is derived from.
@@ -1738,18 +2262,17 @@ self_test() {
     # tokens the real engine prints, which is the only reason the two sides are
     # in one alphabet. quote(7+3) is '10' on one engine and T3130 on the other
     # until this runs.
-    tk="$(record_tokens "$(printf 'C 3 T61 T62 T63%sR I31 T3130 B414243' "$NL")")"
+    tk="$(record_tokens "$(printf 'C 3 T61 T62 T63%sR I31 T3130 B414243%sR - T' "$NL" "$NL")")"
     check "an integer record field becomes the bare decimal" \
         "$(printf '%s' "$tk" | head -1 | cut -d"$US" -f1)" "1"
     check "a text record field becomes a quoted token, not hex" \
         "$(printf '%s' "$tk" | head -1 | cut -d"$US" -f2)" "'10'"
-    check "a NULL record field is the bare word NULL" \
-        "$(printf '%s' "$tk" | sed -n 2p)" "NULL"
     check "a blob record field keeps its class" \
-        "$(printf '%s' "$tk" | sed -n 2p | cut -d"$US" -f2)" "X'414243'"
-    tk="$(record_tokens "$(printf 'C 2 T61 T62%sR T B414243' "$NL")")"
+        "$(printf '%s' "$tk" | head -1 | cut -d"$US" -f3)" "X'414243'"
+    check "a NULL record field is the bare word NULL" \
+        "$(printf '%s' "$tk" | tail -1 | cut -d"$US" -f1)" "NULL"
     check "an empty text record field is an empty quoted string" \
-        "$(printf '%s' "$tk" | head -1 | cut -d"$US" -f1)" "''"
+        "$(printf '%s' "$tk" | tail -1 | cut -d"$US" -f2)" "''"
     check "a blob is not a text value of the same bytes" \
         "$(compare_rows "$(record_tokens "$(printf 'C 2 T61 T62%sR T B414243' "$NL")")" \
                        "X'414243'${NL}${SQT}ABC${SQT}" >/dev/null 2>&1; echo $?)" "1"
@@ -1873,6 +2396,190 @@ self_test() {
     check "INSERT refused" "$(build_projection 'INSERT INTO t VALUES(1)' >/dev/null 2>&1; echo $?)" "1"
     check "VALUES refused" "$(build_projection 'VALUES(1,2)' >/dev/null 2>&1; echo $?)" "1"
 
+    # --- the derived query, and the two counters that swallow a statement ---
+    #
+    # These were the two gates that hid a real defect, so they are checked
+    # here. Before this there was nothing in this function that mentioned
+    # SELFREFUSED or CORPUSGAP, which is why both could be wrong and still
+    # report `self-test: all 80 checks passed`.
+    #
+    # 1. A result list is a list only when it is the WHOLE of what follows
+    #    SELECT. A query with no FROM and a trailing WHERE, GROUP BY, HAVING,
+    #    ORDER BY, LIMIT or OFFSET has a tail, and the tail has to be re-attached
+    #    OUTSIDE the quote() of each expression. The version that had no such
+    #    pass produced
+    #        build_token_query "SELECT 1 WHERE 0"  ->  "SELECT quote(1 WHERE 0)"
+    #    which is a syntax error on BOTH engines, and a whole section of
+    #    FROM-less queries was then recorded as CORPUSGAP and reported as
+    #    `PASS: 0/31 agreed, 0 disagreed` -- nothing compared, nothing wrong.
+    # The output is compared with the SPACES THE STMT ITSELF CARRIES, and
+    # `emit_stmt` trims the statement, so a corpus line has no leading space and
+    # none after its commas. `SELECT 1 WHERE 0` therefore becomes the token query
+    # `SELECT quote(1)WHERE 0`, which is still the right query -- the space before
+    # a keyword is not required -- and writing the expectation with a space makes
+    # this check fail for a reason that has nothing to do with what it tests. The
+    # check that matters is the one below it: WHERE is OUTSIDE the quote() at all.
+    check "a FROM-less query keeps its WHERE outside the quote" \
+        "$(build_token_query "SELECT 1 WHERE 0")" "SELECT quote(1)WHERE 0"
+    check "a FROM-less query keeps its LIMIT outside the quote" \
+        "$(build_token_query "SELECT 1 LIMIT 1")" "SELECT quote(1)LIMIT 1"
+    check "a FROM-less query keeps its OFFSET outside the quote" \
+        "$(build_token_query "SELECT a OFFSET 2")" "SELECT quote(a)OFFSET 2"
+    check "a FROM-less query keeps its HAVING outside the quote" \
+        "$(build_token_query "SELECT count(*) HAVING 1")" "SELECT quote(count(*))HAVING 1"
+    # The tail itself, with the spaces `find_result_list` is handed, because that
+    # is where the two-word clauses live: `ORDER BY` with a space between its
+    # words is the shape every statement in the corpus's LIMIT section has, and
+    # `SELECT a, b  ORDER BY a, b LIMIT 2` is the case that was wrong.
+    # The clause header is EIGHT bytes, `ORDER BY`, and not the five of ORDER and
+    # not the seven a space-around-a-separator reading suggests. Getting that
+    # wrong is invisible: the clause never matches, the query falls through to
+    # the no-tail path, and the whole tail is folded into the result list -- which
+    # is how the shipped corpus's LIMIT section reported PASS while `LIMIT -1
+    # OFFSET 2` returns no rows here and three rows on sqlite3.
+    check "a FROM-less ORDER BY is a tail and not an expression" \
+        "$(find_result_list 'a ORDER BY a'; printf '%s|%s' "${#LIST[@]}" "$RTAIL")" \
+        "1|ORDER BY a"
+    check "a FROM-less GROUP BY is a tail and not an expression" \
+        "$(find_result_list 'a GROUP BY a'; printf '%s|%s' "${#LIST[@]}" "$RTAIL")" \
+        "1|GROUP BY a"
+    check "a two-item list keeps its whole two-word tail" \
+        "$(find_result_list 'a, b  ORDER BY a, b LIMIT 2'; printf '%s|%s' "${#LIST[@]}" "$RTAIL")" \
+        "2|ORDER BY a, b LIMIT 2"
+    check "a FROM-less ORDER BY is a tail and not an expression" \
+        "$(find_result_list 'a  ORDER BY a'; printf '%s|%s' "${#LIST[@]}" "$RTAIL")" \
+        "1|ORDER BY a"
+    # Two result items and a tail, through the whole rewrite. This is the shape
+    # of every statement in the shipped corpus's own LIMIT section, which
+    # reported `PASS: 8/8 agreed, 0 disagreed, 8 refusals worded differently`
+    # while `LIMIT -1 OFFSET 2` is a real disagreement -- three rows on sqlite3,
+    # none here. The comma splitter THROWS AWAY the spaces around a comma, so a
+    # tail cannot be cut out of a trimmed copy of the list: `${tail:0:n}` then no
+    # longer lands on the keyword. It is cut by INDEX instead.
+    check "a two-item list is not split by the ORDER BY in its own tail" \
+        "$(build_token_query "SELECT a, b FROM n ORDER BY a, b LIMIT 2")" \
+        "SELECT quote(a), quote(b) FROM n ORDER BY a, b LIMIT 2"
+    # The trailing boundary is what keeps a COLUMN out of the clause: `a_group`,
+    # `x.limit` and `count_group` are names whose quoting is the value under
+    # test, and folding one into a clause changes the question.
+    check "a column whose name ends in a clause word stays in the list" \
+        "$(find_result_list 'a_group  ORDER BY a_group'; printf '%s|%s' "${#LIST[@]}" "$RTAIL")" \
+        "1|ORDER BY a_group"
+    # A keyword needs the boundary on its LEFT too, or the result list is a
+    # fragment and the derived probe is a different question from the original.
+    # The list is `a  ORDER BY x` -- the two spaces survive, because there is no
+    # comma here for the splitter to strip them -- and the tail is whatever is
+    # left from the F, which is ` FROMY`: FROM with a Y is not a clause.
+    check "a clause word followed by more of the token is not a clause" \
+        "$(find_result_list 'a  ORDER BY x FROMY'; printf '%s|%s' "${#LIST[@]}" "$RTAIL")" \
+        "1| FROMY"
+
+    # --- the two counters that swallow a statement ---
+    #
+    # A statement that both engines refuse the same way is SELFREFUSED; a
+    # statement that RAN and whose derived probe was refused is CORPUSGAP.
+    # Neither is an agreement and neither is a disagreement, and a section made
+    # entirely of them is reported as a FAILURE, so a corpus that named every
+    # table wrongly cannot report a clean run.
+    #
+    # The corpus that did exactly that is in the repository: section m of
+    # tools/gen2.sql reads `ord`, which section l creates, and the runner resets
+    # both databases between sections. It reported
+    #     PASS: 12/12 statements agreed, 0 disagreed, 12 refusals worded differently
+    # for twelve statements that were never evaluated.
+    #
+    # None of this was in the self-test before, which is why both counters could
+    # be wrong and still print `self-test: all 80 checks passed`.
+    # The STATUS is 0 when the section is suppressed, which is the naming that
+    # reads correctly in the runner (`if section_is_suppressed ...; then fail`).
+    # It is read through `echo $?` rather than captured as output, because the
+    # function prints nothing and a check that took its stdout would be checking
+    # the empty string.
+    check "a section whose every statement was refused outright is suppressed" \
+        "$(section_is_suppressed 0 3 0; echo $?)" "0"
+    check "a section with an agreement in it is not suppressed" \
+        "$(section_is_suppressed 1 3 0; echo $?)" "1"
+    check "a section with a disagreement in it is not suppressed" \
+        "$(section_is_suppressed 0 3 1; echo $?)" "1"
+    check "an empty section is not suppressed" \
+        "$(section_is_suppressed 0 0 0; echo $?)" "1"
+    # A section of SELFREFUSED and of CORPUSGAP are suppressed in the same way,
+    # which is the property that matters: neither counter can be the one that
+    # decides a section is fine.
+    # Neither counter can be the one that decides a section is fine, which is the
+    # property that matters: SELFREFUSED and CORPUSGAP are the two ways a section
+    # can end up wholly unverified, and section m of tools/gen2.sql was one.
+    check "SELFREFUSED alone still suppresses the section" \
+        "$(_sec_is_suppressed 0 3 0 3 0; echo $?)" "0"
+    check "CORPUSGAP alone still suppresses the section" \
+        "$(_sec_is_suppressed 0 3 0 0 3; echo $?)" "0"
+    check "one verified statement clears the suppression" \
+        "$(_sec_is_suppressed 1 3 0 1 1; echo $?)" "1"
+
+    # --- a reason is captured once, and printing it is not a side effect ------
+    #
+    # compare_rows writes its reason to STDOUT, which is the stream it is
+    # compared on, so a bare `if compare_rows ...; then` printed the reason
+    # outside the report frame, and a `reason="$(compare_rows ...)"` printed it
+    # once more into the capture. Both are measured on one statement:
+    #
+    #     row counts differ: sqlite3 1, nsqlited 0
+    #       first row only sqlite3 has: 0^_0^_'a'row counts differ: sqlite3 1, nsqlited 0
+    #       first row only sqlite3 has: 0^_0^_'a'
+    #     === disagreement #1 ...
+    #
+    # -- the message three times, the last two run together, and the first two
+    # at column zero where no report has opened yet. compare_rows is asked
+    # whether two results are equal; it is never asked to narrate.
+    check "a captured reason names the difference once" \
+        "$(compare_rows_reason "i1${RS}i3" "i1" | grep -c 'row counts differ')" "1"
+    check "a captured reason still says which side has the extra row" \
+        "$(compare_rows_reason "i1" "i1${RS}i3" | grep -c 'only nsqlited has')" "1"
+    # Both lines of the reason go to STDOUT, so a bare
+    # `if compare_rows ...; then` leaks them into the report before the report
+    # has opened. This is the leak itself: the reason is two lines -- the counts
+    # and then the first row only one side has -- and neither belongs at column
+    # zero.
+    check "asking only about the status prints nothing" \
+        "$(rows_equal "i1${RS}i3" "i1" | cat)" ""
+
+    # --- a section that is one script ---------------------------------------
+    #
+    # A section named `script` is run as ONE script per engine, one connection
+    # each, and that is the only shape in which a TRANSACTION is visible at all.
+    # The statement-at-a-time run cannot see one: BEGIN and ROLLBACK become two
+    # connections, and this engine then correctly refuses both of them with
+    # `cannot start a transaction within a transaction`, so the section PASSES for
+    # a transaction that is not a transaction. Measured on the script section of
+    # tools/difftest2-finds.sql:
+    #
+    #     PASS: 27/27 statements agreed, 0 disagreed, 5 refusals worded differently
+    #
+    # with the database holding 0 rows on sqlite3 and 1 row here.
+    check "a section named script is a script section" \
+        "$(section_kind "script h a transaction is not a transaction")" "script"
+    check "a section named interop is an interop section" \
+        "$(section_kind "interop 8a a table written by each engine")" "interop"
+    check "a section named script2 IS a script section" \
+        "$(section_kind "script2 something else")" "script"
+    check "a plain section is a plain section" \
+        "$(section_kind "4e LIMIT with OFFSET")" "plain"
+    # One table name per line. The marker reads only CREATE TABLE: an index is
+    # not a table. It does NOT check for a CREATE TABLE inside a string literal,
+    # and does not claim to -- a script that builds one as text is a script this
+    # runner cannot take the row counts of, and the count it then reports is a
+    # smaller number rather than a wrong one.
+    check "the row counts asked of a script are the tables it created" \
+        "$(script_tables "CREATE TABLE a(x);
+CREATE TABLE IF NOT EXISTS b(y);
+CREATE INDEX i ON a(x);
+" | tr '\n' ',')" \
+        "a,b,"
+    check "and still answers with a failing status" \
+        "$(compare_rows "i1${RS}i3" "i1" >/dev/null 2>&1; echo $?)" "1"
+    check "and a failing pair names the difference when its output is read" \
+        "$(compare_rows "i1${RS}i3" "i1" 2>&1 | grep -c 'row counts differ')" "1"
+
     rm -f "$f"
     if [ "$fails" -eq 0 ]; then
         printf '\nself-test: all %d checks passed\n' "$ok"
@@ -1894,6 +2601,16 @@ ensure_rdb
 if [ -n "$ONE_SQL" ]; then
     SECTION_NAME="(ad-hoc)"; SECTION_IDX=0
     reset_pair
+    # The trailing `;` is stripped, because --sql takes a statement and people
+    # write one with its semicolon, and the DERIVED probe is built from this
+    # text and re-issued with its own `;` appended. Without the strip the probe
+    # is `SELECT quote(1);;` -- a syntax error on both engines -- and the run
+    # reports the ad-hoc statement as unverifiable for a reason that has nothing
+    # to do with it. Measured: `--sql "SELECT 1;"` came out as 1 CORPUSGAP and
+    # `--sql "SELECT 1"` as 1 agreement, for the same query.
+    ONE_SQL="$(trim "$ONE_SQL")"
+    ONE_SQL="${ONE_SQL%;}"
+    ONE_SQL="$(trim "$ONE_SQL")"
     STMT="$ONE_SQL"
     run_one "$ONE_SQL"
 elif [ -n "$CASE_FILE" ]; then
@@ -1911,6 +2628,7 @@ elif [ -n "$CASE_FILE" ]; then
         if [ -n "$WANT_SECTION" ] && [ "$i" != "$WANT_SECTION" ]; then i=$((i + 1)); continue; fi
         case "$name" in
             interop*) run_interop "$i" "$body" "$name" ;;
+            script*)  run_script_section "$i" "$body" "$name" ;;
             *)       run_section  "$i" "$body" "$name" ;;
         esac
         i=$((i + 1))
@@ -1921,6 +2639,8 @@ printf '\n%s: %d/%d statements agreed, %d disagreed' \
     "$([ "$DIFFS" -eq 0 ] && echo PASS || echo FAIL)" \
     "$AGREE" "$TOTAL" "$DIFFS"
 [ "$WORDING" -eq 0 ] || printf ', %d refusals worded differently' "$WORDING"
+[ "$SELFREFUSED" -eq 0 ] || printf ', %d statements both engines refused the same way' "$SELFREFUSED"
+[ "$CORPUSGAP" -eq 0 ] || printf ', %d statements whose probe failed though the statement ran (not self-contained)' "$CORPUSGAP"
 [ "$CRASH" -eq 0 ] || printf ', %d statements CRASHED the engine' "$CRASH"
 printf '\n     of the agreements, %d were strict (quote() projection the engine evaluated itself)' \
     "$STRICT"

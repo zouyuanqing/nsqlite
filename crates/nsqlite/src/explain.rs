@@ -32,6 +32,86 @@
 //! "what are the columns?" gets the right answer, and a caller asking "what are
 //! the opcodes?" gets an empty list rather than a plausible fabrication.
 //!
+//! An earlier version of this argument added that the cost is *invisible* to a
+//! suite comparing through `do_eqp_test`, on the grounds that the procedure
+//! reads the plan's `detail` words and never the row count. That claim was
+//! half right and has been dropped. `do_eqp_test` has two arms, and the arm
+//! that matters here is the whole-plan one, which fetches the plan with
+//! `query_plan_graph` and compares the result **for exact equality**; an empty
+//! listing does not merely fail to match, it produces a different number of
+//! `|--` lines. The suite is not indifferent to the row count -- it is
+//! indifferent only on the substring arm, where any absence of the expected
+//! words fails the same way.
+//!
+//! That is worth saying plainly because it is the one thing that *would* have
+//! justified the choice and does not. The decision stands anyway, and on the
+//! earlier half of the argument, which the shim has nothing to do with:
+//!
+//! * A fabricated listing is a lie about a machine this engine does not have.
+//!   It is not a *smaller* lie for being in SQLite's own words.
+//! * A plan-shaped listing is wrong in the columns as well as the values. The
+//!   opcode schema is eight columns wide and mostly numeric, so plan text
+//!   would have to be padded across integer columns to fit, and a column-name
+//!   check -- which passes today, because the names are right -- would start
+//!   failing too.
+//! * Empty is the only answer under which a caller that asks what the opcodes
+//!   are gets told "there are none" rather than something invented.
+//!
+//! So the listing is empty, and the reason is honesty, not a bet about what
+//! the suite measures. What is *bought* by the empty result is the column list,
+//! which is right, and the cost -- failing on content -- is paid either way,
+//! because a wrong listing fails on content too.
+//!
+//! # What is reachable, and what waits
+//!
+//! The parser has a branch for the keyword now, and the whole of this module
+//! is reachable from a statement. What is *not* reachable is a wrapped
+//! statement the executor refuses, because a query that cannot run cannot be
+//! planned: a sub-select in FROM and a CTE. Both are listed at the end of
+//! these docs, and both are refusals of `select` rather than of the planner --
+//! this module has a `CO-ROUTINE` line and plans a CTE through its body, and
+//! the tests in this crate reach both by calling [`execute`] directly.
+//!
+//! Re-measured through the *statement* after the parser arm was fixed, over the
+//! schema in `tests/explain_stmt.rs` -- `t1(a,b,c)` with `i1(b)` and `i2(b,c)`,
+//! `t2(x,y,z)` with `i4(x,y)`, `t3(p,q)` with `i3(p,q)` -- the *rendered plan
+//! graph* agrees with `sqlite3` on 15 of 21 statements, and the difference is
+//! drawn the way `test/shim/tester.tcl` draws it, from the `id`/`parent`
+//! columns. The 21 cover a plain scan, an index search, a two-term search, a
+//! range, a BETWEEN, a GLOB prefix, an IS NULL, a covering search, a two-table
+//! join, a LIST SUBQUERY, a SCALAR SUBQUERY, a CORRELATED SCALAR SUBQUERY, a
+//! MERGE compound, a LEFT JOIN, DISTINCT, GROUP BY, ORDER BY with and without a
+//! seek, `min(b), max(b)`, `c=1 ORDER BY b` and a third table.
+//!
+//! Five of the six that differ are the gaps written down further down, read the
+//! same way: the `minmax` rule (`SEARCH` where SQLite reads one end of the
+//! index with a `SeekEnd`), the index chosen for `c=1 ORDER BY b`, the LEFT
+//! JOIN's inner seek, the cost-model tie, and a sub-select with no covering
+//! index.
+//!
+//! The sixth is **a compound `UNION` this engine plans by a route SQLite does
+//! not take at all**, and it is the one that matters here because the module's
+//! table above says both spellings are reproduced:
+//!
+//! ```text
+//! SELECT a FROM t1 UNION SELECT p FROM t3
+//!   sqlite3  COMPOUND QUERY / LEFT-MOST SUBQUERY / SCAN t1 / UNION USING TEMP B-TREE / SCAN t3
+//!   here     MERGE (UNION) / LEFT / SCAN t1 / USE TEMP B-TREE FOR ORDER BY / RIGHT / SCAN t3
+//! ```
+//!
+//! Both choose a sorted merge of two sorted arms and both put a temp b-tree on
+//! the left, so the *work* is the same and only the wording differs -- but the
+//! wording is the thing `do_eqp_test` compares, and it is three lines against
+//! five. It is a cost-model difference: this planner has no statistics, so it
+//! cannot tell that `SCAN t3` is already ordered through `i3` and falls back
+//! to the merge spelling, where SQLite checks and finds it. `UNION ALL` and
+//! `EXCEPT` do match, measured, because neither is a merge decision.
+//!
+//! The one-line summary of what that means for the suite: the *wording* is
+//! reproduced and the *cost model* is not, and the suite's `do_eqp_test` cases
+//! check the wording -- so they pass where the two agree and fail on the text
+//! where they do not, which is the honest result.
+//!
 //! # `EXPLAIN QUERY PLAN`: a real plan, in SQLite's words
 //!
 //! This one is buildable and is what the suite's `do_eqp_test` cases actually
@@ -81,6 +161,14 @@
 //! | an `ORDER BY` term in the other direction | the index delivers that one term |
 //! | a merge arm read through a whole-table index | `SCAN t USING COVERING INDEX i` |
 //!
+//! One row of that table is not quite right, and the measurement at the top of
+//! these docs is where the correction is: a compound is merged here whenever it
+//! has to be sorted, including a `UNION`. SQLite decides it differently -- a
+//! `UNION` with both arms already ordered by an index is reported as
+//! `COMPOUND QUERY` with `UNION USING TEMP B-TREE` -- because it can see that
+//! the arms are sorted and this planner cannot. `UNION ALL` and `EXCEPT` do
+//! match either way, which is what the row says.
+//!
 //! # What this does not reproduce
 //!
 //! * **The cost model.** [`choose_index`] picks among indexes with documented
@@ -101,15 +189,46 @@
 //!   indexes are declared, both can serve the query, and the query text does
 //!   not change, so the winner is decided entirely by the row-count estimate.
 //!   [`Access::is_null_only`] is where the missing term would go.
+//!
+//!   Re-measured through the *statement* -- `EXPLAIN QUERY PLAN` run through a
+//!   connection rather than a hand-built catalog -- a sweep of 49 statements
+//!   over `t1(a,b,c)`, `t2(x,y,z)` and `t3(p,q)` with `i1(b)`, `i2(b,c)` and
+//!   `i3(p,q)` reproduces SQLite's plan text on 39. The ten that differ are the
+//!   three documented below -- a join, a sub-select in FROM and a CTE -- plus
+//!   `rowid`, and three more this section did not have:
+//!
+//!   | statement | SQLite | here |
+//!   |---|---|---|
+//!   | `SELECT * FROM t3 WHERE p=(SELECT max(p) FROM t3)` | `SEARCH t3 USING COVERING INDEX i3 (p=?)` | `SCAN t3` |
+//!   | `SELECT min(b), max(b) FROM t1` | `SCAN t1 USING COVERING INDEX i1` | `SEARCH t1 USING COVERING INDEX i1` |
+//!   | `SELECT * FROM t1 WHERE rowid=1` | `SEARCH t1 USING INTEGER PRIMARY KEY (rowid=?)` | `no such column: rowid` |
+//!
+//!   The first two are the same gap as the `max()` one already written down
+//!   below and are read the same way: SQLite folds a whole-table aggregate into
+//!   the outer scan, and this engine evaluates the sub-select per row.
+//!
+//!   `min(b), max(b)` is the same story for a query that is itself the
+//!   aggregate. SQLite recognises the bare minimum or maximum of an indexed
+//!   column -- the `minmax.c` optimisation -- and reads one end of the index
+//!   with a single `SeekEnd`, so it is a `SCAN` through a covering index and
+//!   not a `SEARCH`. This planner has no such rule: [`Access`] answers a
+//!   `SEARCH` for a seek it can describe, and a minimum is a seek it cannot.
+//!   `rowid` is not a gap in the *plan* at all -- `Access::rowid_lookup`
+//!   exists and names it -- but `rowid` is not a column the name resolver
+//!   knows, so the statement is refused before the plan is written. Both the
+//!   `minmax` rule and a `rowid` in `crate::resolve` are outside this module;
+//!   the first is a planner rule that wants a cost model to justify itself, and
+//!   the second is `resolve`'s list of implicit names.
 //! * **A join constraint between two columns.** `equalities` only accepts a
 //!   literal on the other side of `=`, because `a=b` pins neither column, and
 //!   that reasoning is right for a single table. SQLite reads a join constraint
 //!   as a seek on the *inner* table, so `SELECT * FROM t1 AS p, t1 AS q WHERE
 //!   p.b=q.b` is `SCAN p ~ SEARCH q USING INDEX i2 (b=?)` while this reports
 //!   `SCAN p ~ SCAN q`. One line per table is still the work the engine does;
-//!   what is missing is the seek. [`a_join_reports_a_line_per_table`] and
-//!   [`an_alias_names_the_access_line`] pin both sides of that difference
-//!   rather than hiding it.
+//!   what is missing is the seek. A test named
+//!   `a_join_reports_a_line_per_table` and another named
+//!   `an_alias_names_the_access_line` pin both sides of that difference rather
+//!   than hiding it.
 //! * **`AUTOMATIC INDEX` and `BLOOM FILTER ON`.** SQLite builds a transient
 //!   index on the inner side of a join whose constraint no index serves, and
 //!   reports it as `SEARCH t2 USING AUTOMATIC COVERING INDEX (x=?)` under a
@@ -266,6 +385,19 @@ const CONSTANT_ROW: &str = "SCAN CONSTANT ROW";
 /// The split is where the input ran out, not where the semicolon is: a
 /// semicolon that was actually written is a token and is named, and only an
 /// input that simply stopped reports `incomplete input`. See [`unexpected`].
+///
+/// The table above is the answer this function gives, and for a long while it
+/// was not the answer a *statement* gave, because the text never arrived with
+/// the `;` still in it. The parser's shared statement slice ended at the
+/// semicolon's start rather than its end, so `EXPLAIN;` handed over an empty
+/// string and this function reported `incomplete input` for input sqlite3
+/// words as `near ";": syntax error`. All three of `EXPLAIN;`, `EXPLAIN
+/// QUERY;` and `EXPLAIN QUERY PLAN;` were wrong that way, and so was the
+/// sibling `PRAGMA;` -- one rule, one bug, two callers. `parser::statement_end`
+/// now returns the end offset; the parser's own regression cases are in
+/// `tests/explain_stmt.rs`, which go through `parse_one` rather than calling
+/// this function, because a test that calls it directly cannot see the slice
+/// that is actually handed over.
 pub fn parse(rest: &str) -> Result<Explain> {
     let tokens = Tokenizer::tokenize_all(rest)?;
     let mut mode = Mode::Opcodes;

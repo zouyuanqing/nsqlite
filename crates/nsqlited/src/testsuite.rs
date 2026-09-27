@@ -214,7 +214,7 @@ pub fn run(conn: &mut Connection, sql: &str, out: &mut impl Write) -> bool {
         }
     };
     for stmt in stmts {
-        match conn.execute(&stmt) {
+        match conn.execute_with_text(&stmt, sql) {
             Ok(o) => emit(out, &o),
             Err(e) => {
                 // The bare message, not the Display form. The suite compares

@@ -166,6 +166,40 @@ pub fn aliases(columns: &[crate::parser::ResultColumn]) -> Vec<(String, Expr)> {
         .collect()
 }
 
+/// The spelling the schema holds for a column of `table`, or `None` when no
+/// such table or column is in the catalog.
+///
+/// A result column that is a direct reference is reported under the schema's
+/// name, not the statement's: `SELECT Bb FROM Users` names the column `Bb`
+/// whichever way the query wrote it, because the report is a description of
+/// the schema rather than a quotation of the query. It is also what makes
+/// `SELECT b AS bb FROM t ORDER BY BB` work -- the projection is matched
+/// against the reported names -- so the two spellings have to agree.
+///
+/// The result-column name is not a message, so the case rule does not apply to
+/// it; `no such column: Bb` and the reported column name `Bb` are the same
+/// text for different reasons. See `connection::column_name_with`.
+pub fn schema_column_name(
+    catalog: &crate::catalog::Catalog,
+    qualifier: &str,
+    column: &str,
+) -> Option<String> {
+    // The qualifier is whatever the query called the source, so it is an alias
+    // more often than not. The catalog holds tables, and there is no place in
+    // it that records which alias a query gave one, so an alias is looked up
+    // the only way it can be: through the FROM the caller has already
+    // resolved, and failing that, through the table whose name the qualifier
+    // is. A caller that has the FROM should resolve through it -- see
+    // `join::From` - and this is the fallback for a caller that does not, which
+    // is right whenever the query gave no alias.
+    let base = crate::join::strip_schema_qualifier(qualifier).unwrap_or(qualifier);
+    let t = catalog.get(base)?;
+    t.columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(column))
+        .map(|c| c.name.clone())
+}
+
 /// Every clause of a SELECT, as the resolver needs to see them.
 ///
 /// The clauses are one value rather than six arguments because each carries both

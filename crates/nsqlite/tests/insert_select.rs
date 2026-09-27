@@ -636,42 +636,27 @@ fn a_failed_large_insert_leaves_nothing_on_disk() {
 // --- the transaction the atomicity advice depends on -----------------------
 
 #[test]
-fn a_transaction_cannot_be_opened_on_a_database_file_that_does_not_exist_yet() {
-    // Why [`nsqlite::insert_select::ATOMICITY`] cannot tell a caller that
-    // wrapping the statement in BEGIN and COMMIT makes it atomic: on a fresh
-    // file it cannot be done at all.
+fn a_transaction_opens_on_a_database_file_that_does_not_exist_yet() {
+    // Measured on sqlite3 3.53.4, which accepts BEGIN on a path that does not
+    // exist and creates the file while doing it. An engine that refused would
+    // diverge on the first CREATE TABLE a test file does inside a transaction.
     //
-    // sqlite3 3.53.4 accepts BEGIN on a new file with no complaint, so this is
-    // a divergence with no oracle to match -- it is a limitation of this
-    // engine's pager, recorded so the advice is not read as a guarantee.
-    //
-    // `Pager::open` takes its `fresh` branch for a zero-length file and sets
-    // the pager's path to `None`, so `begin_journal` refuses for the whole
-    // lifetime of that connection -- not just before the first write. Creating
-    // a table in between does not help, because the file is still zero-length
-    // on disk until something flushes, and the connection keeps the same pager.
+    // This used to fail here: the pager took its fresh branch for a zero-length
+    // file and recorded no path at all, so begin_journal refused for the life of
+    // the connection. The path is now set on both branches, and a fresh file
+    // gets one because the engine creates it when it opens the database.
     let p = temp_path("fresh_begin");
     {
         let mut c = Connection::open(&p).expect("open a path that does not exist");
-        let e = fails(&mut c, "BEGIN");
-        assert!(
-            e.contains("an in-memory database cannot be journalled"),
-            "got {e:?}"
-        );
-        // A CREATE TABLE in the same connection does not make it possible.
+        run(&mut c, "BEGIN");
         run(&mut c, "CREATE TABLE t(a)");
-        let e = fails(&mut c, "BEGIN");
-        assert!(
-            e.contains("an in-memory database cannot be journalled"),
-            "still refused after a write: got {e:?}"
-        );
+        run(&mut c, "COMMIT");
+        assert!(p.exists(), "the file the database was opened on exists");
     }
-    // Once the file exists and has been closed, BEGIN works.
-    let mut c = Connection::open(&p).expect("reopen the now-existing file");
-    run(&mut c, "BEGIN");
-    assert!(c.in_transaction());
-    run(&mut c, "ROLLBACK");
-    assert!(!c.in_transaction());
+    // And the table survives, because it was committed.
+    let mut c = Connection::open(&p).expect("reopen");
+    let names = scalar(&mut c, "SELECT name FROM sqlite_schema");
+    assert_eq!(names, "t");
 }
 
 #[test]

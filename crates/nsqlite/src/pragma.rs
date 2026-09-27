@@ -266,7 +266,7 @@ impl<'a> PragmaParser<'a> {
     /// so does `PRAGMA "TABLE_INFO"(t)`.
     fn name_token_opt(&mut self) -> Option<String> {
         match self.advance() {
-            Some(Token::Identifier(n)) => Some(n),
+            Some(Token::Identifier(n)) | Some(Token::DoubleQuotedIdentifier(n)) => Some(n),
             Some(Token::Keyword(k)) => Some(k.as_str().to_string()),
             Some(Token::String(s)) => Some(s),
             _ => {
@@ -454,7 +454,10 @@ impl<'a> PragmaParser<'a> {
 /// all punctuation, and all of those are refused.
 fn is_a_pragma_value(tok: &Token) -> bool {
     match tok {
-        Token::Identifier(_) | Token::Keyword(_) | Token::String(_) => true,
+        Token::Identifier(_)
+        | Token::DoubleQuotedIdentifier(_)
+        | Token::Keyword(_)
+        | Token::String(_) => true,
         Token::Integer(_) | Token::Float(_) => true,
         // A sign is a value only with a number after it, which the caller
         // checks; here it is a value so that `PRAGMA x=-1` gets that far.
@@ -783,10 +786,16 @@ const ENDS_A_DEFAULT: &[Keyword] = &[
 /// quoted COLUMN name is reported with whatever case it had and the quoting
 /// does not change it.
 fn unquote(n: &str) -> String {
-    n.strip_prefix(['"', '`', '['])
-        .and_then(|w| w.strip_suffix(['"', '`', ']']))
-        .unwrap_or(n)
-        .to_string()
+    // Only the brackets are a matched pair; a `"` may be a *back* quote and
+    // the other way round, so the two are stripped independently. Stripping
+    // them as one set would leave `\"` and `` ` `` alone, and a declared type
+    // written that way would be reported with a stray quote on the front.
+    let n = n.strip_prefix('"').unwrap_or(n);
+    let n = n.strip_prefix('`').unwrap_or(n);
+    let n = n.strip_prefix('[').unwrap_or(n);
+    let n = n.strip_suffix('"').unwrap_or(n);
+    let n = n.strip_suffix('`').unwrap_or(n);
+    n.strip_suffix(']').unwrap_or(n).to_string()
 }
 
 /// One column of a table, as `PRAGMA table_info` sees it.
@@ -1025,7 +1034,9 @@ impl<'a> SchemaText<'a> {
         let mut i = p.pos;
         while i > 0 {
             i -= 1;
-            if let Some((Token::Identifier(n), _)) = p.tokens.get(i) {
+            if let Some((Token::Identifier(n) | Token::DoubleQuotedIdentifier(n), _)) =
+                p.tokens.get(i)
+            {
                 return Some(n.clone());
             }
         }
@@ -1077,7 +1088,9 @@ impl<'a> SchemaText<'a> {
     fn column(&mut self) -> Option<ColumnInfo> {
         let span = self.span();
         let name = match self.tokens.get(self.pos)? {
-            (Token::Identifier(_), _) | (Token::Keyword(_), _) => self.text(span),
+            (Token::Identifier(_), _)
+            | (Token::DoubleQuotedIdentifier(_), _)
+            | (Token::Keyword(_), _) => self.text(span),
             _ => return None,
         };
         self.pos += 1;
@@ -1182,10 +1195,15 @@ impl<'a> SchemaText<'a> {
                 Token::Keyword(k) if ENDS_A_TYPE.contains(k) => break,
                 Token::Punct(Punct::Comma) | Token::Punct(Punct::RParen) => break,
                 // A quoted name is a type, and SQLite reports it as the bare
-                // words without the quotes. The tokenizer hands a quoted
-                // identifier through as one `Identifier` whose text contains a
-                // space, so the quotes are stripped rather than the token
-                // refused: `c "Weird Type"` is a column c of that type.
+                // words without the quotes. Every quoted form arrives as an
+                // identifier whose text holds the whole run, so the quotes are
+                // stripped rather than the token refused: `c "Weird Type"` is a
+                // column c of that type, and `c [Weird Type]` is one too. The
+                // three are one arm because they are one case.
+                Token::DoubleQuotedIdentifier(n) => {
+                    words.push(unquote(n));
+                    self.pos += 1;
+                }
                 Token::Identifier(n) if n.contains(' ') => {
                     words.push(unquote(n));
                     self.pos += 1;
@@ -1522,7 +1540,11 @@ impl<'a> SchemaText<'a> {
         let start = self.pos;
         for (i, w) in words.iter().enumerate() {
             match self.tokens.get(self.pos) {
-                Some((Token::Identifier(n), _)) if n.eq_ignore_ascii_case(w) => self.pos += 1,
+                Some((Token::Identifier(n) | Token::DoubleQuotedIdentifier(n), _))
+                    if n.eq_ignore_ascii_case(w) =>
+                {
+                    self.pos += 1
+                }
                 Some((Token::Keyword(k), _)) if k.as_str().eq_ignore_ascii_case(w) => self.pos += 1,
                 _ => {
                     let _ = i;
@@ -1601,7 +1623,9 @@ impl<'a> SchemaText<'a> {
     /// whether it arrives as a keyword or a bare identifier.
     fn eat_word(&mut self, word: &str) -> bool {
         let matches_word = match self.tokens.get(self.pos).map(|(t, _)| t) {
-            Some(Token::Identifier(n)) => n.eq_ignore_ascii_case(word),
+            Some(Token::Identifier(n)) | Some(Token::DoubleQuotedIdentifier(n)) => {
+                n.eq_ignore_ascii_case(word)
+            }
             Some(Token::Keyword(k)) => k.as_str().eq_ignore_ascii_case(word),
             _ => false,
         };
@@ -1617,7 +1641,7 @@ impl<'a> SchemaText<'a> {
     fn name(&mut self) -> Option<String> {
         let t = self.tokens.get(self.pos).map(|(t, _)| t.clone())?;
         let out = match &t {
-            Token::Identifier(n) => n.clone(),
+            Token::Identifier(n) | Token::DoubleQuotedIdentifier(n) => n.clone(),
             Token::Keyword(k) => k.as_str().to_string(),
             _ => return None,
         };

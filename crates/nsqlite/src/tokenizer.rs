@@ -68,6 +68,12 @@ pub enum Token {
     /// keep their case because SQLite treats them as case-insensitive at the
     /// b-tree level but preserves what was written.
     Identifier(String),
+    /// A double-quoted name, which [`Token::Identifier`] is for every other
+    /// quoting. The variant is the only record of the character that opened
+    /// the name, and SQLite's `no such column: "x" - should this be a string
+    /// literal in single-quotes?` needs it, so it is kept rather than folded
+    /// into `Identifier` at scan time.
+    DoubleQuotedIdentifier(String),
     Keyword(Keyword),
     /// A single-quoted text literal, with `''` already resolved to `'`.
     String(String),
@@ -387,6 +393,34 @@ impl Keyword {
         Keyword::Within,
         Keyword::Without,
     ];
+
+    /// Whether this keyword is the first token of a *name* in the grammar --
+    /// the SELECT list, a WHERE, an ORDER BY term and the rest -- rather than
+    /// the keyword that opens the clause itself.
+    ///
+    /// This is what tells `SELECT FROM t` (a syntax error, because `FROM` opens
+    /// the FROM clause and there is nothing before it to select) from
+    /// `SELECT from_col FROM t` (a name, and a very ordinary one). A name is
+    /// read at the head of a clause before the expression grammar is
+    /// consulted, so the two cannot be told apart further in -- by then the
+    /// clause has already claimed its own keyword.
+    pub fn heads_a_name(self) -> bool {
+        !matches!(
+            self,
+            Keyword::Select
+                | Keyword::From
+                | Keyword::Where
+                | Keyword::Order
+                | Keyword::By
+                | Keyword::Group
+                | Keyword::Having
+                | Keyword::Limit
+                | Keyword::Offset
+                | Keyword::As
+                | Keyword::Asc
+                | Keyword::Desc
+        )
+    }
 
     /// The keyword's canonical spelling, always lowercase.
     pub fn as_str(self) -> &'static str {
@@ -995,7 +1029,18 @@ impl<'a> Tokenizer<'a> {
     fn scan_token(&mut self, ch: char, start: usize) -> Result<Token> {
         match ch {
             '\'' => Ok(Token::String(self.scan_quoted('\'', true, start)?)),
-            '"' => Ok(Token::Identifier(self.scan_quoted('"', true, start)?)),
+            // A double-quoted run is marked as one, because SQLite's own
+            // message about it says the quotes are there. `SELECT "a+b"` is
+            // `no such column: "a+b" - should this be a string literal in
+            // single-quotes?`, while `SELECT [a+b]` and ``SELECT `a+b``` are
+            // `no such column: a+b` -- the same unresolved name, and the only
+            // difference between the two messages is the character that opened
+            // it. Which is why the flag lives on the token rather than in the
+            // resolver: by the time a name fails to resolve the quoting has
+            // already been consumed.
+            '"' => Ok(Token::DoubleQuotedIdentifier(
+                self.scan_quoted('"', true, start)?,
+            )),
             '`' => Ok(Token::Identifier(self.scan_quoted('`', true, start)?)),
             '[' => Ok(Token::Identifier(self.scan_bracket(start)?)),
 
@@ -1440,6 +1485,12 @@ mod tests {
         Token::Identifier(s.to_string())
     }
 
+    /// A name written in double quotes, which is its own token so the quoting
+    /// survives to the `no such column` message that is about it.
+    fn dquoted(s: &str) -> Token {
+        Token::DoubleQuotedIdentifier(s.to_string())
+    }
+
     fn kw(s: &str) -> Token {
         Token::Keyword(Keyword::from_name(s).unwrap())
     }
@@ -1548,7 +1599,7 @@ mod tests {
 
     #[test]
     fn all_four_quoting_forms_are_accepted() {
-        assert_eq!(one("\"a b\""), ident("a b"));
+        assert_eq!(one("\"a b\""), dquoted("a b"));
         assert_eq!(one("[a b]"), ident("a b"));
         assert_eq!(one("`a b`"), ident("a b"));
         assert_eq!(one("'a b'"), Token::String("a b".into()));
@@ -1557,13 +1608,13 @@ mod tests {
     #[test]
     fn a_doubled_quote_is_that_quote() {
         assert_eq!(one("'a''b'"), Token::String("a'b".into()));
-        assert_eq!(one("\"a\"\"b\""), ident("a\"b"));
+        assert_eq!(one("\"a\"\"b\""), dquoted("a\"b"));
         assert_eq!(one("`a``b`"), ident("a`b"));
     }
 
     #[test]
     fn single_quotes_do_not_escape_inside_double_or_bracket_quotes() {
-        assert_eq!(one("\"a'b\""), ident("a'b"));
+        assert_eq!(one("\"a'b\""), dquoted("a'b"));
         assert_eq!(one("[a'b]"), ident("a'b"));
         assert_eq!(one("'a\"b'"), Token::String("a\"b".into()));
     }
@@ -1578,7 +1629,7 @@ mod tests {
 
     #[test]
     fn quoted_names_keep_their_case() {
-        assert_eq!(one("\"MixedCase\""), ident("MixedCase"));
+        assert_eq!(one("\"MixedCase\""), dquoted("MixedCase"));
         assert_eq!(one("[MixedCase]"), ident("MixedCase"));
         assert_eq!(one("`MixedCase`"), ident("MixedCase"));
     }
@@ -2158,7 +2209,7 @@ mod tests {
                 kw("select"),
                 ident("a"),
                 punct(Punct::Comma),
-                ident("b"),
+                dquoted("b"),
                 punct(Punct::Comma),
                 ident("c"),
                 kw("from"),

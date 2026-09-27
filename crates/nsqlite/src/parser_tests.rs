@@ -219,7 +219,7 @@ fn exists_and_cast_parse() {
     assert!(matches!(
         select_body("SELECT CAST(a AS INTEGER)"),
         SelectBody::Simple { columns, .. }
-            if matches!(&columns[0].expr, Expr::Cast { ty, .. } if ty == "integer")
+            if matches!(&columns[0].expr, Expr::Cast { ty, .. } if ty == "INTEGER")
     ));
 }
 

@@ -24,7 +24,7 @@
 
 use crate::catalog::Table;
 use crate::error::{Error, Result, ResultCode};
-use crate::msg::{self, Msg};
+use crate::msg::Msg;
 use crate::parser::{Expr, FromItem, JoinKind, TableRef};
 use crate::value::Value;
 
@@ -414,9 +414,11 @@ pub fn resolve_ref(
             // in that order. The schema is the part a query cannot spell any
             // other way -- it is a keyword -- so it needs no case handling.
             Some(t) => match t.split_once('.') {
-                Some((schema, table)) => {
-                    Msg::NoSuchColumnSchemaQualified.render(&[schema.into(), table.into(), name.into()])
-                }
+                Some((schema, table)) => Msg::NoSuchColumnSchemaQualified.render(&[
+                    schema.into(),
+                    table.into(),
+                    name.into(),
+                ]),
                 None => Msg::NoSuchColumnQualified.render(&[t.into(), name.into()]),
             },
             None => Msg::NoSuchColumn.render(&[name.into()]),
@@ -881,6 +883,72 @@ pub fn bind_all(from: &From, exprs: &[&Expr], aliases: &[String]) -> Result<Vec<
         // passes over the same tree because the first one has to fail on the
         // first bad name while the second collects all of them.
         check_unresolved(from, e, aliases)?;
+        bind_expr(from, e, &mut out);
+    }
+    Ok(out)
+}
+
+/// The schema's spelling of a column of the source `qualifier` names, or
+/// `None` when the FROM has no such source or the source has no such column.
+///
+/// A result column that refers straight at a table column is reported under
+/// the name the schema gave it, and the query may have reached that column
+/// through an alias -- so the qualifier is resolved against the FROM rather
+/// than against the catalog, which holds tables and no aliases. `SELECT p.x
+/// FROM a AS p` reports `x`, and it is the source called `p` that holds it.
+///
+/// An **empty** qualifier is the unqualified reference, which the resolution
+/// itself settles: the search is across every source, in FROM order, and the
+/// first one holding the column owns it. `SELECT BB FROM Users` reports `Bb`
+/// for the same reason `SELECT p.x` reports `x` -- the name is the schema's,
+/// whichever way the statement wrote it.
+pub fn schema_column_name(from: &From, qualifier: &str, column: &str) -> Option<String> {
+    let base = strip_schema_qualifier(qualifier).unwrap_or(qualifier);
+    let src = from
+        .sources
+        .iter()
+        .find(|s| base.is_empty() || s.name.eq_ignore_ascii_case(base))?;
+    src.table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(column))
+        .map(|c| c.name.clone())
+}
+
+/// The name the schema holds for the table a source reads, or `None` when the
+/// FROM has no source by that name.
+///
+/// A result column is reported under the *table's* name when `full_column_names`
+/// is on, and a query may have reached the table through an alias -- so the
+/// table is named by asking the source the alias resolved to, not by reading
+/// the alias itself. `SELECT p.x FROM a AS p` is `a.x` under `full` and `p.x`
+/// with `short_column_names` off, and the difference is exactly this.
+///
+/// An **empty** qualifier is the unqualified reference, and it resolves to the
+/// first source holding the column -- the same source the reference itself
+/// resolved to, which is what keeps `full_column_names` from naming a table
+/// the reference never read.
+pub fn source_table_name(from: &From, qualifier: &str) -> Option<String> {
+    let base = strip_schema_qualifier(qualifier).unwrap_or(qualifier);
+    from.sources
+        .iter()
+        .find(|s| base.is_empty() || s.name.eq_ignore_ascii_case(base))
+        .map(|s| s.table.name.clone())
+}
+
+/// Binds a set of expressions that have already been resolved.
+///
+/// [`bind_all`] re-checks every reference, which is what a statement's own
+/// terms want: an unknown name is reported before a row is read. A caller
+/// holding terms that came out of `orderby::resolve_keys` does not want that
+/// twice -- the names in those terms have already been resolved against the
+/// FROM and the result list, and the aliases they may stand for are not in the
+/// FROM at all, so the second check reads them as missing columns. `SELECT b AS
+/// bb FROM t ORDER BY BB` is that case: the key the statement wrote names the
+/// alias, and the key that comes back names the table's `b`.
+pub fn bind_all_lenient(from: &From, exprs: &[&Expr]) -> Result<Vec<Bound>> {
+    let mut out = Vec::new();
+    for e in exprs {
         bind_expr(from, e, &mut out);
     }
     Ok(out)

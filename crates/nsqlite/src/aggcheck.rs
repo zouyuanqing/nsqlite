@@ -600,9 +600,14 @@ fn has_column(cols: &[String], name: &str) -> bool {
 /// The two forms are `resolve.c:791-793`: a qualified and a bare name are
 /// printed the same way whichever way the name failed to resolve, so the
 /// message does not depend on *how* it was unresolvable — only on what it was
-/// written as. A doubly-quoted name gets a different sentence
-/// (`resolve.c:788-789`), which is the tokenizer's to choose and not this
-/// module's, so the bare form stands for it too.
+/// written as.
+///
+/// A bare name written in double quotes gets a third sentence, which this
+/// module can only be told about: `no such column: "a" - should this be a
+/// string literal in single-quotes?` is the message when the name was written
+/// `"a"`, and the quoting is gone by the time the name fails to resolve.
+/// So [`Ctx::double_quoted`] carries the names the statement wrote that way,
+/// and `name_error` is the one place that has to know about it.
 fn no_such_column(qualifier: Option<&str>, name: &str) -> String {
     match qualifier {
         Some(q) => format!("no such column: {q}.{name}"),
@@ -717,12 +722,33 @@ pub struct Ctx<'a> {
     /// which SQLite resolves before every other clause and whose failure ends
     /// the statement.
     projection: bool,
+    /// The names the statement wrote in double quotes, which a `no such
+    /// column` for one of them is a different sentence about.
+    ///
+    /// Set by [`Ctx::with_double_quoted`]. Empty -- the default -- means the
+    /// caller does not have the statement's text, and every name gets the plain
+    /// form, which is right for a name that was not written in double quotes
+    /// and is the only reading available for one that was.
+    double_quoted: &'a [String],
 }
 
 impl<'a> Ctx<'a> {
     /// A fresh check.
     pub fn new() -> Ctx<'a> {
         Ctx::default()
+    }
+
+    /// The check, told which names the statement wrote in double quotes.
+    ///
+    /// SQLite's `no such column` for a name written that way is
+    /// `no such column: "a" - should this be a string literal in
+    /// single-quotes?`, and the quoting is not in the name by the time this
+    /// walk reaches it. A caller with the statement's text reads the list off
+    /// it and hands it here; a caller without one leaves the default, which
+    /// reports the plain form.
+    pub fn with_double_quoted(mut self, names: &'a [String]) -> Ctx<'a> {
+        self.double_quoted = names;
+        self
     }
 
     /// Checks a statement and reports the error `sqlite3` would report, if any.
@@ -851,8 +877,15 @@ impl<'a> Ctx<'a> {
     /// FROM holds, so `aliases` is consulted first. A *qualified* name is
     /// never an alias — no alias is a column of any table — so only a bare one
     /// can be.
+    ///
+    /// The alias is matched without regard to case, because that is the one
+    /// name in a statement that may be spelled any way and still mean the same
+    /// column: sqlite3 answers `SELECT b AS bb FROM t ORDER BY BB` with the
+    /// rows, and so does `... ORDER BY Bb` against an alias written `bB`. Every
+    /// other name comparison in this module already ignores case, and an exact
+    /// one here made the whole statement `no such column: BB`.
     fn resolves(&self, aliases: &Aliases<'_>, qualifier: Option<&str>, name: &str) -> Option<bool> {
-        if qualifier.is_none() && aliases.iter().any(|(a, _, _)| a == name) {
+        if qualifier.is_none() && aliases.iter().any(|(a, _, _)| a.eq_ignore_ascii_case(name)) {
             return Some(true);
         }
         self.names.as_ref()?.resolves(qualifier, name)
@@ -1456,7 +1489,20 @@ impl<'a> Ctx<'a> {
         // written and `sqlite3ErrorMsg` keeps the later message (`util.c:268`).
         if let Expr::Column { table, name, .. } = expr {
             if let Some(false) = self.resolves(aliases, table.as_deref(), name) {
-                self.name_error(no_such_column(table.as_deref(), name));
+                let message = match table {
+                    // A qualified name is never the quoting's fault, so
+                    // `resolve.c:788-789` applies to a bare name only.
+                    Some(_) => no_such_column(table.as_deref(), name),
+                    None if self
+                        .double_quoted
+                        .iter()
+                        .any(|q| q.eq_ignore_ascii_case(name)) =>
+                    {
+                        crate::msg::Msg::NoSuchColumnDoubleQuoted.render(&[name.into()])
+                    }
+                    None => no_such_column(None, name),
+                };
+                self.name_error(message);
                 return;
             }
         }

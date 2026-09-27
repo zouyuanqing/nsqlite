@@ -52,6 +52,16 @@ pub struct EvalCtx<'a> {
     /// in which case every comparison converts nothing, exactly as SQLite does
     /// for `SELECT '5' = 5`.
     pub affinities: &'a std::collections::HashMap<usize, crate::affinity::Affinity>,
+    /// The double-quoted names in the statement being run.
+    ///
+    /// SQLite's `no such column` for a name written in double quotes is a
+    /// different sentence -- `no such column: "a+b" - should this be a string
+    /// literal in single-quotes?` -- and the only thing that distinguishes it
+    /// from the plain one is a character that is gone by the time the name
+    /// fails to resolve. So the names are collected from the statement's text
+    /// before it is evaluated and carried here, and a context built by hand
+    /// leaves the list empty and gets the plain message.
+    pub double_quoted: &'a [String],
 }
 
 /// A context with nothing in scope, which is what a test comparing two values
@@ -70,6 +80,7 @@ impl<'a> Default for EvalCtx<'a> {
             context: None,
             resolved: Vec::new(),
             affinities: crate::affinity_rules::no_affinities(),
+            double_quoted: &[],
         }
     }
 }
@@ -84,6 +95,7 @@ impl<'a> EvalCtx<'a> {
             context: None,
             resolved: Vec::new(),
             affinities: crate::affinity_rules::no_affinities(),
+            double_quoted: &[],
         }
     }
 
@@ -135,6 +147,30 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Result<Value> {
             }
             if let Some(v) = ctx.lookup(name) {
                 return Ok(v.clone());
+            }
+            // The name is echoed exactly as the statement wrote it. The engine
+            // never folds a name for a message, and the oracle does not either
+            // for a column reference: `SELECT BadCol` is `no such column:
+            // BadCol` and `SELECT NOSUCHCOL` is `no such column: NOSUCHCOL`.
+            // A *function* is the same way about (`no such function: XYZZY`),
+            // so the two are not in conflict -- the inconsistency the roadmap
+            // called out was that the engine folded the table side of the family
+            // and not the function side, and the resolution is that neither is
+            // folded. See the module docs in `msg`.
+            //
+            // A name written in double quotes is a third sentence rather than a
+            // second spelling, because sqlite3 reads the quotes as the mistake:
+            // `SELECT "a+b"` is `no such column: "a+b" - should this be a
+            // string literal in single-quotes?` while `SELECT [a+b]` is
+            // `no such column: a+b`. The quotes are the reason, so they are in
+            // the message.
+            if table.is_none()
+                && ctx
+                    .double_quoted
+                    .iter()
+                    .any(|q| q.eq_ignore_ascii_case(name))
+            {
+                return Err(msg::no_such_column_double_quoted(name));
             }
             match table {
                 // A qualified name that did not resolve usually means the table

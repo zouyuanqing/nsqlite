@@ -114,6 +114,29 @@ fn case_file() -> PathBuf {
         .to_path_buf()
 }
 
+/// The FINDINGS corpus: the statements whose disagreement was reduced to the
+/// smallest statement that still shows it.
+///
+/// It is a separate file from the main corpus, and a separate test, because the
+/// two are opposite in what they are for. The main corpus is a survey: it asks
+/// what the two engines do over a wide subject, and its disagreements are
+/// whatever falls out. This one is a list of statements each of which is known
+/// to differ, reduced by hand, so a run over it is a regression check on the
+/// findings themselves -- and the reduction is the point, because a finding
+/// that is still three statements long has not been reduced.
+///
+/// `DIFFTEST2_FINDS` points it elsewhere, and `DIFFTEST2_FINDS_SECTION` narrows
+/// a run to one section, which is how one finding is re-checked without paying
+/// for the other hundred-odd statements.
+fn finds_file() -> PathBuf {
+    if let Ok(p) = std::env::var("DIFFTEST2_FINDS") {
+        return PathBuf::from(p);
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools/difftest2-finds.sql")
+        .to_path_buf()
+}
+
 /// The shell that runs the runner script.
 ///
 /// `bash` on the Windows PATH is often the WSL launcher, which cannot see a
@@ -285,12 +308,16 @@ fn run_self_test() -> (bool, String, String) {
 /// apart. The full run is slow by nature: it is a differential test across two
 /// engines, and each statement is a process on each side.
 fn run_corpus(extra: &[&str]) -> (bool, String, String) {
+    run_case_file(&case_file(), extra)
+}
+
+/// The same, pointed at a corpus other than the default one.
+fn run_case_file(cases: &Path, extra: &[&str]) -> (bool, String, String) {
     let bin = difftest2_bin();
-    let cases = case_file();
     let bash = difftest2_bash();
     let mut cmd = Command::new(bash);
     cmd.arg(windows_path_to_shell(&bin));
-    cmd.arg(windows_path_to_shell(&cases));
+    cmd.arg(windows_path_to_shell(cases));
     for a in extra {
         cmd.arg(a);
     }
@@ -605,5 +632,297 @@ fn the_corpus_is_well_formed() {
             text.contains(shape),
             "the corpus must cover {shape}; it has been removed and the coverage is gone"
         );
+    }
+}
+
+/// The findings corpus as text, read once and cached.
+fn finds_text() -> String {
+    use std::sync::OnceLock;
+    static TEXT: OnceLock<String> = OnceLock::new();
+    TEXT.get_or_init(|| {
+        std::fs::read_to_string(finds_file()).unwrap_or_else(|e| {
+            panic!(
+                "reading the findings corpus {}: {e}",
+                finds_file().display()
+            )
+        })
+    })
+    .clone()
+}
+
+/// The FINDINGS corpus, run.
+///
+/// This one is *expected to fail*, and in a specific way. Every section in it
+/// holds statements whose disagreement between the two engines was reduced, by
+/// hand, to the smallest statement that still shows it, so a disagreement here
+/// is not a survey result that fell out of a wide subject: it is a defect that
+/// was chased down and pinned. The reduction is the point -- a finding that is
+/// still three statements long has not been reduced.
+///
+/// So the test does not assert that the engines agree. It asserts three things,
+/// each of which catches a different way this corpus going wrong:
+///
+/// * the runner compared something in EVERY section. That is the check the
+///   runner's own `CORPUSGAP` counter was missing, and fifteen sections of the
+///   main corpus turned out to need it: a section that reads a table another
+///   section created reported `PASS` while comparing nothing;
+/// * every reported disagreement names a statement, and that statement is one
+///   the corpus contains -- a report about a statement nobody wrote is a report
+///   about the runner, and the whole point of a reduced finding is that it can
+///   be typed into either shell;
+/// * the run reached a summary at all, so a runner that silently did nothing
+///   cannot look like a run that found nothing.
+///
+/// The count it prints is the number of findings still open.
+#[test]
+fn the_findings_corpus_is_measured() {
+    let bin = difftest2_bin();
+    let finds = finds_file();
+    if find_sqlite3().is_none() {
+        eprintln!("skipping: the real sqlite3 is not on PATH");
+        return;
+    }
+    if !nsqlited().exists() {
+        eprintln!("skipping: {} does not exist", nsqlited().display());
+        return;
+    }
+    if !bin.exists() {
+        eprintln!("skipping: {} does not exist", bin.display());
+        return;
+    }
+    if !finds.exists() {
+        panic!("the findings corpus {} does not exist", finds.display());
+    }
+
+    let mut extra: Vec<&str> = Vec::new();
+    if let Ok(s) = std::env::var("DIFFTEST2_FINDS_SECTION") {
+        if !s.is_empty() {
+            extra.push("--section");
+            extra.push(Box::leak(s.into_boxed_str()));
+        }
+    }
+    let (ok, stdout, stderr) = run_case_file(&finds, &extra);
+    let _ = ok;
+    if !stderr.is_empty() {
+        eprintln!("difftest2 stderr:\n{stderr}");
+    }
+    println!("{stdout}");
+
+    let normalised: String = stdout.replace("\r\n", "\n");
+    assert!(
+        normalised.contains("statements agreed"),
+        "the runner produced no summary, so nothing was compared.\ncorpus: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        finds.display()
+    );
+
+    // The check that matters most. A section in which nothing was verified is
+    // not a clean run: it is a hole. The runner now reports one by name, and
+    // this is the test that says a hole in THIS corpus is a failure. Before the
+    // gate existed, section m of tools/gen2.sql -- twelve statements over a
+    // table another section created -- reported
+    //
+    //     PASS: 12/12 statements agreed, 0 disagreed, 12 refusals worded
+    //     differently
+    //
+    // for twelve statements that were never evaluated, and fifteen sections of
+    // the main corpus did the same.
+    let unsuppressed: Vec<&str> = normalised
+        .lines()
+        .filter(|l| l.contains("unsuppressed section"))
+        .collect();
+    assert!(
+        unsuppressed.is_empty(),
+        "{} section(s) of the findings corpus compared nothing at all, and a runner that \
+         says PASS about a section it never asked a question of is worse than one that \
+         reports a disagreement. Each needs to create everything it reads.\n{}",
+        unsuppressed.len(),
+        unsuppressed.join("\n")
+    );
+
+    // Every disagreement names a statement the corpus holds.
+    let text = finds_text();
+    let reported: Vec<String> = normalised
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("statement: "))
+        .map(|s| s.trim().to_string())
+        .collect();
+    for s in &reported {
+        // A script section reports its whole body, joined onto one line with its
+        // semicolons as spaces, so it is split back into statements first.
+        if s.contains("; ") {
+            for part in s.split("; ") {
+                let p = part.trim().trim_end_matches(';');
+                if p.is_empty() || p.starts_with('(') {
+                    continue;
+                }
+                assert!(
+                    text.contains(p),
+                    "the runner reported a disagreement about a statement the corpus does not \
+                     contain:\n  {p}\nso the report is about the runner, not the engine"
+                );
+            }
+        } else {
+            assert!(
+                text.contains(s),
+                "the runner reported a disagreement about a statement the corpus does not \
+                 contain:\n  {s}\nso the report is about the runner, not the engine"
+            );
+        }
+    }
+
+    let summary = normalised
+        .lines()
+        .find(|l| l.starts_with("PASS:") || l.starts_with("FAIL:"))
+        .unwrap_or("(no summary line)");
+    eprintln!(
+        "the findings corpus reported {} disagreement(s).\n  {summary}\n  \
+         These are reduced, named defects; they stay open until the engine catches up.",
+        reported.len()
+    );
+}
+
+/// The findings corpus is well-formed, checked without running either engine.
+///
+/// The same rules the main corpus is held to, plus two that only apply here.
+///
+/// * Every section name begins with a subject letter, optionally after
+///   `script `. A name broken over two `###` lines produces two sections, the
+///   second named after the rest of the sentence -- which is a section of a
+///   corpus that silently lost half its names, and it happened while this
+///   corpus was being written.
+/// * The transaction sections are named with the `script` marker, because a
+///   transaction is invisible otherwise: run one statement at a time, `BEGIN`
+///   and `ROLLBACK` are two connections, both engines correctly refuse both of
+///   them, and the section passes while proving nothing. Measured on the
+///   statement-at-a-time form of the transaction section:
+///       PASS: 27/27 statements agreed, 0 disagreed, 5 refusals worded differently
+#[test]
+fn the_findings_corpus_is_well_formed() {
+    let text = finds_text();
+    let mut names: Vec<String> = Vec::new();
+    let mut bodies: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut seen = false;
+    for line in text.lines() {
+        if let Some(name) = line.strip_prefix("###") {
+            if seen {
+                bodies.push(std::mem::take(&mut cur));
+            }
+            seen = true;
+            names.push(name.trim().to_string());
+        } else {
+            cur.push_str(line);
+            cur.push('\n');
+        }
+    }
+    if seen {
+        bodies.push(cur);
+    }
+
+    assert!(!names.is_empty(), "the findings corpus has no sections");
+    assert_eq!(names.len(), bodies.len(), "every section needs a body");
+
+    for (i, n) in names.iter().enumerate() {
+        assert!(
+            !n.is_empty(),
+            "findings section {} has an empty name",
+            i + 1
+        );
+        let subject = n.strip_prefix("script ").unwrap_or(n);
+        let first = subject.split_whitespace().next().unwrap_or("");
+        assert!(
+            first
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_lowercase())
+                .unwrap_or(false),
+            "findings section {i} ({n}) does not begin with a subject letter. Every name here \
+             is `### <letter> ...` or `### script <letter> ...`, so a name that is not is a \
+             line of prose left with a `###` on it -- which opens a section named after the \
+             rest of the sentence."
+        );
+    }
+
+    // The subjects the corpus was written for. Losing any of these would not
+    // make it fail; it would make it quietly cover less than it claims.
+    for shape in [
+        "### a ",        // a WHERE on a SELECT with no FROM
+        "### b ",        // LIMIT and OFFSET coercion
+        "### c ",        // a non-finite real
+        "### d ",        // a string function's storage class
+        "### e ",        // rowid
+        "### f ",        // a qualified star in a join
+        "### g ",        // the schema pragmas and the column-name settings
+        "### script h1", // a rolled-back INSERT, in one session
+        "### script h5", // a rolled-back CREATE TABLE, in one session
+        "### i ",        // an index and the order of an unordered scan
+        "### j ",        // the control for section i
+        "### k ",        // what a runner defect left uncompared
+    ] {
+        assert!(
+            text.contains(shape),
+            "the findings corpus must cover {shape}; it has been removed and the coverage is gone"
+        );
+    }
+
+    let scripts = names.iter().filter(|n| n.starts_with("script ")).count();
+    assert!(
+        scripts >= 5,
+        "the findings corpus has {scripts} `script` sections; the transaction sections have to \
+         be run as one script per engine or BEGIN and ROLLBACK become two connections and \
+         both engines correctly refuse both of them"
+    );
+
+    // Every section creates what it reads. A `SELECT` over a table this section
+    // did not create compares nothing, and the runner now fails such a section
+    // rather than reporting it as agreement -- but the corpus is the thing that
+    // should be fixed, and this is the check that says so before a run does.
+    for (i, (name, body)) in names.iter().zip(bodies.iter()).enumerate() {
+        let mut created: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let l = line.trim();
+            let upper = l.to_ascii_uppercase();
+            if let Some(rest) = upper.strip_prefix("CREATE TABLE") {
+                let name_part = rest.trim_start();
+                let bare = name_part
+                    .split(|c: char| c == '(' || c == ';' || c.is_whitespace())
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if !bare.is_empty() {
+                    created.push(bare);
+                }
+            }
+        }
+        for line in body.lines() {
+            let l = line.trim();
+            if !l.to_ascii_uppercase().starts_with("SELECT") || !l.contains(" FROM ") {
+                continue;
+            }
+            let from = l
+                .to_ascii_uppercase()
+                .find(" FROM ")
+                .map(|p| p + 6)
+                .unwrap_or(0);
+            let tail = &l[from..];
+            let table = tail
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .find(|t| !t.is_empty())
+                .unwrap_or("");
+            // `sqlite_master` and the pragma tables are not this section's.
+            if table.is_empty()
+                || table == "sqlite_master"
+                || table.starts_with("pragma_")
+                || table == "count(*)"
+            {
+                continue;
+            }
+            assert!(
+                created.iter().any(|c| c.eq_ignore_ascii_case(table)),
+                "findings section {i} ({name}) selects from `{table}` but never creates it, and \
+                 this runner resets both databases between sections -- so every statement in \
+                 it is refused and the section compares nothing"
+            );
+        }
     }
 }
