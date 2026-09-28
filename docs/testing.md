@@ -953,13 +953,52 @@ the same change or the suite will still not be able to check it. `SELECT rowid
 FROM t` is the case to fix first: the gap is real, and `sqlite3` returns `1`
 for it.
 
-> **CONFIRMED STILL OPEN.** Re-measured 2026-09-28, both halves: `SELECT rowid
-> FROM t` → `E no such column: rowid`, and `SELECT last_insert_rowid()` → `E no
-> such function: last_insert_rowid`. This is now the **highest-value single
-> item on the list**, because it is a small, self-contained change that unblocks
-> the four `rowid*.test` files, a chunk of `hexlit`, and the row-identity
-> assertions in `insert`/`update` — and unlike the items above, nothing else on
-> this list has to be finished first.
+> **PARTLY CLOSED — measured 2026-09-28, and the numbers are the point.**
+> `rowid`, `_rowid_` and `oid` all resolve now, bare and table-qualified, and
+> case-insensitively (`RowID`, `ROWID`, `oId` all work), and they resolve in
+> `WHERE` as well as the select list. A suite file written to pin exactly that
+> passes 8 of 8:
+>
+> ```sh
+> tools/run_suite.sh 'colnames.test'      # 0 errors out of 8 tests
+> ```
+>
+> What moved, measured against the same suite runner:
+>
+> | file | before | after |
+> | --- | --- | --- |
+> | `rowid.test` | 206 errors / 221 cases | **178** / 221 |
+> | `hexlit.test` | 2 / 132 | **1** / 132 |
+> | `intpkey.test` | 47 / 95 | **27** / 95 |
+>
+> **Read the direction of that table carefully.** Every error count went *down*
+> while the case count held, which is the good direction — but the reason the
+> counts fell is not that 100 tests started passing on their merits. Of
+> `rowid.test`'s 178 remaining failures, **100 are the same missing harness
+> command**: `invalid command name "restore_prng_state"`, 100 occurrences,
+> against 1 for `save_prng_state`. Those tests are all inside one
+> I/O-fault-injection section, and both procs are **undefined in the upstream
+> suite too** — `test/sqlite-suite/test/tester.tcl` only *calls* them, and the
+> C testfixture supplies them. So this is a **harness ceiling**, not a gap to
+> close: a CLI shim cannot inject an I/O failure into a process it does not own.
+> The other two files that use them are `bitvec.test` and `walslow.test`, and
+> `bitvec.test` skips 0-of-0 for the same reason.
+>
+> `last_insert_rowid()` is **still open**, and it is worth being precise about
+> why, because the answer is not "the engine has not got round to it":
+>
+> ```sh
+> $ sqlite3 li.db "CREATE TABLE t(a); INSERT INTO t VALUES(100);"
+> $ sqlite3 li.db "SELECT last_insert_rowid();"    # -> 0   in a FRESH process
+> $ sqlite3 li.db "SELECT rowid,a FROM t;"         # -> 1|100
+> ```
+>
+> **The reference returns 0 too.** The value is not on disk and the file format
+> does not preserve it; it lives in the connection. `fts4lastrowid.test` expects
+> `3`, because it measures inside a single `execsql` block — which is exactly
+> the shape this shim's one-process-per-statement model cannot express. So
+> `last_insert_rowid()` is not a roadmap item for the engine at all; it is
+> blocked on the shim, and it should be read as harness work.
 
 **14. `BEGIN` on a file that did not exist when the process opened it.**
 `Pager::open` builds its fresh-file branch (`len == 0`) with `path: None` and
