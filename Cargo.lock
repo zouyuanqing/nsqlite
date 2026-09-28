@@ -139,6 +139,7 @@ dependencies = [
 name = "nsqlite-vector"
 version = "0.1.0"
 dependencies = [
+ "nsqlite",
  "serde",
  "serde_json",
  "ureq",

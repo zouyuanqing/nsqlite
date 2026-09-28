@@ -11,6 +11,15 @@ ureq = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# The test that the shadow tables' CREATE TABLE text is accepted by the engine's
+# own parser is the one check that storage and the catalog cannot drift apart
+# silently, and it needs the engine. A dev-dependency, not a real one: this
+# crate does not use the engine, and must not -- the engine is what plugs the
+# vec0 module in, so a dependency the other way would be the integration
+# contract expressed as a cycle.
+[dev-dependencies]
+nsqlite = { path = "../nsqlite" }
+
 [lib]
 name = "nsqlite_vector"
 path = "src/lib.rs"

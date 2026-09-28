@@ -391,6 +391,8 @@ fn eval_literal(lit: &Literal, ctx: &EvalCtx<'_>) -> Result<Value> {
     Ok(match lit {
         Literal::Null => Value::Null,
         Literal::Integer(i) => Value::Integer(*i),
+        // Unnegated 2^63, which does not fit an i64, so it is a real.
+        Literal::Big(v) => Value::real(*v as f64),
         Literal::Real(r) => Value::real(*r),
         Literal::Text(s) => Value::Text(s.clone()),
         Literal::Blob(b) => Value::Blob(b.clone()),
@@ -435,7 +437,13 @@ fn unary(op: UnaryOp, v: Value) -> Result<Value> {
         }
         UnaryOp::Negate => match v {
             Value::Null => Value::Null,
-            Value::Integer(i) => Value::Integer(i.wrapping_neg()),
+            Value::Integer(i) => match i.checked_neg() {
+                    Some(v) => Value::Integer(v),
+                    // The most negative integer has no positive counterpart,
+                    // so the answer is a real rather than a wrap back to
+                    // itself.
+                    None => Value::real(-(i as f64)),
+                },
             Value::Real(r) => Value::real(-r),
             // Negating text is not a conversion SQLite performs; the whole
             // expression is a datatype mismatch rather than a silent zero.
@@ -837,12 +845,15 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
             expect_arity(name, args, 1)?;
             Ok(match &args[0] {
                 Value::Null => Value::Null,
-                // wrapping_abs on i64::MIN gives i64::MIN back, so the
-                // magnitude of the most negative integer has to come from the
-                // float path rather than wrapping.
+                // abs of the most negative integer has no integer answer,
+                // and sqlite3 reports that rather than returning the number
+                // unchanged or widening it to a real. Measured: SELECT
+                // abs(-9223372036854775808) is "integer overflow" in 3.53.4.
                 Value::Integer(i) => match i.checked_abs() {
                     Some(v) => Value::Integer(v),
-                    None => Value::real(-(*i as f64)),
+                    None => {
+                        return Err(Error::new(ResultCode::Error, "integer overflow"));
+                    }
                 },
                 Value::Real(r) => Value::real(r.abs()),
                 other => numeric_of(other),
@@ -889,14 +900,6 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
             Ok(match &args[0] {
                 Value::Null => Value::Null,
                 Value::Text(s) => Value::Text(s.to_lowercase()),
-                other => other.clone(),
-            })
-        }
-        "upper" => {
-            expect_arity(name, args, 1)?;
-            Ok(match &args[0] {
-                Value::Null => Value::Null,
-                Value::Text(s) => Value::Text(s.to_uppercase()),
                 other => other.clone(),
             })
         }
@@ -1137,7 +1140,26 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
         // with `no such function: XYZZY`, so a test that writes the name in
         // mixed case and compares the message needs the original spelling.
         // The arity error above already reads `name` for the same reason.
-        _ => Err(msg::no_such_function(name)),
+        // The math and string modules carry the wider set and were written
+        // against the oracle function by function. They are consulted after the
+        // arms above so the behaviour already pinned by this module's own tests
+        // is not shadowed by a second implementation of the same name.
+        //
+        // `None` means the name is not one of theirs. The lowercased name is
+        // what they match on, since the engine folds an identifier and the
+        // message keeps the original spelling.
+        _ => {
+            if let Some(v) = crate::func_math::call(&lname, args)? {
+                return Ok(v);
+            }
+            if let Some(v) = crate::func_string::call(&lname, args)? {
+                return Ok(v);
+            }
+            // The name is reported as it was written, not as the lowercased form
+            // the dispatch matches on. sqlite3 3.53.4 answers `SELECT XYZZY(1)`
+            // with `no such function: XYZZY`.
+            Err(msg::no_such_function(name))
+        }
     }
 }
 

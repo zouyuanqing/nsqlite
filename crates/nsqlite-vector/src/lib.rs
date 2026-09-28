@@ -46,8 +46,10 @@
 mod config;
 mod embed;
 mod error;
+pub mod index_store;
 mod rerank;
 pub mod search;
+pub mod vtab;
 
 pub use config::{
     ClientConfig, DEFAULT_BASE_URL, DEFAULT_EMBED_MODEL, DEFAULT_RERANK_MODEL, DEFAULT_TIMEOUT,
@@ -57,8 +59,13 @@ pub use embed::{
     MAX_BATCH_SIZE,
 };
 pub use error::{ApiErrorDetail, ApiErrorEnvelope, VectorError};
+pub use index_store::{RowStore, StoreError, StoredRow, Vec0Table};
 pub use rerank::{
     parse_rerank_response, parse_rerank_response_bounded, RerankClient, RerankRequest, RerankResult,
+};
+pub use vtab::{
+    Column, ColumnKind, Constraint, Cursor, Plan, PlanError, Row, RowUpdate, Schema, VTab,
+    VTabError, Vec0Module, VirtualTable, DISTANCE_COLUMN, ENGINE_CONTRACT,
 };
 
 use std::time::Duration;

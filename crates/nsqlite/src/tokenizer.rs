@@ -80,6 +80,10 @@ pub enum Token {
     /// An `x'..'` blob literal.
     Blob(Vec<u8>),
     Integer(i64),
+    /// An integer literal that does not fit an i64 but is one more than the
+    /// most positive: 2^63, which is i64::MIN once a sign is applied. The
+    /// tokenizer cannot see the sign, so the parser settles it.
+    BigInt(u64),
     Float(f64),
     /// `?`, `?NNN`, `?name`, `:name`, `@name`, or `$name`.
     Parameter {
@@ -1407,9 +1411,13 @@ impl<'a> Tokenizer<'a> {
                 parse_f64_literal(text).ok_or_else(|| unrecognized(self.src, start, self.pos))?,
             ));
         }
-        // A decimal too large for i64 widens to a real, the way SQLite does.
+        // A decimal too large for i64 widens to a real, the way SQLite does --
+        // except for 2^63, which is the most negative i64 once a sign is
+        // applied. The tokenizer cannot see the sign, so that one value is
+        // carried as `BigInt` and the parser decides from the sign.
         match parse_int_literal(text) {
             Some(v) => Ok(Token::Integer(v)),
+            None if text.replace('_', "") == "9223372036854775808" => Ok(Token::BigInt(1u64 << 63)),
             None => match parse_f64_literal(text) {
                 Some(v) => Ok(Token::Float(v)),
                 // Unreachable for real digits, but a total function cannot
@@ -1441,6 +1449,10 @@ impl<'a> Tokenizer<'a> {
                 format!("hex literal too big: {}", &self.src[start..self.pos]),
             )
         })?;
+        // A hex literal is a u64, and one past i64::MAX is its two's
+        // complement rather than a real: 0xFFFFFFFFFFFFFFFF is -1 and
+        // 0x8000000000000000 is i64::MIN. Measured on sqlite3 3.53.4, and it
+        // differs from the decimal rule, where the same magnitude widens.
         Ok(Token::Integer(value as i64))
     }
 }
@@ -1706,12 +1718,14 @@ mod tests {
     #[test]
     fn a_minus_is_its_own_operator() {
         // SQLite folds a minus into a following literal, but that is the
-        // parser's job: lexically they are two tokens.
+        // parser's job: lexically they are two tokens. 2^63 arrives as BigInt
+        // rather than as a real, because whether it is one depends on the sign
+        // and the tokenizer cannot see it.
         assert_eq!(
             toks("-9223372036854775808"),
             vec![
                 punct(Punct::Minus),
-                Token::Float(9_223_372_036_854_775_808.0)
+                Token::BigInt(1u64 << 63)
             ]
         );
         assert_eq!(toks("-1"), vec![punct(Punct::Minus), Token::Integer(1)]);
@@ -1723,14 +1737,17 @@ mod tests {
 
     #[test]
     fn an_integer_past_i64_widens_to_a_real() {
+        // Past i64::MAX a decimal widens to a real, with one exception: 2^63 is
+        // the most negative i64 once a sign is applied, so the tokenizer cannot
+        // decide and hands it on. Measured: typeof(9223372036854775808) is real
+        // and typeof(-9223372036854775808) is integer in sqlite3 3.53.4.
+        assert_eq!(one("9223372036854775807"), Token::Integer(i64::MAX));
+        assert_eq!(one("9223372036854775808"), Token::BigInt(1u64 << 63));
         assert_eq!(
-            one("9223372036854775808"),
-            Token::Float(9_223_372_036_854_775_808.0)
+            one("9223372036854775809"),
+            Token::Float(9223372036854775809.0)
         );
-        assert_eq!(
-            one("12345678901234567890"),
-            Token::Float(1.2345678901234567e19)
-        );
+        assert_eq!(one("99999999999999999999"), Token::Float(1.0e20));
     }
 
     #[test]

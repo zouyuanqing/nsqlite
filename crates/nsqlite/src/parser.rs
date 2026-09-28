@@ -73,6 +73,10 @@ pub enum UnaryOp {
 pub enum Literal {
     Null,
     Integer(i64),
+    /// An integer literal too large for an i64 that may still be one once a
+    /// sign is applied: 2^63. The sign is what settles it, and the value is
+    /// negative, so the two spellings differ.
+    Big(u64),
     Real(f64),
     Text(String),
     Blob(Vec<u8>),
@@ -2391,10 +2395,22 @@ impl<'a> Parser<'a> {
     fn expr_unary(&mut self) -> Result<Expr> {
         if self.eat_punct(Punct::Minus)? {
             let inner = self.expr_unary()?;
-            // A negated literal folds immediately, which is what SQLite does and
-            // what keeps -9223372036854775808 representable.
+            // 2^63 is the one integer that only fits once it is negative, so
+            // the sign decides. sqlite3: typeof(-9223372036854775808) is
+            // integer and typeof(9223372036854775808) is real.
+            if let Expr::Literal(Literal::Big(v)) = inner {
+                let as_i64 = (v as i128) as i64;
+                return Ok(Expr::Literal(Literal::Integer(as_i64)));
+            }
+            // A negated literal folds immediately, which is what SQLite does --
+            // but the most negative integer has no positive counterpart, so
+            // folding it wraps back to itself. sqlite3 answers
+            // -(-9223372036854775808) with a real, and the fold has to agree.
             if let Expr::Literal(Literal::Integer(i)) = inner {
-                return Ok(Expr::Literal(Literal::Integer(i.wrapping_neg())));
+                return Ok(match i.checked_neg() {
+                    Some(v) => Expr::Literal(Literal::Integer(v)),
+                    None => Expr::Literal(Literal::Real(-(i as f64))),
+                });
             }
             if let Expr::Literal(Literal::Real(r)) = inner {
                 return Ok(Expr::Literal(Literal::Real(-r)));
@@ -2426,6 +2442,8 @@ impl<'a> Parser<'a> {
         let start = self.index;
         match self.advance() {
             Some(Token::Integer(i)) => Ok(Expr::Literal(Literal::Integer(i))),
+            // 2^63 reaches here unnegated too, and is a real in that position.
+            Some(Token::BigInt(v)) => Ok(Expr::Literal(Literal::Big(v))),
             Some(Token::Float(v)) => Ok(Expr::Literal(Literal::Real(v))),
             Some(Token::String(s)) => Ok(Expr::Literal(Literal::Text(s))),
             Some(Token::Blob(b)) => Ok(Expr::Literal(Literal::Blob(b))),
