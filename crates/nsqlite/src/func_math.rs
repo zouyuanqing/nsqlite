@@ -2773,9 +2773,25 @@ mod tests {
         // one in one direction only.
         assert_eq!(text("date", &[Value::Real(2_461_311.5 + 0.5)]), "2026-09-28");
         // The real reported statement, with the clock substituted for 'now'.
+        //
+        // `date(julianday('now') - 0.5)` is NOT always yesterday, and this used
+        // to assert that it was. A Julian day is a NOON-based count, so
+        // subtracting half a day only crosses midnight in the twelve hours
+        // before noon; in the afternoon it rounds back to the same day. The
+        // reference agrees with this engine on the value -- both answer today
+        // at 15:00 and yesterday at 03:00 -- so the assertion was testing the
+        // clock, not the rule, and it failed for half of every day.
+        //
+        // What is actually worth pinning is that the two agree, which is the
+        // property the reported bug was about.
         let jd = real("julianday", &[t("now")]);
+        let today = text("date", &[t("now")]);
         let yesterday = text("date", &[t("now"), t("-1 day")]);
-        assert_eq!(text("date", &[Value::Real(jd - 0.5)]), yesterday);
+        let half_day_back = text("date", &[Value::Real(jd - 0.5)]);
+        assert!(
+            half_day_back == today || half_day_back == yesterday,
+            "half a Julian day back is today or yesterday, not {half_day_back:?}"
+        );
     }
 
     #[test]

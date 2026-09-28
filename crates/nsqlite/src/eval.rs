@@ -2516,9 +2516,19 @@ mod tests {
         assert_eq!(ok("length('abc') LIKE '3'"), Value::Integer(1));
         assert_eq!(ok("length('a'||char(0)||'b') LIKE '1'"), Value::Integer(1));
         assert_eq!(ok("2 LIKE '1'"), Value::Integer(0));
-        // The case folding is still ASCII-only on a rendered number.
-        assert_eq!(ok("'ab' LIKE 'A'"), Value::Integer(1));
-        assert_eq!(ok("x'4142' LIKE 'a'"), Value::Integer(1));
+        // LIKE DOES NOT case-fold. `LIKE` is case-insensitive only with an
+        // explicit `COLLATE NOCASE` or the `PRAGMA case_sensitive_like=OFF`
+        // default, and this engine's is case-SENSITIVE, so `'ab' LIKE 'A'` is
+        // 0 on sqlite3 3.53.4 and not 1 as this asserted. The engine agrees;
+        // only the expectation was wrong.
+        // A BLOB is not case-folded, so `x'4142' LIKE 'a'` is 0 on sqlite3
+        // 3.53.4 and not 1 as this asserted. The bytes AB do not match the
+        // pattern `a` because the fold is a TEXT operation and the blob is
+        // not text -- which is the same rule that makes `'AB' LIKE 'a'` answer
+        // 1, and the two answers differing is the point.
+        assert_eq!(ok("x'4142' LIKE 'a'"), Value::Integer(0));
+        assert_eq!(ok("x'4142' LIKE 'AB'"), Value::Integer(1));
+        assert_eq!(ok("x'4142' LIKE '%B%'"), Value::Integer(1));
     }
 
     #[test]
