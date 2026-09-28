@@ -622,6 +622,15 @@ fn binary(
             // result that is not valid UTF-8 stays in `TextBytes`: `hex(x'FF'||x'00')`
             // is FF00 in sqlite3, and a `String` built by transcoding would have
             // already replaced FF with U+FFFD.
+            //
+            // A NULL operand makes the WHOLE result NULL, which is the one
+            // place `||` propagates NULL: `typeof(NULL || 'a')` is `null` and
+            // `hex('x' || NULL)` is the empty string, where treating the NULL
+            // as a zero-length operand answered `text` and `78`. The check
+            // is on the OPERANDS, before the join, so no coercion can hide it.
+            if l.is_null() || r.is_null() {
+                return Ok(Value::Null);
+            }
             let bytes = concat_bytes(&l, &r);
             Ok(match String::from_utf8(bytes) {
                 Ok(s) => Value::Text(s),
@@ -1448,7 +1457,14 @@ pub fn call(
                     Value::Integer(crate::func_string::char_count(head, enc) as i64)
                 }
                 Value::Blob(b) => Value::Integer(b.len() as i64),
-                other => Value::Integer(absolute(other).to_string().chars().count() as i64),
+                // A number's length is the length of its SPELLING, and the
+                // spelling of -45 is the three characters `-45`. Taking the
+                // absolute value first, which this used to do, drops the sign
+                // and answered 2 where sqlite3 answers 3 -- and the same for
+                // every negative number, `length(-45.0)` being 4 here against
+                // the reference's 5. The absolute value was there for a
+                // different arm and is not wanted here.
+                other => Value::Integer(other.to_string().chars().count() as i64),
             })
         }
         "replace" => {
@@ -2633,9 +2649,16 @@ mod tests {
     }
 
     #[test]
-    fn concatenation_treats_null_as_empty() {
+    fn concatenation_propagates_null() {
         assert_eq!(ok("'a' || 'b'"), Value::Text("ab".into()));
-        assert_eq!(ok("'a' || NULL"), Value::Text("a".into()));
+        // A NULL operand makes the WHOLE result NULL -- `||` is the one
+        // operator that propagates it, and `typeof('a' || NULL)` is `null` on
+        // sqlite3 3.53.4. This used to be asserted the other way, as though
+        // the NULL were a zero-length operand, which answered `a` and made
+        // `hex('x' || NULL)` come back as `78` where the reference gives the
+        // empty string.
+        assert_eq!(ok("'a' || NULL"), Value::Null);
+        assert_eq!(ok("NULL || 'a'"), Value::Null);
         assert_eq!(ok("1 || 2"), Value::Text("12".into()));
         // A blob concatenates as its text form, which is lossy and matches
         // SQLite.

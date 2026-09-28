@@ -333,7 +333,22 @@ fn utf8_offsets(b: &[u8]) -> Vec<usize> {
     let mut off = Vec::with_capacity(b.len() + 1);
     let mut i = 0;
     while i < b.len() {
-        off.push(i);
+        // A character may only START at a byte that is not a continuation.
+        // Without this, every byte in 0x80..=0xBF became a character start of
+        // its own, and the measurable consequence is in `instr`:
+        //
+        //     instr(CAST(x'4180' AS TEXT), CAST(x'80' AS TEXT))
+        //         sqlite3  ->  0    the needle cannot begin mid-character
+        //         before   ->  2    it matched the trailing byte
+        //
+        // and the same for every continuation byte: 0x80 and 0xBF answer 0
+        // where 0x7F, 0xC0 and 0xFF answer 2. A lead byte with no
+        // continuations after it still starts a character, and a stray
+        // continuation at the start of the value is a character of its own,
+        // because there is nothing for it to continue.
+        if !(0x80..=0xBF).contains(&b[i]) {
+            off.push(i);
+        }
         if b[i] >= 0xC0 {
             // A lead byte swallows the continuation run that follows it, and
             // that run may be short, empty, or run to the end of the value --
