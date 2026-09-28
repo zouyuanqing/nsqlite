@@ -674,3 +674,56 @@ wording and not the engine's; the remainder is compared byte for byte.
 * Cross-engine interop — a file written by one engine and read by the other —
   which `differential2.rs` covers and this corpus does not repeat.
 * Transactions, journal and recovery, covered by `gen4.sql`.
+
+## Final state of this pass
+
+Measured 2026-09-29, on the committed tree:
+
+```
+341 statements: 336 agreed, 0 wrong answers, 0 refusals, 5 worded differently
+32 statements had no usable typed projection and were compared weakly
+```
+
+The pass opened at 294 agreed with 40 wrong answers, so all forty are closed
+and the five wording differences are the remainder. They are not defects:
+each is a statement both engines refuse, where the two refusals differ in
+wording or in which one refuses first.
+
+The five wording differences, for whoever picks them up:
+
+| statement | sqlite3 | nsqlite |
+| --- | --- | --- |
+| `SELECT hex(upper(x'616263'))` | `unrecognized token: "x'616263));"` | `unrecognized token: "x'616263));` |
+| `SELECT no_such_column FROM (SELECT 1 AS a)` | `no such column: no_such_column` | `a subquery in FROM is not supported yet` |
+| `SELECT 1 FROM (SELECT 1 AS a, 2 AS a) WHERE no_such_column=1` | `no such column: no_such_column` | `a subquery in FROM is not supported yet` |
+| `SELECT FROM t` | `near "FROM": syntax error` | `near "from": syntax error` |
+| `CREATE INDEX ON t(a)` | `near "ON": syntax error` | `object name reserved for internal use: sqlite_autoindex_t_1` |
+
+Three of the five are a consequence of the two open engine gaps rather than
+independent defects: the two subquery cases are roadmap item 12, and the
+`CREATE INDEX` case is a statement with no index name, which this engine
+accepts and then names. The keyword case is a real and small difference --
+`near "FROM"` against `near "from"` -- and is worth a single line of
+work, since the suite compares error text verbatim.
+
+## What this pass added beyond the corpus
+
+Three defects the differential corpus does not reach, all found by an
+adversarial verification pass and each reproduced against the reference
+before being changed:
+
+* `instr` could match a byte in the middle of a character, because
+  `char_offsets` gave every byte in `0x80..=0xBF` a character start of its
+  own. `instr(CAST(x'4180' AS TEXT), CAST(x'80' AS TEXT))` was 2 where the
+  reference says 0; only those 64 bytes differ, and 0x7F, 0xC0 and 0xFF
+  always agreed.
+* `length()` of a negative number took the absolute value first, so
+  `length(-45)` was 2 against 3 and `length(-45.0)` 4 against 5.
+* `||` did not propagate NULL: `typeof(NULL || 'a')` was `text` where the
+  reference says `null`.
+
+And three TESTS that asserted the reference's absence rather than this
+engine's behaviour -- `x'4142' LIKE 'a'` as 1, `'ab' LIKE 'A'` as 1, and
+`date(julianday('now') - 0.5)` as always yesterday. Each was checked
+against the reference first, and in all three the engine was right. A test
+that pins the opposite of the reference reads as protection and is not.
