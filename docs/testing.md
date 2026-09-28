@@ -682,6 +682,53 @@ reports a flattering number instead of a measurement. They are also the
 cheapest large group to turn into signal: a per-file `--maxerror` and the
 `veryquick` permutation would each reach files this one-shot run does not.
 
+#### The vtab skips are the largest single unblock left, and half of them are not reachable
+
+Measured 2026-09-28, by parsing each file's own `ifcapable` guards:
+
+```sh
+ls test/sqlite-suite/test/*.test | wc -l                      # 1190
+grep -l 'ifcapable.*!vtab\|ifcapable vtab' test/sqlite-suite/test/*.test | wc -l   # 138
+# of those 138, gated on vtab AND NOTHING ELSE:                125
+```
+
+**125 files are blocked on one missing capability and nothing else.** That is
+larger than every engine gap in section 5.3 added together, and it is the
+reason virtual tables are the next thing to build rather than anything further
+down the list.
+
+But the module survey changes what "build it" means, because a large share of
+those 125 want modules **this machine's own `sqlite3` does not have**:
+
+| module | files wanting it | present in the reference? |
+| --- | --- | --- |
+| `echo` | 55 | **no** — `no such module: echo` |
+| `tcl` | 48 | **no** — `no such module: tcl` |
+| `fuzzer` | 38 | **no** — `no such module: fuzzer` |
+| `unionvtab` | 26 | **no** — `no such module: unionvtab` |
+| `csv` | 12 | **no** — `no such module: csv` |
+| `fts3` / `fts4` / `fts5` | many | yes |
+| `rtree` | 12 | yes |
+| `zipfile` | 10 | yes |
+
+The five absent modules are **testfixture additions**: upstream's `testfixture`
+build links them in for the suite's own use, and a stock `sqlite3` does not have
+them. So the honest reading of "125 files" is not "implementing virtual tables
+runs 125 files". It is closer to:
+
+* the **vtab mechanism** — `xConnect`/`xBestIndex`/`xFilter`/`xColumn`/`xNext`,
+  the `CREATE VIRTUAL TABLE` path, and the `rootpage = 0` catalog row — is one
+  piece of work that everything above depends on, and
+* after it, **fts3/fts4/fts5** is a large subsystem of its own (three tokenizers,
+  a segment format, and query parsing) that would gate the largest single block
+  of the rest, while
+* `echo`, `tcl`, `fuzzer`, `unionvtab` and `csv` are only reachable if the
+  shim supplies them, which is the *testfixture*'s job, not the engine's.
+
+That last distinction is the one worth keeping: a file wanting `echo` is not an
+engine gap. It is a harness gap, and it stays a harness gap however good the
+virtual-table implementation gets.
+
 ### Closest to passing, and therefore the cheapest next wins
 
 Reproduce with:
