@@ -763,6 +763,15 @@ nsqlite:  E CREATE INDEX is not supported yet
 7 files abort here and the whole `index.test` (77 errors / 101 cases) is
 unreachable. Nothing that plans a query can be trusted until an index exists.
 
+> **CLOSED.** `CREATE INDEX` and `DROP INDEX` both work; the index is written to
+> `sqlite_schema` as `type = 'index'` and `load_schema` reads it back, so an
+> index survives the process that created it. Re-measured 2026-09-28:
+> `CREATE TABLE t(a);CREATE INDEX i1 ON t(a);` → `X X` (no error), and
+> `index.test` runs 101 cases instead of aborting. Three separate causes had to
+> be fixed together: the parser never captured the `CREATE INDEX` source text,
+> the creation path had no `flush()`, and `load_schema` read `type = 'table'`
+> rows only.
+
 **3. `INSERT ... SELECT` is unimplemented.**
 
 ```
@@ -773,6 +782,11 @@ nsqlite:  E INSERT ... SELECT is not supported yet
 
 `types.test` dies on it, `select1-2.0` fails on it, and `insert.test` leans on
 it heavily.
+
+> **CLOSED.** Re-measured 2026-09-28: the same four statements return `X X X X`
+> then the row `1`. `types.test` went from aborting at 12 cases to running
+> **55** cases, which is why it no longer appears in the ABORTED column of
+> section 5.6.
 
 **4. Column names are not resolved when there is a `FROM` clause.** This one is
 subtle and wrong in a way that is easy to ship by accident:
@@ -791,6 +805,10 @@ is one, and the query returns a single column whose *name* is the unresolved
 identifier. Every "no such column" test in the suite that reads from a table is
 passing for the wrong reason or failing for a confusing one.
 
+> **CLOSED.** Re-measured 2026-09-28: `CREATE TABLE t(a);SELECT nosuchcol FROM
+> t;` → `E no such column: nosuchcol`, identical to the no-`FROM` case. Both
+> spellings of the message now match the reference byte for byte.
+
 **5. `ORDER BY <integer literal>` is not range-checked and not applied as a
 column ordinal.**
 
@@ -803,6 +821,14 @@ nsqlite:  both return 1 10 / 2 9  (sorted by the first column, no error)
 
 So nsqlite both mis-sorts and fails to raise. `select1-4.9` through `4.12` are
 all this.
+
+> **CLOSED.** Re-measured 2026-09-28, on a table with two columns and two rows:
+> `SELECT * FROM t5 ORDER BY 2;` returns `2 9` then `1 10` — the reference's
+> answer, i.e. ordered by column *b* — and `ORDER BY 3` raises
+> `E 1st ORDER BY term out of range - should be between 1 and 2`, the
+> reference's text exactly. The out-of-range message names the count of the
+> offending term, so the wording varies with position; that part is generated,
+> not hard-coded.
 
 **6. Aggregate misuse is detected by the wrong rule, and the messages do not
 match.**
@@ -819,10 +845,21 @@ nsqlite:  X   (accepted, no error)
 `select1-2.1` through `2.23` are all this. The aliased-aggregate rule (ticket
 #2526) is a real check with a real message, and nsqlite has neither.
 
+> **PARTLY CLOSED.** Re-measured 2026-09-28: `SELECT count(a,b) FROM t` now
+> raises `E wrong number of arguments to function count()`, the reference's text
+> exactly. The **aliased-aggregate rule (ticket #2526) is still open** — it is
+> not in the list of live findings below, but nothing in this tree implements it
+> either, so treat "has neither" as now "has the first half".
+
 **7. `EXPLAIN` is not parsed.** `explain.test`, and the `do_eqp_test` cases in
 `orderby1`, stop here. Note this is two different needs: the suite reads the
 opcode dump from `EXPLAIN` *and* the plan graph from `EXPLAIN QUERY PLAN`, and
 neither is reachable.
+
+> **CLOSED.** Re-measured 2026-09-28: `EXPLAIN SELECT 1;` returns an 8-column
+> result row whose first two names are `addr` and `opcode`, which is the shape
+> the suite reads. `explain.rs` and the `do_eqp_test` comparison in
+> `test/shim/tester.tcl` (section 5.7, bug 2) are what made it reachable.
 
 **8. Affinity is not applied on `REAL` and `NUMERIC` columns in one direction.**
 
@@ -838,6 +875,11 @@ nsqlite:  real                       wrong
 That is `types.test` cases 1.1.4, 1.1.6 and 1.1.7 — the whole file's current
 failure count.
 
+> **CLOSED.** Re-measured 2026-09-28: `CREATE TABLE t(a NUMERIC);INSERT INTO t
+> VALUES(5.0);SELECT typeof(a) FROM t;` returns `integer`, the reference's
+> answer. `affinity.rs` and `affinity_rules.rs` hold the conversion; the
+> measured grid of every declared-type/value pair is in `docs/affinity-grid.md`.
+
 **9. Error text case is not preserved for unknown functions.**
 
 ```
@@ -847,9 +889,18 @@ nsqlite:  E no such function: xyzzy
 
 The suite compares this exactly, so case matters.
 
+> **CLOSED.** Re-measured 2026-09-28: `SELECT XYZZY(1);` returns
+> `E no such function: XYZZY` — the identifier's case is preserved. This is the
+> kind of fix that looks cosmetic and is not: the suite compares the whole
+> message, so a case difference fails the case that has nothing else wrong with
+> it.
+
 **10. `AS 'quoted alias'` is rejected.** `SELECT a AS 'x y'` is a syntax error
 in nsqlite and fine in SQLite. The suite uses it constantly for column-name
 tests.
+
+> **CLOSED.** Re-measured 2026-09-28: `SELECT 1 AS 'x y';` returns a one-column
+> result whose column name is `x y` (hex `782079`).
 
 **11. `UNION` and `DISTINCT` are unimplemented.**
 
@@ -866,8 +917,19 @@ and every `EXCEPT`/`INTERSECT` test. `DISTINCT` is worse in kind, because it
 does not fail — it returns duplicate rows, so a test that happens to have no
 duplicates passes and one that does gets a wrong answer rather than an error.
 
+> **DISTINCT is CLOSED; UNION is not.** Re-measured 2026-09-28:
+> `INSERT INTO t VALUES(1),(1);SELECT DISTINCT a FROM t;` returns the single
+> row `1`. **`UNION` is still unimplemented** — `SELECT 1 UNION SELECT 2;`
+> still answers `E Union is not supported yet`, where the reference returns
+> `1` then `2`. It stays at the top of the live list because it is the parser
+> grammar for all four compound forms (`UNION`, `UNION ALL`, `EXCEPT`,
+> `INTERSECT`) and because the suite's own `compound.test` is named after it.
+
 **12. A subquery in `FROM` is rejected**: `E a subquery in FROM is not supported
 yet`. This blocks `select1-6.9.7`/`6.9.8` and much of `join.test`.
+
+> **CONFIRMED STILL OPEN.** Re-measured 2026-09-28: `SELECT * FROM (SELECT a
+> FROM t);` → `E a subquery in FROM is not supported yet`.
 
 **13. `rowid` is not implemented.** `SELECT rowid FROM t` and `SELECT
 t.rowid FROM t` both say `no such column: rowid`; SQLite returns the row's
@@ -891,6 +953,14 @@ the same change or the suite will still not be able to check it. `SELECT rowid
 FROM t` is the case to fix first: the gap is real, and `sqlite3` returns `1`
 for it.
 
+> **CONFIRMED STILL OPEN.** Re-measured 2026-09-28, both halves: `SELECT rowid
+> FROM t` → `E no such column: rowid`, and `SELECT last_insert_rowid()` → `E no
+> such function: last_insert_rowid`. This is now the **highest-value single
+> item on the list**, because it is a small, self-contained change that unblocks
+> the four `rowid*.test` files, a chunk of `hexlit`, and the row-identity
+> assertions in `insert`/`update` — and unlike the items above, nothing else on
+> this list has to be finished first.
+
 **14. `BEGIN` on a file that did not exist when the process opened it.**
 `Pager::open` builds its fresh-file branch (`len == 0`) with `path: None` and
 never assigns it; only the non-fresh branch runs `pager.path =
@@ -906,6 +976,16 @@ $ printf 'BEGIN;\n' | nsqlited --testsuite f2.db
 E an in-memory database cannot be journalled          # wrong
 $ printf 'BEGIN;\n' | sqlite3 f2.db                   # rc=0, no output
 ```
+
+> **CLOSED.** Re-measured 2026-09-28: on a file that does not exist,
+> `printf 'BEGIN;\n' | nsqlited --testsuite f2.db` produces no output and
+> exits 0, the reference's answer. `pager.path` is now set in the fresh branch.
+>
+> A note on the *other* thing this item used to be confused with, because the
+> two look identical from the outside and only one is a bug: the shim runs one
+> process per statement, so **a transaction still cannot span two `execsql`
+> calls**, and that remains a harness ceiling. `where2.test` fails 58 of 58 for
+> exactly this reason, and will until the shim grows a single-process mode.
 
 This reproduces entirely inside one process and `sqlite3` never shows it, so it
 is a plain engine bug and not a limit of the process-per-statement harness. It
@@ -1197,33 +1277,59 @@ tools/run_suite.sh 'select1.test' 'createtab.test' 'insert.test' 'types.test' \
 
 | Asked for | Actual file | errors / cases run | state | What blocks it |
 | --- | --- | --- | --- | --- |
-| `select1` | `select1.test` | 45 / 113 | aborted at 113 | `PRAGMA`, `*` in the select list, column-name rules |
+| `select1` | `select1.test` | 69 / 188 | FAILED | `UNION`, `rowid`, `*` in the select list, column-name rules |
 | `create` | `createtab.test` | 16 / 20 | FAILED | the prepare/step API (a harness ceiling) |
-| `insert` | `insert.test` | 51 / 74 | FAILED | `INSERT ... SELECT`, multi-row `VALUES` |
-| `types` | `types.test` | 0 / 12 | aborted at 12 | `INSERT ... SELECT`, after NUMERIC affinity |
-| `orderby1` | `orderby1.test` | 33 / 51 | aborted at 51 | `EXPLAIN` / `EXPLAIN QUERY PLAN` |
-| `trans1` | `trans.test` | 66 / 106 | aborted at 106 | `DROP INDEX`, `CREATE INDEX`, `txn_state` |
-| `index` | `index.test` | 70 / 101 | FAILED | `CREATE INDEX` and `DROP INDEX` |
+| `insert` | `insert.test` | 45 / 74 | FAILED | `rowid`, `UNION`, multi-row `VALUES` |
+| `types` | `types.test` | 7 / 55 | FAILED | `rowid` |
+| `orderby1` | `orderby1.test` | 31 / 51 | aborted at 51 | the remaining `EXPLAIN QUERY PLAN` shapes, `rowid` |
+| `trans1` | `trans.test` | 66 / 106 | aborted at 106 | `rowid`, `txn_state`, and the process-per-statement ceiling |
+| `index` | `index.test` | 70 / 101 | FAILED | `rowid`, and the plan assertions |
 
-**Every one of the seven now runs and reaches its summary.** None passes
+**Measured 2026-09-28**, with `--jobs 6` (the per-file numbers do not depend on
+the job count; the runner re-enters the same `run_one` either way).
+
+**Every one of the seven runs and reaches its summary.** None passes
 completely, and the reason in each case is an engine gap listed above, not a
 harness gap — that distinction is the point of the table.
 
+Three files moved since the table was first written, all upward, and each one
+names a roadmap item that section 5.3 now records as closed:
+
+* `types.test` went from **0 errors out of 12 cases, aborted** to **7 of 55**,
+  because `INSERT ... SELECT` and the NUMERIC affinity rule are both fixed. It
+  is no longer in the ABORTED state at all.
+* `select1.test` went from 45/113 to 69/**188** — 75 more cases execute, because
+  the `PRAGMA` and column-name paths that used to abort it are reachable. Its
+  error *count* rose too, which is the expected shape: more cases running means
+  more chances to fail, and a file that measures more is worth more than one
+  that aborts early.
+* `index.test` is unchanged at 70/101 because `CREATE INDEX` and `DROP INDEX`
+  being fixed made the whole file *reachable* — before, it could not run at
+  all. An unchanged error count here is not an unchanged situation.
+
+What the remaining blockers have in common: **`rowid` is nearly all of them.**
+It is item 13 on the list and it is now the single cheapest large win, for the
+reason given in its entry.
+
 Two things in that table are worth reading carefully rather than skimming.
 
-`types.test` reports **0 errors**. That is not a pass: it aborted after 12
-tests, and the abort is `INSERT ... SELECT is not supported yet`, which is
-engine roadmap item 6. `func.test` is worse still — 0 errors out of 3 tests,
-out of 224 `do_test` calls in the file — because `PRAGMA` on line 45 stops it
-before the file's own subject matter. This is why the runner reports `ABORTED`
-as its own state rather than folding it into `FAILED`: an error count with no
-denominator for the file is not a pass rate.
+`types.test` used to report **0 errors** — which is not a pass, but a file that
+aborted after 12 of its cases on `INSERT ... SELECT is not supported yet`. That
+is fixed: it now runs 55 cases and reports 7 real errors. `func.test` is the
+remaining example of the shape, and it is worse than `types.test` was — 0
+errors out of 3 tests, out of 224 `do_test` calls in the file — because
+`PRAGMA` on line 45 stops it before the file's own subject matter. This is why
+the runner reports `ABORTED` as its own state rather than folding it into
+`FAILED`: an error count with no denominator for the file is not a pass rate.
+A file that has stopped aborting is a strictly better thing than one that has
+not, even when its error count goes **up** — `select1.test` is at 69 errors
+over 188 cases where it used to report 45 over 113.
 
-The numbers moved when the `do_eqp_test` comparison was fixed (section 5.7):
-`orderby1` went 46 → 33 errors and `index` 76 → 70, because those files' plan
-tests were being failed by a harness bug rather than by the engine. The engine
-gap underneath is unchanged — `EXPLAIN` is still unparsed — but the harness is
-no longer adding failures of its own on top of it.
+The numbers also moved once, for a different reason: when the `do_eqp_test`
+comparison was fixed (section 5.7), `orderby1` went 46 → 33 errors and
+`index` 76 → 70, because those files' plan tests were being failed by a
+harness bug rather than by the engine. `EXPLAIN` itself is now parsed, so that
+gap is closed too.
 
 ### 5.6a A wider sweep, for scale
 
