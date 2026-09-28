@@ -64,6 +64,14 @@ pub mod value;
 pub mod varint;
 pub mod vec0_bridge;
 
+#[cfg(test)]
+#[path = "binary_text_tests.rs"]
+mod binary_text_tests;
+
+#[cfg(test)]
+#[path = "unique_constraint_tests.rs"]
+mod unique_constraint_tests;
+
 pub use error::{Error, Result, ResultCode};
 pub use text::Encoding;
 pub use value::{Datatype, Value};

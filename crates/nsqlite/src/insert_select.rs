@@ -58,7 +58,7 @@ use crate::catalog::Table;
 use crate::connection::{Outcome, Row};
 use crate::error::{Error, Result, ResultCode};
 use crate::eval::{eval, EvalCtx};
-use crate::parser::Select;
+use crate::parser::{ConflictAction, Select};
 use crate::value::Value;
 
 /// What an `INSERT ... SELECT` needs from whatever holds the rows.
@@ -103,6 +103,60 @@ pub trait InsertTarget {
     /// Writes one row at a given rowid.
     fn write_row(&mut self, table: &Table, rowid: i64, values: Vec<Value>) -> Result<()>;
 
+    /// Decides what a UNIQUE conflict on `values` means for this statement, and
+    /// carries out the part of the action that touches storage.
+    ///
+    /// `None` means the row is fine and should be written. `Err` is a refusal
+    /// that ends the statement. The actions that are not refusals are handled
+    /// here rather than by the caller because each one needs something only the
+    /// target can do: IGNORE has to skip the row, and REPLACE has to delete the
+    /// row it collides with before the new one goes in.
+    ///
+    /// The rules, all measured against sqlite3 3.53.4: a key holding a NULL
+    /// never conflicts, so any number of NULLs is legal; the comparison is
+    /// `Value::compare` and not `==`, which is what makes the integer 1 and the
+    /// real 1.0 collide while the text '1' does not; and OR IGNORE covers
+    /// conflicts only, so a NOT NULL violation beside it still aborts the
+    /// statement.
+    fn write_unique(
+        &mut self,
+        table: &Table,
+        values: &[Value],
+        conflict: ConflictAction,
+        pending: &[(Vec<usize>, Vec<Value>)],
+    ) -> Result<UniqueOutcome>;
+
+    /// The uniqueness keys a row that has just been written should be recorded
+    /// under, so that a later row of the *same statement* is checked against it.
+    ///
+    /// A key holding a NULL is left out: such a row can never conflict with
+    /// anything, so keeping it would cost a comparison and find nothing.
+    fn written_keys(&self, table: &Table, values: &[Value]) -> Vec<Vec<usize>>;
+
+    /// Every uniqueness constraint the table has, as groups of column indices.
+    ///
+    /// Separate from [`InsertTarget::written_keys`] because it answers a
+    /// different question: not "which keys does this row occupy" but "which keys
+    /// exist at all", which is what the pre-pass needs to know whether a
+    /// statement can conflict with anything before writing a row.
+    fn unique_keys(&self, table: &Table) -> Vec<Vec<usize>>;
+
+    /// The first of `keys` that a row about to be written collides with, judged
+    /// against the rows the table already holds.
+    ///
+    /// Separate from [`InsertTarget::write_unique`] because the pre-pass must
+    /// decide a *refusal* without performing one, and because the write loop
+    /// needs the conflict's identity either way. `exclude` is the row being
+    /// updated, which an UPDATE has already taken out and which would otherwise
+    /// collide with itself.
+    fn stored_unique_conflict(
+        &mut self,
+        table: &Table,
+        keys: &[Vec<usize>],
+        values: &[Value],
+        exclude: Option<i64>,
+    ) -> Result<Option<usize>>;
+
     /// Publishes the statement's effect once every row is written: the change
     /// count, the last insert rowid, and the flush.
     fn finish(&mut self, changed: usize, last_rowid: Option<i64>) -> Result<()>;
@@ -129,8 +183,27 @@ struct Prepared {
     has_column_list: bool,
     /// Where each supplied value goes: one entry per named target, or one per
     /// table column when there was no column list.
-    targets: Vec<usize>,
+    ///
+    /// An entry is a column's position, or `None` for a target that is not a
+    /// column at all. There is exactly one such name and it is a row's key
+    /// rather than a value the record holds: `INSERT INTO t(rowid, a) VALUES
+    /// (77, 5)` writes the row under key 77. Measured against sqlite3 3.53.4,
+    /// which accepts it on a table that has no such column and refuses it
+    /// nowhere -- the key is not a column, so the column-list lookup misses it
+    /// and the rowid rule below has to answer.
+    targets: Vec<Option<usize>>,
     rows: Vec<Vec<Value>>,
+}
+
+/// What a `write_unique` check decided about one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniqueOutcome {
+    /// No conflict, or a conflict OR REPLACE resolved by deleting the row it
+    /// collided with. Either way the row is written.
+    Write,
+    /// A conflict that OR IGNORE swallowed. Skip the row and carry on with the
+    /// rest of the statement -- this is per ROW, not per statement.
+    Skip,
 }
 
 /// Runs a SELECT and inserts each of its rows, applying the same rules an
@@ -145,14 +218,17 @@ struct Prepared {
 /// A mismatch between the query's column count and the number of targets is an
 /// error, and it is raised before any row is written — see
 /// [`check_column_count`] for the two wordings sqlite3 uses.
+
+/// What a write does when it hits a UNIQUE or PRIMARY KEY conflict.
 pub fn insert_select<T: InsertTarget>(
     target: &mut T,
     written_name: &str,
     columns: Option<&[String]>,
     select: &Select,
+    conflict: ConflictAction,
 ) -> Result<Outcome> {
     let prepared = prepare(target, written_name, columns, select)?;
-    insert_prepared(target, prepared)
+    insert_prepared(target, prepared, conflict)
 }
 
 /// Resolves the target, runs the query, and materialises its rows.
@@ -187,16 +263,11 @@ fn prepare<T: InsertTarget>(
         Some(names) => {
             let mut v = Vec::with_capacity(names.len());
             for n in names {
-                v.push(table.column_index(n).ok_or_else(|| {
-                    Error::new(
-                        ResultCode::Error,
-                        format!("table {written_name} has no column named {n}"),
-                    )
-                })?);
+                v.push(build_target(&table, n, written_name)?);
             }
             v
         }
-        None => (0..table.len()).collect(),
+        None => (0..table.len()).map(Some).collect(),
     };
 
     let source = target.run_source(select)?;
@@ -234,7 +305,11 @@ fn prepare<T: InsertTarget>(
 /// duplicate rowid, and UNIQUE and CHECK constraints the b-tree itself
 /// enforces. Those still leave the earlier rows behind, which is the honest
 /// limit of what this engine can do and is why the note says so.
-fn insert_prepared<T: InsertTarget>(target: &mut T, prepared: Prepared) -> Result<Outcome> {
+fn insert_prepared<T: InsertTarget>(
+    target: &mut T,
+    prepared: Prepared,
+    conflict: ConflictAction,
+) -> Result<Outcome> {
     let Prepared {
         table,
         written_name,
@@ -253,7 +328,7 @@ fn insert_prepared<T: InsertTarget>(target: &mut T, prepared: Prepared) -> Resul
     // `t(a,b DEFAULT abs(random()))` gives three *different* b values -- so
     // building each row in its own turn is the same number of evaluations of
     // the same expressions, in the same order.
-    let mut built: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    let mut built: Vec<(Vec<Value>, Option<i64>)> = Vec::with_capacity(rows.len());
     for values in rows {
         // The width was checked once against the projection before anything was
         // written. Re-checking per row catches a result set whose rows are
@@ -278,8 +353,48 @@ fn insert_prepared<T: InsertTarget>(target: &mut T, prepared: Prepared) -> Resul
     // loop, the rows ahead of it would already be in the b-tree, and this engine
     // has no way to take them back out. Checked against sqlite3 3.53.4, which
     // leaves 0 rows in the same case.
-    for full in &built {
+    for (full, _) in &built {
         check_rowid_value(&table, full)?;
+    }
+
+    // The uniqueness check is pure in the same way, and needs the same pre-pass
+    // for the same reason. Resolved in the write loop it would leave the rows
+    // ahead of the failing one in the b-tree, because this engine has no way to
+    // take them back out: `INSERT INTO u VALUES(1),(1)` would leave 1 row where
+    // sqlite3 leaves 0. A key holding a NULL is exempt, and the rows are
+    // compared to each other in order as well as to the table, so the duplicate
+    // inside one statement is found here too.
+    //
+    // Only the refusal is hoisted. OR IGNORE and OR REPLACE are not refusals --
+    // one skips a row, the other deletes one -- so they stay in the write loop,
+    // where the target can carry them out.
+    let keys = target.unique_keys(&table);
+    if !keys.is_empty() {
+        let refusing = !matches!(conflict, ConflictAction::Ignore | ConflictAction::Replace);
+        let mut seen: Vec<(Vec<usize>, Vec<Value>)> = Vec::new();
+        for (full, _) in &built {
+            let hit = match crate::connection::find_unique_conflict(&keys, full, &seen) {
+                Some(i) => Some(i),
+                None if refusing => {
+                    target.stored_unique_conflict(&table, &keys, full, None)?
+                }
+                None => None,
+            };
+            if let Some(i) = hit {
+                if refusing {
+                    return Err(crate::index_ddl::unique_violation(
+                        &table.name,
+                        &crate::connection::key_names(&table, &keys[i]),
+                    ));
+                }
+            }
+            seen.extend(
+                target
+                    .written_keys(&table, full)
+                    .into_iter()
+                    .map(|key| (key, full.clone())),
+            );
+        }
     }
 
     // The rowid itself is resolved in the write loop, and that is deliberate
@@ -293,9 +408,28 @@ fn insert_prepared<T: InsertTarget>(target: &mut T, prepared: Prepared) -> Resul
     // same rowid three times and overwrite the first two rows with the third.
     let mut inserted = 0usize;
     let mut last_rowid = None;
-    for full in built {
-        let rowid = target.next_rowid(&table, &full)?;
-        target.write_row(&table, rowid, full)?;
+    // The rows this statement has already written, so a duplicate *within* one
+    // statement is caught like any other. `INSERT INTO u SELECT x FROM s` with
+    // s holding (1),(2),(1) leaves 0 rows in the reference, not 1, and this is
+    // what makes it 0 here.
+    let mut pending: Vec<(Vec<usize>, Vec<Value>)> = Vec::new();
+    for (full, explicit) in built {
+        // A key the statement named wins over the one this engine would hand
+        // out, and a key it named as NULL is the same as not naming it at all.
+        let rowid = match explicit {
+            Some(v) => v,
+            None => target.next_rowid(&table, &full)?,
+        };
+        // Checked before the write, which is what leaves nothing behind when it
+        // refuses. `write_unique` also carries out OR IGNORE and OR REPLACE,
+        // the two actions that are not refusals.
+        if target.write_unique(&table, &full, conflict, &pending)? == UniqueOutcome::Skip {
+            continue;
+        }
+        target.write_row(&table, rowid, full.clone())?;
+        for key in target.written_keys(&table, &full) {
+            pending.push((key, full.clone()));
+        }
         last_rowid = Some(rowid);
         inserted += 1;
     }
@@ -346,14 +480,33 @@ fn check_rowid_value(table: &Table, values: &[Value]) -> Result<()> {
 ///    statement never mentioned is caught too;
 /// 3. affinity is applied last, which is why `'123'` into an INTEGER column
 ///    stores the integer.
-fn build_row(table: &Table, targets: &[usize], values: &[Value]) -> Result<Vec<Value>> {
+fn build_row(
+    table: &Table,
+    targets: &[Option<usize>],
+    values: &[Value],
+) -> Result<(Vec<Value>, Option<i64>)> {
     let mut full = vec![Value::Null; table.len()];
     let mut named: Vec<bool> = vec![false; table.len()];
-    for (i, pos) in targets.iter().enumerate() {
+    let mut rowid: Option<i64> = None;
+    for (i, target) in targets.iter().enumerate() {
+        // A target that is not a column is the row's key, and the row does not
+        // hold it: it is the b-tree cell the record is written under, so it is
+        // taken out of the row and handed back separately. The value is checked
+        // by the same `check_rowid_value` that reads the alias column, so
+        // `INSERT INTO t(rowid,a) VALUES('x',1)` is refused the same way a
+        // non-integer INTEGER PRIMARY KEY is.
+        let Some(pos) = *target else {
+            match &values[i] {
+                Value::Integer(v) => rowid = Some(*v),
+                Value::Null => {}
+                _ => return Err(crate::msg::datatype_mismatch()),
+            }
+            continue;
+        };
         // A target is resolved against the table before the loop starts, so it
         // is in range; the guard is here because the alternative is an index
         // panic on a malformed table.
-        let Some(pos) = full.get(*pos).map(|_| *pos) else {
+        let Some(pos) = full.get(pos).map(|_| pos) else {
             return Err(Error::new(
                 ResultCode::Error,
                 format!("table {} has no column at position {}", table.name, pos),
@@ -384,7 +537,40 @@ fn build_row(table: &Table, targets: &[usize], values: &[Value]) -> Result<Vec<V
     for (i, col) in table.columns.iter().enumerate() {
         full[i] = apply_affinity(&full[i], col.affinity);
     }
-    Ok(full)
+    Ok((full, rowid))
+}
+
+/// Where one named INSERT target goes.
+///
+/// A column is found by name, and the three rowid names are the one case where
+/// the lookup misses on purpose: a key is not a column, so
+/// `INSERT INTO t(rowid, a) VALUES(77, 5)` names something the record does not
+/// hold. Measured against sqlite3 3.53.4, which accepts it and writes the row
+/// under key 77 -- so it is answered with `None` and `build_row` takes the key
+/// out of the row.
+///
+/// A real column of that name wins, in that order, because `column_index` is
+/// tried first. `CREATE TABLE u(b, rowid, c)` really does have a column called
+/// `rowid`, and `INSERT INTO u(rowid) VALUES(9)` writes 9 into it -- the
+/// pseudo-column does not shadow a real one any more here than it does in a
+/// SELECT.
+///
+/// A name that is neither is the error it always was, and a WITHOUT ROWID table
+/// has no key to name: its DDL is refused upstream, so this is not reachable
+/// for one, and leaving the rowid answer unconditional rather than guarding it
+/// on `table.without_rowid` would be answering for a table kind that cannot be
+/// built.
+pub fn build_target(table: &Table, name: &str, written_name: &str) -> Result<Option<usize>> {
+    if let Some(pos) = table.column_index(name) {
+        return Ok(Some(pos));
+    }
+    if crate::join::is_rowid_name(name) {
+        return Ok(None);
+    }
+    Err(Error::new(
+        ResultCode::Error,
+        format!("table {written_name} has no column named {name}"),
+    ))
 }
 
 /// NOT NULL enforcement, with sqlite3's wording and extended code.

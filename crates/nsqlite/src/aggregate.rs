@@ -61,9 +61,15 @@ pub enum Acc {
     /// group_concat and string_agg: the separator between elements, and the
     /// elements in arrival order, which is what the non-aggregate form
     /// guarantees.
+    ///
+    /// Both the separator and the elements are bytes rather than `String`,
+    /// because a blob is joined as its bytes and a byte that is not valid
+    /// UTF-8 has to survive to the result. A `String` would have to replace
+    /// `FF` with U+FFFD on the way in, so `group_concat` over `(x'FF', x'41')`
+    /// would come out as `EFBFBD,41` instead of the `FF,41` sqlite3 gives.
     Concat {
-        sep: String,
-        parts: Vec<String>,
+        sep: Vec<u8>,
+        parts: Vec<Vec<u8>>,
         any_null: bool,
     },
     Total {
@@ -126,9 +132,9 @@ fn integer_valued(v: &Value) -> Option<i64> {
     // (1, 0) sums to the integer 1. So the test below is "is this an exact
     // integer *in a class that stays integral*", not "is this number whole".
     //
-    // Text is the only class where "does this read as a number" and "what
-    // number" are different questions, and a blob never counts, so both are
-    // settled before the conversion.
+    // Text and a blob are the two classes where "does this read as a number"
+    // and "what number" are different questions, so both are settled before
+    // the conversion.
     match v {
         Value::Real(_) => return None,
         // The parse is the check *and* the conversion. `as_f64` below only
@@ -140,6 +146,14 @@ fn integer_valued(v: &Value) -> Option<i64> {
             let f = s.trim().parse::<f64>().ok()?;
             return exact_int_of(f);
         }
+        // A blob **always** promotes the sum to a real, even when its bytes
+        // spell a whole integer: `sum` over `x'31'` is the real 1.0, not the
+        // integer 1. Returning `None` is what forces that promotion, so the
+        // *value* the blob contributes has to come from
+        // [`numeric_contribution`] instead — otherwise dropping the promotion
+        // here would make the fold stay integer, and `sum` over
+        // `(x'2D33', x'332E35', x'414243')` would come out as an integer
+        // instead of the real 0.5 that sqlite3 gives for -3 + 3.5 + 0.
         Value::Blob(_) => return None,
         _ => {}
     }
@@ -153,6 +167,27 @@ fn exact_int_of(f: f64) -> Option<i64> {
         return None;
     }
     Some(f as i64)
+}
+
+/// What a value contributes to a running `total`, `avg` or `product`.
+///
+/// `Value::as_f64` covers only the two numeric classes, so a blob reached the
+/// fold as `unwrap_or(0.0)` and contributed nothing: `sum` over `x'2D33'`,
+/// `x'332E35'`, `x'414243'` came out as 0.0 where sqlite3 gives 0.5, the sum of
+/// -3, 3.5 and 0. A blob is read as its bytes and then as a number, by the same
+/// prefix rule the arithmetic operators use, so it has to go through the same
+/// helper rather than a second conversion that can drift.
+fn numeric_contribution(v: &Value) -> f64 {
+    match v {
+        Value::Integer(_) | Value::Real(_) => v.as_f64().unwrap_or(0.0),
+        Value::Text(s) => crate::eval::numeric_prefix_of(s.as_bytes())
+            .as_f64()
+            .unwrap_or(0.0),
+        Value::TextBytes(b) | Value::Blob(b) => {
+            crate::eval::numeric_prefix_of(b).as_f64().unwrap_or(0.0)
+        }
+        Value::Null => 0.0,
+    }
 }
 
 impl Acc {
@@ -209,14 +244,19 @@ impl Acc {
             "group_concat" | "string_agg" => {
                 need(1, 2)?;
                 let sep = match args.get(1) {
-                    None => ",".to_string(),
+                    None => b",".to_vec(),
                     Some(Value::Null) => {
                         return Err(Error::new(
                             ResultCode::Error,
                             "group_concat() with a NULL separator",
                         ))
                     }
-                    Some(v) => v.to_string(),
+                    // The separator is joined by the same rule the elements
+                    // are, so a blob separator is its bytes and not the
+                    // `x'..'` display form: `group_concat(v, x'FF')` over
+                    // `(x'41', x'42')` is the two bytes 41 FF 42.
+                    Some(Value::Blob(b)) | Some(Value::TextBytes(b)) => b.clone(),
+                    Some(v) => v.to_string().into_bytes(),
                 };
                 Acc::Concat {
                     sep,
@@ -332,7 +372,7 @@ impl Acc {
                                     *exact = None;
                                     *saw_float = true;
                                 }
-                                *total += other.as_f64().unwrap_or(0.0);
+                                *total += numeric_contribution(other);
                             }
                         }
                     }
@@ -357,7 +397,7 @@ impl Acc {
                 }
             }
             Acc::Avg { total, n } => {
-                *total += v.as_f64().unwrap_or(0.0);
+                *total += numeric_contribution(v);
                 *n += 1;
             }
             Acc::Concat {
@@ -370,19 +410,21 @@ impl Acc {
                 // display form, so it is the one class that is not
                 // `to_string`. sqlite3 3.53.4 gives `group_concat(v)` over
                 // `(x'31', 'z')` as `1,z` and over `(x'3132')` as `12`, while
-                // `to_string` would give `x'31',z` and `x'3132'`.
+                // `to_string` would give `x'31',z` and `x'3132'`. The bytes
+                // are kept as bytes so a blob that is not valid UTF-8 reaches
+                // the result intact.
                 match v {
-                    Value::Blob(b) => parts.push(String::from_utf8_lossy(b).into_owned()),
-                    other => parts.push(other.to_string()),
+                    Value::Blob(b) | Value::TextBytes(b) => parts.push(b.clone()),
+                    other => parts.push(other.to_string().into_bytes()),
                 }
             }
             Acc::Total { n, total } => {
                 *n += 1;
-                *total += v.as_f64().unwrap_or(0.0);
+                *total += numeric_contribution(v);
             }
             Acc::Product { acc, n } => {
                 *n += 1;
-                *acc *= v.as_f64().unwrap_or(0.0);
+                *acc *= numeric_contribution(v);
             }
             Acc::CountDistinct { seen } => {
                 seen.insert(v.identity_key(), ());
@@ -443,7 +485,21 @@ impl Acc {
             Acc::Concat { sep, parts, .. } => Ok(if parts.is_empty() {
                 Value::Null
             } else {
-                Value::Text(parts.join(sep))
+                // Joined over bytes, because the elements are: the result is
+                // TEXT whose bytes are the elements' bytes, and one that is
+                // not valid UTF-8 stays in `TextBytes` rather than being
+                // transcoded into a `String` that has already lost it.
+                let mut out = Vec::new();
+                for (i, part) in parts.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(sep);
+                    }
+                    out.extend_from_slice(part);
+                }
+                match String::from_utf8(out) {
+                    Ok(s) => Value::Text(s),
+                    Err(e) => Value::TextBytes(e.into_bytes()),
+                }
             }),
             Acc::Product { acc, n } => Ok(if *n == 0 {
                 Value::Null
@@ -749,6 +805,42 @@ mod tests {
         assert_eq!(a.result(), Value::Integer(6));
     }
 
+    /// A blob is read as a number by the aggregates too, so it contributes the
+    /// number its bytes spell rather than nothing. Measured on sqlite3 3.53.4
+    /// over `(x'2D33', x'332E35', x'414243')`, which is -3, 3.5 and 0.
+    #[test]
+    fn a_blob_contributes_the_number_its_bytes_spell() {
+        let blobs: Vec<Value> = [
+            Value::Blob(vec![0x2D, 0x33]),          // "-3"
+            Value::Blob(vec![0x33, 0x2E, 0x35]),    // "3.5" -- 0x2E is the '.'
+            Value::Blob(vec![0x41, 0x42, 0x43]),    // "ABC" -> 0
+        ]
+        .into_iter()
+        .collect();
+        for name in ["sum", "total", "avg"] {
+            let mut a = acc(name);
+            for v in &blobs {
+                a.step(v).unwrap();
+            }
+            let want = match name {
+                "avg" => Value::real(0.5 / 3.0),
+                _ => Value::real(0.5),
+            };
+            assert_eq!(a.result(), want, "{name} over a blob column");
+        }
+    }
+
+    #[test]
+    fn a_blob_promotes_a_sum_to_a_real_even_when_it_whole() {
+        // A blob is not an integer *class*, so even x'31' ("1") makes the fold
+        // a real. That part was already true; what was missing was the value
+        // it contributes.
+        let mut a = acc("sum");
+        a.step(&Value::Integer(1)).unwrap();
+        a.step(&Value::Blob(vec![b'1'])).unwrap();
+        assert_eq!(a.result(), Value::real(2.0));
+    }
+
     #[test]
     fn an_integer_sum_that_would_overflow_is_an_error() {
         let mut a = acc("sum");
@@ -907,6 +999,38 @@ mod tests {
     }
 
     #[test]
+    fn group_concat_keeps_a_blob_element_that_is_not_text() {
+        // sqlite3 3.53.4: `group_concat(v)` over (x'FF', x'41') is the two
+        // bytes FF 41 with a comma between them, not a `String` in which the
+        // FF has already become U+FFFD.
+        let mut a = Acc::new("group_concat", &[Value::Null]).unwrap();
+        a.step(&Value::Blob(vec![0xFF])).unwrap();
+        a.step(&Value::Blob(vec![0x41])).unwrap();
+        assert_eq!(a.result(), Value::TextBytes(vec![0xFF, b',', 0x41]));
+    }
+
+    #[test]
+    fn group_concat_joins_a_blob_separator_by_its_bytes() {
+        // The separator is joined like the elements are. sqlite3 gives
+        // `group_concat(v, x'FF')` over (x'41', x'42') as 41 FF 42, where a
+        // `to_string()` of the separator would have put `x'FF'` in the middle.
+        let mut a = Acc::new("group_concat", &[Value::Null, Value::Blob(vec![0xFF])]).unwrap();
+        a.step(&Value::Blob(vec![0x41])).unwrap();
+        a.step(&Value::Blob(vec![0x42])).unwrap();
+        assert_eq!(a.result(), Value::TextBytes(vec![0x41, 0xFF, 0x42]));
+    }
+
+    #[test]
+    fn group_concat_over_utf8_elements_is_still_text() {
+        // The bytes path is not a change of class: an all-UTF-8 result is
+        // still `Text`, which is what `typeof` reports.
+        let mut a = Acc::new("group_concat", &[Value::Null]).unwrap();
+        a.step(&Value::Blob(b"1".to_vec())).unwrap();
+        a.step(&Value::Text("z".into())).unwrap();
+        assert_eq!(a.result(), Value::Text("1,z".into()));
+    }
+
+    #[test]
     fn a_wrong_arity_is_an_error() {
         assert!(Acc::new("sum", &[]).is_err());
         assert!(Acc::new("count", &[Value::Null, Value::Null]).is_err());
@@ -959,4 +1083,5 @@ mod tests {
         assert_eq!(out[1], Value::Integer(3));
         assert_eq!(out[2], Value::Integer(6));
     }
+
 }

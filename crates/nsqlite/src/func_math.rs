@@ -41,6 +41,12 @@ pub fn num_value(v: &Value) -> f64 {
         Value::Integer(i) => *i as f64,
         Value::Real(r) => *r,
         Value::Text(s) => parse_prefix(s).map_or(0.0, |(_, n)| n),
+        // A blob and text whose bytes are not valid UTF-8 are read the same way
+        // as text: their bytes, then the longest numeric prefix. This is what
+        // makes a blob a usable argument wherever a number is expected.
+        Value::TextBytes(b) | Value::Blob(b) => {
+            parse_prefix(&String::from_utf8_lossy(b)).map_or(0.0, |(_, n)| n)
+        }
         _ => 0.0,
     }
 }
@@ -717,6 +723,19 @@ fn parse_time_value(v: &Value) -> Option<Jd> {
         Value::Integer(i) => Some(Jd::plain(*i as f64)),
         Value::Real(r) => Some(Jd::plain(*r)),
         Value::Text(s) => {
+            // `now` is the one time value that names the instant rather than a
+            // date, so it is matched here, before the three-way fallback below
+            // and before `parse_datetime_text` sees it. That parser rejects
+            // `now` at its first `read_digits`, which is correct for every
+            // other string, so the word has to be caught on the way in.
+            //
+            // The match is on the WHOLE string and it ignores case, and both
+            // details are measured. sqlite3 answers today's date for `now`,
+            // `NOW`, `Now` and `nOw`, and answers NULL for `now `, `nowx`,
+            // `now!` and `NOWX` -- so nothing is trimmed and no prefix counts.
+            if s.eq_ignore_ascii_case("now") {
+                return now_jd();
+            }
             if looks_like_time_only(s) {
                 parse_time_of_day(s).map(|secs| Jd::plain(jd_of(&J2000_ANCHOR) + secs / 86400.0))
             } else if let Some(n) = parse_whole(s) {
@@ -731,6 +750,29 @@ fn parse_time_value(v: &Value) -> Option<Jd> {
         }
         _ => None,
     }
+}
+
+/// The current instant as a Julian day, which is what `date('now')` and its
+/// five siblings ask for.
+///
+/// The value is the system clock read in UTC. The engine has no local time zone
+/// — the same decision the `localtime` modifier already records at
+/// [`Modifier::NoOp`] — so this is exactly what a UTC build of sqlite3
+/// computes. That this sqlite3 is a UTC build is measured, not assumed:
+/// `TZ=America/New_York sqlite3 :memory: "SELECT datetime('now')"` returns the
+/// same UTC reading as the default environment, so the two engines can be
+/// compared at all.
+///
+/// The sub-second part is kept, because `julianday('now')` on sqlite3 is a real
+/// with a fractional day (`2461311.8032892593`), and truncating to whole
+/// seconds still lands inside the same millisecond for any two reads made
+/// close together.
+fn now_jd() -> Option<Jd> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
+    Some(Jd::plain(secs / 86_400.0 + UNIX_EPOCH_JD))
 }
 
 /// 2000-01-01, the day a bare time value is anchored to.
@@ -2607,6 +2649,133 @@ mod tests {
         assert_eq!(ok("datetime", &[t("abc")]), Value::Null);
         assert_eq!(ok("julianday", &[t("abc")]), Value::Null);
         assert_eq!(ok("unixepoch", &[t("abc")]), Value::Null);
+    }
+
+    #[test]
+    fn now_is_the_current_instant_and_not_null() {
+        // `date('now')` used to be NULL, because nothing in the engine knew the
+        // word: it is not `HH:MM`, `parse_whole` rejects it, and the strict
+        // date parser fails on its very first digit.
+        //
+        // The answer moves, so the assertions are windows rather than values.
+        // What is being pinned is that `now` is the CURRENT instant: not NULL,
+        // not a fixed date such as 2000-01-01, and close to a clock read here.
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // None of the five siblings may report NULL any more.
+        for name in ["date", "datetime", "time", "julianday", "unixepoch"] {
+            assert_ne!(
+                ok(name, &[t("now")]),
+                Value::Null,
+                "{name}('now') was NULL"
+            );
+        }
+
+        // The rendered day is today's, computed here from the clock through a
+        // different route than the module uses. `civil_from_days` counts days
+        // from 1970-01-01, which is the same origin `UNIX_EPOCH_JD` names, so
+        // this is a check against the clock rather than a restatement of the
+        // code under test.
+        let (y, m, d) = super::civil_from_days((clock / 86_400.0) as i64);
+        assert_eq!(
+            text("date", &[t("now")]),
+            format!("{y:04}-{m:02}-{d:02}"),
+            "date('now') is not the current UTC day"
+        );
+
+        // The two numeric renderings are one instant, so they agree with each
+        // other and with the clock to within a second. `julianday` keeps the
+        // sub-second part on sqlite3, and `unixepoch` truncates it, so the two
+        // differ by the fraction of a second rather than agreeing exactly --
+        // which is itself part of what is being pinned.
+        let jd = real("julianday", &[t("now")]);
+        let ux = int("unixepoch", &[t("now")]);
+        assert!(
+            ((jd - UNIX_EPOCH_JD) * 86_400.0 - ux as f64).abs() < 2.0,
+            "julianday({jd}) and unixepoch({ux}) are the same instant"
+        );
+        assert!(
+            ((jd - UNIX_EPOCH_JD) * 86_400.0 - clock).abs() < 60.0,
+            "julianday('now') was {jd}, which is not now"
+        );
+        // `unixepoch` truncates toward zero while `julianday` keeps the
+        // fraction, so the Julian day is the sub-second part AHEAD of the
+        // epoch -- the fraction is carried, not rounded off before the day
+        // count. The window is a millisecond wide at the bottom because the
+        // Unix path rounds to a millisecond before it truncates, which can
+        // carry a reading in the last fraction of a millisecond into the next
+        // second.
+        let frac = (jd - UNIX_EPOCH_JD) * 86_400.0 - ux as f64;
+        assert!(
+            (-0.001..1.0).contains(&frac),
+            "julianday('now') must carry the sub-second part unixepoch drops, got {frac}"
+        );
+    }
+
+    #[test]
+    fn now_ignores_case_but_matches_the_whole_word_only() {
+        // sqlite3 answers today's date for every spelling of the word, and NULL
+        // for a near miss. `eq_ignore_ascii_case` on the whole string is what
+        // produces exactly that set: nothing is trimmed and no prefix counts.
+        for spelling in ["now", "NOW", "Now", "nOw", "nOW"] {
+            let got = ok("date", &[t(spelling)]);
+            assert_ne!(got, Value::Null, "date({spelling:?}) was NULL");
+        }
+        for junk in ["now ", "nowx", "now!", "NOWX", " now", "no", "noww", "no1"] {
+            assert_eq!(
+                ok("date", &[t(junk)]),
+                Value::Null,
+                "date({junk:?}) should be NULL"
+            );
+        }
+        // A BLOB holding the same bytes is a different case, and it is a known
+        // gap rather than a rule of the `now` match: sqlite3 answers today's
+        // date for `date(x'6e6f77')` because a time value that is not text is
+        // read as its bytes, but the engine's `parse_time_value` only has a
+        // `Text` arm, so every blob time value is NULL -- `date(x'32303234
+        // 2d30312d3031')` (2024-01-01) is NULL here too. Pinned as a reminder
+        // that the two are separate defects, so neither is blamed on the other.
+        assert_eq!(ok("date", &[Value::Blob(b"2024-01-01".to_vec())]), Value::Null);
+        assert_eq!(ok("date", &[Value::Blob(b"now".to_vec())]), Value::Null);
+    }
+
+    #[test]
+    fn now_takes_modifiers_and_stays_null_for_a_bogus_one() {
+        // sqlite3: date('now','-1 day') is yesterday and date('now','+1 day')
+        // is tomorrow, so the instant feeds the modifier chain like any other.
+        let today = text("date", &[t("now")]);
+        let yesterday = text("date", &[t("now"), t("-1 day")]);
+        let tomorrow = text("date", &[t("now"), t("+1 day")]);
+        assert_ne!(today, yesterday);
+        assert_ne!(today, tomorrow);
+        assert_ne!(yesterday, tomorrow);
+        assert_eq!(
+            ok("date", &[t("now"), t("nonsense")]),
+            Value::Null,
+            "an unknown modifier still poisons the call"
+        );
+    }
+
+    #[test]
+    fn a_julian_day_less_half_a_day_is_the_previous_day() {
+        // This is the shape `date(julianday('now')-0.5)` has. With 'now' it
+        // also needs the clock, so the fixed values pin the rule underneath it:
+        // a Julian day is a NOON-based count, so 2461311.5 is midnight on
+        // 2026-09-28 and half a day earlier is the day before. Getting this
+        // wrong is a floor-versus-round bug at the day boundary, which is what
+        // these two values exist to catch.
+        assert_eq!(text("date", &[Value::Real(2_461_311.5 - 0.5)]), "2026-09-27");
+        assert_eq!(text("date", &[Value::Real(2_460_310.5 - 0.5)]), "2023-12-31");
+        // And half a day later is the day after, so the floor is not an off-by-
+        // one in one direction only.
+        assert_eq!(text("date", &[Value::Real(2_461_311.5 + 0.5)]), "2026-09-28");
+        // The real reported statement, with the clock substituted for 'now'.
+        let jd = real("julianday", &[t("now")]);
+        let yesterday = text("date", &[t("now"), t("-1 day")]);
+        assert_eq!(text("date", &[Value::Real(jd - 0.5)]), yesterday);
     }
 
     #[test]

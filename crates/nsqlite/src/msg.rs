@@ -516,6 +516,59 @@ pub enum Msg {
     /// `duplicate WITH table name: %s`, which is the same error for a name
     /// already used as a table.
     DuplicateColumnName,
+    /// `Cannot add a PRIMARY KEY column`
+    ///
+    /// An `ALTER TABLE ... ADD COLUMN` whose new column is a primary key. The
+    /// restriction is SQLite's, and it is about the *index* a primary key is,
+    /// not about the column: measured, `ADD COLUMN c UNIQUE` is refused the
+    /// same way even though a unique constraint is equally an index, and
+    /// `ADD COLUMN c NOT NULL` is allowed.
+    CannotAddPrimaryKeyColumn,
+    /// `Cannot add a UNIQUE column`
+    ///
+    /// The same restriction for a unique constraint. See
+    /// [`Msg::CannotAddPrimaryKeyColumn`].
+    CannotAddUniqueColumn,
+    /// `Cannot add a column to a view`
+    ///
+    /// A view has no columns of its own to extend. The binary also answers
+    /// this for the other objects a view-like name can reach, but a view is
+    /// the one this engine can be asked about.
+    CannotAddColumnToView,
+    /// `Cannot add a NOT NULL column with default value NULL`
+    ///
+    /// An `ALTER TABLE ... ADD COLUMN c NOT NULL` against a table that already
+    /// has a row. The rows on disk are not rewritten by an ALTER, so the new
+    /// column would read back as NULL in every one of them; SQLite refuses
+    /// rather than write a column its own rows cannot satisfy. The same
+    /// statement against an *empty* table is accepted -- measured -- so this
+    /// message is raised by the executor rather than by the parser, where the
+    /// table's contents are not visible.
+    CannotAddNotNullColumn,
+    /// `Cannot add a column with non-constant default`
+    ///
+    /// An `ALTER TABLE ... ADD COLUMN c DEFAULT <expr>` against a table that
+    /// already has a row, where `<expr>` is not one of the spellings SQLite
+    /// accepts as constant. The rows on disk are not rewritten by an ALTER, so
+    /// the default has to be a value the executor can supply later, at read
+    /// time; `(1+2)` and `CURRENT_TIMESTAMP` are not.
+    ///
+    /// It is a *runtime* error, raised by the executor and not the parser, and
+    /// only against a table that has rows: measured on 3.53.4, the same ALTER
+    /// against an empty table is accepted, and the default is then evaluated
+    /// per row as it is inserted. It is a separate message from
+    /// [`Msg::DefaultValueNotConstant`], which SQLite raises at parse time,
+    /// without looking at the table at all, for the one spelling its grammar
+    /// refuses outright.
+    CannotAddNonConstantDefault,
+    /// `default value of column [NAME] is not constant`
+    ///
+    /// A column whose `DEFAULT` is a parenthesised *name* -- `DEFAULT (a)`.
+    /// SQLite's grammar treats an unparenthesised name as a string literal and
+    /// a parenthesised one as a reference, so the same word is a constant in
+    /// `DEFAULT a` and a reference in `DEFAULT (a)`, and the reference is
+    /// refused here whatever the table holds.
+    DefaultValueNotConstant,
 
     // --- aggregates ---------------------------------------------------------
     /// `misuse of aggregate: NAME()`
@@ -548,6 +601,8 @@ pub enum Msg {
     CompoundColumnCount,
     /// `too many terms in compound SELECT`
     TooManyCompoundTerms,
+    /// `Nth ORDER BY term does not match any column in the result set`
+    OrderByTermNoMatch,
 
     // --- the syntax error family --------------------------------------------
     /// `near "TOKEN": syntax error`
@@ -577,6 +632,7 @@ pub enum Msg {
 /// holds each of them to the length the render arms say it must be -- a list
 /// that is one entry too long would otherwise answer for a message it does not
 /// cover without anything noticing.
+const NO_NAMES: &[CaseRule] = &[];
 const ONE_NAME_QUERY: &[CaseRule] = &[CaseRule::Query];
 const ONE_NAME_SCHEMA: &[CaseRule] = &[CaseRule::Schema];
 const TWO_NAMES_QUERY: &[CaseRule] = &[CaseRule::Query, CaseRule::Query];
@@ -687,6 +743,23 @@ impl Msg {
             | Msg::NoSuchColumnForTable => TWO_NAMES_QUERY,
             // Schema, table, column.
             Msg::NoSuchColumnSchemaQualified => THREE_NAMES_QUERY,
+            // No holes at all: the four ALTER TABLE ADD COLUMN refusals are
+            // about a column by what it *is* -- a primary key, a unique, a
+            // view, a NOT NULL with nothing to default it to -- and not by
+            // which one it is. They are grouped with the no-names block for
+            // that reason, and `every_case_rule_entry_is_a_name_hole` keeps
+            // the list and the render arms agreeing about which is which.
+            Msg::CannotAddPrimaryKeyColumn
+            | Msg::CannotAddUniqueColumn
+            | Msg::CannotAddColumnToView
+            | Msg::CannotAddNotNullColumn
+            // This one is a fifth ALTER TABLE refusal that carries no name:
+            // it is about the *default*, and the column it lands on is named
+            // by the statement, not by the complaint.
+            | Msg::CannotAddNonConstantDefault => NO_NAMES,
+            // The one ALTER-related message that does name a column, because
+            // the complaint is about that column's own DEFAULT.
+            Msg::DefaultValueNotConstant => ONE_NAME_QUERY,
 
             // One name: the constraint's own text, or the table of a duplicate
             // rowid. A foreign key names two, and so is below.
@@ -711,6 +784,7 @@ impl Msg {
             | Msg::IncompleteInput
             | Msg::CompoundColumnCount
             | Msg::OrderByTermOutOfRange
+            | Msg::OrderByTermNoMatch
             | Msg::GroupByTermOutOfRange
             | Msg::SubSelectColumnCount
             | Msg::ValuesForColumnsCount
@@ -759,6 +833,7 @@ impl Msg {
         Msg::HavingOnNonAggregate,
         Msg::IntegerOverflow,
         Msg::OrderByTermOutOfRange,
+        Msg::OrderByTermNoMatch,
         Msg::GroupByTermOutOfRange,
         Msg::SubSelectColumnCount,
         Msg::CompoundColumnCount,
@@ -895,6 +970,24 @@ impl Msg {
             (Msg::DuplicateColumnName, [Arg::Name(n)]) => {
                 format!("duplicate column name: {n}")
             }
+            // The four ALTER TABLE refusals, which carry no name at all: they
+            // are about a column by what it is rather than which one it is.
+            (Msg::CannotAddPrimaryKeyColumn, []) => "Cannot add a PRIMARY KEY column".to_string(),
+            (Msg::CannotAddUniqueColumn, []) => "Cannot add a UNIQUE column".to_string(),
+            (Msg::CannotAddColumnToView, []) => "Cannot add a column to a view".to_string(),
+            (Msg::CannotAddNotNullColumn, []) => {
+                "Cannot add a NOT NULL column with default value NULL".to_string()
+            }
+            (Msg::CannotAddNonConstantDefault, []) => {
+                "Cannot add a column with non-constant default".to_string()
+            }
+            // The brackets are in the message, not the render: SQLite writes
+            // the column's own spelling inside them, so `DEFAULT (a)` on a
+            // column named `c` is `default value of column [c] is not
+            // constant`.
+            (Msg::DefaultValueNotConstant, [Arg::Name(n)]) => {
+                format!("default value of column [{n}] is not constant")
+            }
 
             // Aggregates. All three wordings keep the function's case:
             // `SELECT COUNT(a) FROM t WHERE COUNT(a)` is
@@ -924,6 +1017,10 @@ impl Msg {
             ),
             (Msg::GroupByTermOutOfRange, [Arg::Count(n), Arg::Count(max)]) => format!(
                 "{} GROUP BY term out of range - should be between 1 and {max}",
+                ordinal(*n)
+            ),
+            (Msg::OrderByTermNoMatch, [Arg::Count(n)]) => format!(
+                "{} ORDER BY term does not match any column in the result set",
                 ordinal(*n)
             ),
 
@@ -1087,6 +1184,40 @@ pub fn unique_constraint(table: &str, column: &str) -> Error {
     Msg::UniqueConstraint.error(&[table.into(), column.into()])
 }
 
+/// The `ALTER TABLE ... ADD COLUMN` refusals, which name no column.
+///
+/// They are grouped here rather than left as `Error::new` calls at the two
+/// sites that raise them, because the result code is the part that is easy to
+/// get wrong by hand and because a message with no name hole is still a
+/// message, not a bare string.
+pub mod cannot_add {
+    use super::Msg;
+    use crate::error::Error;
+
+    pub fn primary_key() -> Error {
+        Msg::CannotAddPrimaryKeyColumn.error(&[])
+    }
+    pub fn unique() -> Error {
+        Msg::CannotAddUniqueColumn.error(&[])
+    }
+    pub fn to_view() -> Error {
+        Msg::CannotAddColumnToView.error(&[])
+    }
+    pub fn not_null() -> Error {
+        Msg::CannotAddNotNullColumn.error(&[])
+    }
+    /// A default that is not one of SQLite's constant spellings, against a
+    /// table that already holds a row.
+    pub fn non_constant_default() -> Error {
+        Msg::CannotAddNonConstantDefault.error(&[])
+    }
+    /// A `DEFAULT (name)`, which SQLite's grammar refuses at parse time. The
+    /// name is the column's, not the name that was written as the default.
+    pub fn default_not_constant(column: &str) -> Error {
+        Msg::DefaultValueNotConstant.error(&[super::name(column)])
+    }
+}
+
 /// A `UNIQUE constraint failed: T.rowid` error, for a duplicate rowid.
 ///
 /// The message names the word `rowid` and the table, never the rowid's value.
@@ -1185,6 +1316,18 @@ pub fn group_by_term_out_of_range(n: usize, max: usize) -> Error {
 /// A `sub-select returns N columns - expected 1` error.
 pub fn sub_select_column_count(n: usize) -> Error {
     Msg::SubSelectColumnCount.error(&[count(n as u64)])
+}
+
+/// A `Nth ORDER BY term does not match any column in the result set` error.
+///
+/// The counterpart to [`order_by_term_out_of_range`], and raised only by a
+/// compound SELECT. A compound has no FROM for an expression key to read, so
+/// `ORDER BY y+1` on `SELECT 1 AS x UNION SELECT 2 AS y` names nothing the
+/// result set can answer for. Measured against sqlite3 3.53.4, which says
+/// `1st ORDER BY term does not match any column in the result set` for every
+/// such term, including one whose name is not a result column at all.
+pub fn order_by_term_no_match(n: usize) -> Error {
+    Msg::OrderByTermNoMatch.error(&[count(n as u64)])
 }
 
 /// A `too many terms in compound SELECT` error.
@@ -1572,6 +1715,11 @@ mod tests {
         c(Msg::OrderByTermOutOfRange, vec![count(2), count(1)], "CREATE TABLE t(a,b); SELECT a AS z FROM t ORDER BY 1,3;", "2nd ORDER BY term out of range - should be between 1 and 1"),
         c(Msg::OrderByTermOutOfRange, vec![count(1), count(2)], "CREATE TABLE t(a,b); SELECT a,b AS z FROM t ORDER BY 3;", "1st ORDER BY term out of range - should be between 1 and 2"),
         c(Msg::OrderByTermOutOfRange, vec![count(1), count(2)], "CREATE TABLE t5(a,b); SELECT * FROM t5 ORDER BY 3;", "1st ORDER BY term out of range - should be between 1 and 2"),
+        // A compound has no FROM for an expression key to read, so a term that
+        // is not a result column's name has nothing the result set can answer
+        // for. Measured: even a name that is not a result column at all gets
+        // the same wording, naming the term by its ordinal.
+        c(Msg::OrderByTermNoMatch, vec![count(1)], "SELECT 1 AS x UNION SELECT 2 AS y ORDER BY y+1;", "1st ORDER BY term does not match any column in the result set"),
         c(Msg::GroupByTermOutOfRange, vec![count(1), count(1)], "SELECT 1 GROUP BY 2;", "1st GROUP BY term out of range - should be between 1 and 1"),
         c(Msg::GroupByTermOutOfRange, vec![count(1), count(1)], "CREATE TABLE t(a,b); SELECT a FROM t GROUP BY 4;", "1st GROUP BY term out of range - should be between 1 and 1"),
         c(Msg::GroupByTermOutOfRange, vec![count(1), count(2)], "CREATE TABLE t(a,b); SELECT a,b FROM t GROUP BY 4;", "1st GROUP BY term out of range - should be between 1 and 2"),
@@ -1606,6 +1754,26 @@ mod tests {
         c(Msg::IncompleteInput, vec![], "SELECT (1", "incomplete input"),
         c(Msg::IncompleteInput, vec![], "SELECT 1,", "incomplete input"),
         c(Msg::IncompleteInput, vec![], "SELECT 1 IN", "incomplete input"),
+        // --- ALTER TABLE ... ADD COLUMN -------------------------------------
+        // The four refusals, each with the exact text sqlite3 3.53.4 printed.
+        // None of them names a column, which is what makes them zero-argument
+        // messages rather than a new name hole.
+        //
+        // The NOT NULL one is a runtime decision, not a parse refusal: the same
+        // statement against an *empty* table is accepted, so the case below
+        // needs a row in the table for the answer to be the message.
+        c(Msg::CannotAddPrimaryKeyColumn, vec![], "CREATE TABLE t(a,b); ALTER TABLE t ADD COLUMN c PRIMARY KEY;", "Cannot add a PRIMARY KEY column"),
+        c(Msg::CannotAddUniqueColumn, vec![], "CREATE TABLE t(a,b); ALTER TABLE t ADD COLUMN c UNIQUE;", "Cannot add a UNIQUE column"),
+        c(Msg::CannotAddNotNullColumn, vec![], "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); ALTER TABLE t ADD COLUMN c NOT NULL;", "Cannot add a NOT NULL column with default value NULL"),
+        // The non-constant one is a runtime decision for the same reason: the
+        // ALTER needs a row in the table before SQLite will raise it, and the
+        // empty-table form of the very same statement is accepted.
+        c(Msg::CannotAddNonConstantDefault, vec![], "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); ALTER TABLE t ADD COLUMN c DEFAULT (1+2);", "Cannot add a column with non-constant default"),
+        c(Msg::CannotAddNonConstantDefault, vec![], "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); ALTER TABLE t ADD COLUMN c DEFAULT CURRENT_TIMESTAMP;", "Cannot add a column with non-constant default"),
+        // This one names the column, and it is a *parse* refusal: it is raised
+        // against an empty table too, because it is about the spelling rather
+        // than about anything the table holds.
+        c(Msg::DefaultValueNotConstant, vec![name("c")], "CREATE TABLE t(a,b); ALTER TABLE t ADD COLUMN c DEFAULT (a);", "default value of column [c] is not constant"),
         c(Msg::UnrecognizedToken, vec![name("\"abc")], "SELECT \"abc", "unrecognized token: \"\"abc\""),
         c(Msg::UnrecognizedToken, vec![name("'abc")], "SELECT 'abc", "unrecognized token: \"'abc\""),
         c(Msg::UnrecognizedToken, vec![name("`abc")], "SELECT `abc", "unrecognized token: \"`abc\""),
@@ -1700,7 +1868,9 @@ mod tests {
                 n183 = 183, n184 = 184, n185 = 185, n186 = 186,
                 n187 = 187, n188 = 188, n189 = 189, n190 = 190,
                 n191 = 191, n192 = 192, n193 = 193, n194 = 194,
-                n195 = 195, n196 = 196, n197 = 197,
+                n195 = 195, n196 = 196, n197 = 197, n198 = 198,
+                n199 = 199, n200 = 200, n201 = 201,
+                n202 = 202, n203 = 203, n204 = 204,
             }
         };
     }
@@ -1708,7 +1878,7 @@ mod tests {
     /// The number of rows [`build_cases`] builds, and the number of generated
     /// tests there are. They have to be equal: one test per row, each reaching
     /// its own row and no other.
-    const CASE_COUNT: usize = 198;
+    const CASE_COUNT: usize = 205;
 
     /// The case at `index`, or a panic that says the table and the index
     /// disagree.
@@ -1919,6 +2089,8 @@ mod tests {
             Msg::ColumnCountMismatch => vec![name("Table"), count(2), count(3)],
             Msg::ValuesForColumnsCount => vec![count(2), count(3)],
             Msg::OrderByTermOutOfRange | Msg::GroupByTermOutOfRange => vec![count(1), count(2)],
+            // One count: the offending term, named by its ordinal.
+            Msg::OrderByTermNoMatch => vec![count(1)],
             Msg::SubSelectColumnCount => vec![count(2)],
             Msg::CompoundColumnCount => vec![name("UNION")],
             Msg::UnsupportedYet => vec![name("Widget")],
@@ -1929,7 +2101,13 @@ mod tests {
             | Msg::HavingOnNonAggregate
             | Msg::IntegerOverflow
             | Msg::TooManyCompoundTerms
-            | Msg::IncompleteInput => Vec::new(),
+            | Msg::IncompleteInput
+            | Msg::CannotAddPrimaryKeyColumn
+            | Msg::CannotAddUniqueColumn
+            | Msg::CannotAddColumnToView
+            | Msg::CannotAddNotNullColumn
+            | Msg::CannotAddNonConstantDefault => Vec::new(),
+            Msg::DefaultValueNotConstant => vec![name("c")],
         }
     }
 
@@ -2000,6 +2178,9 @@ mod tests {
             Msg::GroupByTermOutOfRange => {
                 "1st GROUP BY term out of range - should be between 1 and 2".to_string()
             }
+            Msg::OrderByTermNoMatch => {
+                "1st ORDER BY term does not match any column in the result set".to_string()
+            }
             Msg::SubSelectColumnCount => "sub-select returns 2 columns - expected 1".to_string(),
             Msg::CompoundColumnCount => {
                 "SELECTs to the left and right of UNION do not have the same number of result columns"
@@ -2008,6 +2189,18 @@ mod tests {
             Msg::TooManyCompoundTerms => "too many terms in compound SELECT".to_string(),
             Msg::SyntaxError => "near \"Table\": syntax error".to_string(),
             Msg::IncompleteInput => "incomplete input".to_string(),
+            Msg::CannotAddPrimaryKeyColumn => "Cannot add a PRIMARY KEY column".to_string(),
+            Msg::CannotAddUniqueColumn => "Cannot add a UNIQUE column".to_string(),
+            Msg::CannotAddColumnToView => "Cannot add a column to a view".to_string(),
+            Msg::CannotAddNotNullColumn => {
+                "Cannot add a NOT NULL column with default value NULL".to_string()
+            }
+            Msg::CannotAddNonConstantDefault => {
+                "Cannot add a column with non-constant default".to_string()
+            }
+            Msg::DefaultValueNotConstant => {
+                "default value of column [c] is not constant".to_string()
+            }
             Msg::UnrecognizedToken => "unrecognized token: \"Table\"".to_string(),
             Msg::UnsupportedYet => "Widget is not supported yet".to_string(),
             Msg::UnsupportedYetIn => "Reason: Widget is not supported yet".to_string(),

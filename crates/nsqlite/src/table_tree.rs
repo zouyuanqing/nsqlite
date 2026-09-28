@@ -85,6 +85,19 @@ impl TableTree {
 
     /// Builds the record payload for a row.
     fn payload_of(&self, row: &Row) -> Vec<u8> {
+        // A rowid-alias column is a special case the shared encoder already
+        // handles: the value is not stored at all, the rowid is its value, and
+        // the column is written as NULL.
+        //
+        // Every other column is named, NULLs included, which is what
+        // `record::encode` now does and what the reader relies on. Trimming
+        // trailing NULLs here would have been wrong twice over: it would lose
+        // a stored NULL, so `INSERT INTO t VALUES(9,10,NULL)` into a table
+        // whose third column has `DEFAULT 7` could not be told from one that
+        // never mentioned the column; and it would make every row this engine
+        // writes *look* like one an `ALTER TABLE` left behind, so the
+        // DEFAULT-on-read path would apply itself to rows that were written
+        // complete.
         LeafPage::encode_payload(&row.values, self.rowid_alias)
     }
 
@@ -640,5 +653,74 @@ mod tests {
         drop(tree);
         drop(pager);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The raw serial types a stored record carries, which is the thing the
+    /// reader's padding rule turns on: a record *shorter* than the table's
+    /// declared width is the only evidence that a row predates an
+    /// `ALTER TABLE`.
+    fn serial_types_on_disk(pager: &mut Pager, root: u32) -> Vec<i64> {
+        let leaf = LeafPage::read(pager, root).unwrap();
+        let payload = &leaf.cells[0].payload;
+        // A record header is a varint holding its own length, then one varint
+        // serial type per column. The column count is therefore the number of
+        // varints between the size field and the end of the header, which is
+        // what the reader's padding rule turns on.
+        let (header_len, start) = super::super::varint::get(payload);
+        let mut types = Vec::new();
+        let mut pos = start;
+        while pos < header_len as usize {
+            let (t, next) = super::super::varint::get(&payload[pos..]);
+            types.push(t as i64);
+            pos += next;
+        }
+        types
+    }
+
+    #[test]
+    fn a_trailing_null_keeps_its_serial_type() {
+        // sqlite3 does not trim trailing NULLs. Measured on 3.53.4, a
+        // three-column table stores three serial types for `VALUES(1,2,NULL)`
+        // and for `VALUES(NULL,NULL,NULL)`.
+        //
+        // This matters because the length of a record is the only evidence a
+        // reader has about which columns a row predates: `connection`'s
+        // default-on-read path treats a short record as a row an
+        // `ALTER TABLE ... ADD COLUMN` left behind. A writer that trimmed
+        // would make every row it wrote look like one, and a row that
+        // deliberately stored NULL would be indistinguishable from one that
+        // simply never mentioned the column.
+        let (mut pager, mut tree) = new_db("trailnull");
+        let root = tree.root();
+        tree.insert(
+            &mut pager,
+            &Row {
+                rowid: 1,
+                values: vec![Value::Integer(1), Value::Integer(2), Value::Null],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            serial_types_on_disk(&mut pager, root),
+            vec![9, 1, 0],
+            "the NULL column must stay in the header"
+        );
+
+        let root = pager.allocate().unwrap();
+        let mut all_null = TableTree::open(&mut pager, root).unwrap();
+        all_null
+            .insert(
+                &mut pager,
+                &Row {
+                    rowid: 1,
+                    values: vec![Value::Null, Value::Null, Value::Null],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            serial_types_on_disk(&mut pager, root),
+            vec![0, 0, 0],
+            "an all-NULL row still names every column"
+        );
     }
 }

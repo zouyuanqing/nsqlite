@@ -61,6 +61,7 @@ fn table(name: &str, columns: &[&str], root: u32) -> Table {
             })
             .collect(),
         rowid_alias: None,
+        unique_sets: Vec::new(),
         without_rowid: false,
         root_page: root,
     }
@@ -131,6 +132,7 @@ fn render_key(k: &[Value]) -> String {
             Value::Integer(i) => i.to_string(),
             Value::Real(r) => Value::real(*r).to_string(),
             Value::Text(s) => format!("'{s}'"),
+            Value::TextBytes(b) => format!("x'{}", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
             Value::Blob(b) => format!(
                 "x'{}'",
                 b.iter().map(|x| format!("{x:02X}")).collect::<String>()

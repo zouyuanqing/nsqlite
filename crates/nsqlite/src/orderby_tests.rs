@@ -1097,6 +1097,7 @@ fn fixture_tables() -> Vec<crate::catalog::Table> {
                 })
                 .collect(),
             rowid_alias: None,
+            unique_sets: Vec::new(),
             without_rowid: false,
             root_page: 0,
         }

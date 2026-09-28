@@ -32,7 +32,12 @@ pub fn serial_type(v: &Value) -> i64 {
             }
         }
         Value::Real(_) => 7,
+        // Text is stored by its bytes and its length, so both spellings of it
+        // take the same types: a `TextBytes` holding the single byte 0xFF is
+        // TEXT of length 1 (type 15), and not the BLOB that the same byte
+        // would be had the cast to text not turned it into text first.
         Value::Text(s) => 13 + 2 * s.len() as i64,
+        Value::TextBytes(b) => 13 + 2 * b.len() as i64,
         Value::Blob(b) => 12 + 2 * b.len() as i64,
     }
 }
@@ -83,7 +88,13 @@ pub fn decode(t: i64, body: &[u8]) -> Result<Value> {
             Value::real(f64::from_be_bytes(b))
         }
         t if t % 2 == 0 => Value::Blob(raw.to_vec()),
-        _t => Value::Text(String::from_utf8_lossy(raw).into_owned()),
+        // A TEXT field is decoded by its bytes, which need not be valid UTF-8:
+        // a record holding `CAST(x'FF' AS TEXT)` reads back as the same
+        // `TextBytes`, so `typeof` still answers 'text'.
+        _t => match String::from_utf8(raw.to_vec()) {
+            Ok(s) => Value::Text(s),
+            Err(e) => Value::TextBytes(e.into_bytes()),
+        },
     })
 }
 
@@ -139,18 +150,28 @@ impl EncodedRecord {
 
 /// Encodes `values` into a record.
 ///
-/// Trailing NULL columns are omitted, as SQLite's writer does, so a row of
-/// `(1, NULL)` costs no more on disk than `(1)`. The single exception is an
-/// all-NULL row, which still stores one serial type so that it occupies a cell:
-/// a table's row count is defined by cells, not by column values.
+/// Every column gets a serial type, trailing NULLs included. That is what
+/// SQLite does, and the doc used to say otherwise -- it claimed trailing NULL
+/// columns are "omitted, as SQLite's writer does", which is backwards: it is
+/// the *cheaper* encoding, and sqlite3 does not use it. Measured on 3.53.4, a
+/// three-column table stores three serial types for both
+/// `INSERT INTO a VALUES(1,2,NULL)` and `INSERT INTO a VALUES(NULL,NULL,NULL)`.
+///
+/// The difference is not cosmetic. The length of a record is the only evidence
+/// a reader has about which columns a row predates: SQLite does not rewrite the
+/// rows when an `ALTER TABLE ... ADD COLUMN` runs -- measured, the data page is
+/// byte-identical before and after -- so a row written before the ALTER is
+/// short, and its missing columns are supplied with their DEFAULT on read
+/// (see `connection::pad_row_to_table`). A writer that trimmed would make every
+/// row it wrote look like one, and a row that deliberately stored NULL could
+/// not be told from one that never mentioned the column.
+///
+/// The single remaining exception is an *empty* row, which is encoded as zero
+/// bytes: an absent header size reads back as zero columns, and a table's row
+/// count is defined by cells rather than by column values.
 pub fn encode(values: &[Value]) -> EncodedRecord {
     let column_count = values.len();
-    // Drop trailing NULLs, but always keep at least the first column.
-    let mut end = values.len();
-    while end > 1 && values[end - 1].is_null() {
-        end -= 1;
-    }
-    let kept = &values[..end];
+    let kept = values;
 
     // A record with no columns has no header at all, which is how SQLite
     // encodes a zero-column row: an absent header size reads back as zero.
@@ -205,7 +226,7 @@ pub fn encode(values: &[Value]) -> EncodedRecord {
             }
             Value::Real(r) => bytes.extend_from_slice(&r.to_be_bytes()),
             Value::Text(s) => bytes.extend_from_slice(s.as_bytes()),
-            Value::Blob(b) => bytes.extend_from_slice(b),
+            Value::TextBytes(b) | Value::Blob(b) => bytes.extend_from_slice(b),
         }
     }
     let body_len = (bytes.len() - body_start) as i64;
@@ -365,21 +386,31 @@ mod tests {
     }
 
     #[test]
-    fn trailing_nulls_are_trimmed_but_the_count_is_preserved() {
+    fn trailing_nulls_keep_their_serial_types() {
+        // SQLite does not trim a trailing NULL, and the cost of not trimming is
+        // only a byte or two in the header: a NULL column has serial type 0
+        // and no body at all. Measured on 3.53.4, a three-column table stores
+        // three serial types for `VALUES(1,2,NULL)`.
+        //
+        // The count matters more than the bytes. A record that is *shorter*
+        // than the table's declared width is the only evidence a reader has
+        // that a row predates an `ALTER TABLE ... ADD COLUMN`, which SQLite
+        // does not rewrite; those rows are read back with their new columns
+        // defaulted. A trimmed record would make an ordinary row look like
+        // one, and would make a row that stored NULL on purpose
+        // indistinguishable from one that never mentioned the column.
         let enc = encode(&[Value::Integer(7), Value::Null, Value::Null]);
-        // The two NULL columns cost nothing in the body, and the column count
-        // survives separately so the reader can pad the row back out.
         let d = decode_record(&enc.bytes, super::super::text::Encoding::Utf8).unwrap();
-        assert_eq!(d.values, vec![Value::Integer(7)]);
+        assert_eq!(d.values, vec![Value::Integer(7), Value::Null, Value::Null]);
         assert_eq!(enc.column_count, 3);
     }
 
     #[test]
-    fn an_all_null_row_still_stores_one_column() {
+    fn an_all_null_row_names_every_column() {
         let enc = encode(&[Value::Null, Value::Null]);
-        assert_eq!(enc.bytes.len(), 2, "header size plus one serial type");
+        assert_eq!(enc.bytes.len(), 3, "header size plus two serial types");
         let d = decode_record(&enc.bytes, super::super::text::Encoding::Utf8).unwrap();
-        assert_eq!(d.values, vec![Value::Null]);
+        assert_eq!(d.values, vec![Value::Null, Value::Null]);
         assert_eq!(enc.column_count, 2);
     }
 

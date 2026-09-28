@@ -320,9 +320,22 @@ impl<'a> TableBtree<'a> {
 
 /// Decodes a record, padding it out to `columns` values with NULLs.
 ///
-/// SQLite stores trailing NULL columns implicitly, so a three-column row whose
-/// last two values are NULL reads back as a one-value record; the caller knows
-/// the declared width and restores it here.
+/// This is the *narrow* half of widening a record, and it is deliberately not
+/// the whole of it. The doc used to claim SQLite "stores trailing NULL columns
+/// implicitly", which is false and was measured to be: sqlite3 writes a
+/// serial type for every column of every row, so
+/// `INSERT INTO t VALUES(1,2,NULL)` on a three-column table stores three
+/// serial types, not one.
+///
+/// A short record is therefore something *this engine's* writer produces --
+/// `record::encode` drops trailing NULLs -- and a reader has to decide what to
+/// put in the gap. `connection::pad_row_to_table` is that decision, and it
+/// supplies the DEFAULT of a column an `ALTER TABLE` added rather than writing
+/// a NULL; see its doc comment for the two-way measurement behind the
+/// distinction.
+///
+/// This function remains the plain NULL-padding primitive underneath that
+/// rule, and is what a caller wants when the width is all the caller knows.
 pub fn pad_to(values: Vec<Value>, columns: usize) -> Vec<Value> {
     let mut v = values;
     v.resize(columns, Value::Null);

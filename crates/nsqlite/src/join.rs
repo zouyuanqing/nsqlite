@@ -320,6 +320,54 @@ pub enum Ref {
     /// right. The list is the sources that hold the column, in FROM order; the
     /// name is carried so the walk can find the column within each one.
     Coalesced { holders: Vec<usize>, name: String },
+    /// One source's rowid, named by `rowid`, `_rowid_` or `oid`.
+    ///
+    /// A rowid is not a column: it is not in the table's column list, it is
+    /// stored in the b-tree cell rather than in the record, and a source that
+    /// contributed no row has none at all. So it gets a variant of its own
+    /// rather than a column index that would have to be invented and then
+    /// special-cased everywhere the variant is read.
+    ///
+    /// # Only a rowid table has one
+    ///
+    /// The value comes from [`JoinedRow::rowids`], which every rowid source
+    /// fills in. A WITHOUT ROWID table has no rowid, and neither has a VIEW, so
+    /// neither may resolve one -- and this variant must not be handed out for
+    /// either. [`source_has_rowid`] is that test, and it is what
+    /// [`resolve_ref`] consults. A statement that cannot be resolved because of
+    /// this is answered upstream: a WITHOUT ROWID table is refused by the DDL
+    /// itself and a VIEW is not a table this engine can read, so both report
+    /// `no such table` today and the branch is the reason they get there by the
+    /// right route when they are implemented. Widening it is the job of whoever
+    /// lands them, not a silent default here.
+    Rowid { source: usize },
+}
+
+/// The three names a rowid table answers to besides its own columns.
+///
+/// Measured against sqlite3 3.53.4: `SELECT rowid`, `SELECT _rowid_` and
+/// `SELECT oid` over the same table are the same value under every spelling,
+/// and each is shadowed by a real column of that name — `CREATE TABLE
+/// shadowrowid(rowid, a)` makes `rowid` the column and leaves `_rowid_` and
+/// `oid` answering for the row's key. The names are folded to lower case by the
+/// parser, but the comparison is case-insensitive anyway because every other
+/// name in this module is.
+const ROWID_NAMES: [&str; 3] = ["rowid", "_rowid_", "oid"];
+
+/// Whether `name` is one of the three names a rowid table answers to.
+pub fn is_rowid_name(name: &str) -> bool {
+    ROWID_NAMES.iter().any(|r| r.eq_ignore_ascii_case(name))
+}
+
+/// Whether a source is a table whose rows have a rowid, and so answers to
+/// `rowid`, `_rowid_` and `oid`.
+///
+/// A table declared WITHOUT ROWID stores its primary key in the record rather
+/// than as a b-tree key, and has no rowid at all; a source is a VIEW only if
+/// the catalog ever grows one, and a view has no rowid either. Both are refused
+/// upstream today, so this is the check that keeps them from growing one.
+pub fn source_has_rowid(s: &Source) -> bool {
+    !s.table.without_rowid
 }
 
 /// A resolution failure, carrying SQLite's wording.
@@ -408,6 +456,55 @@ pub fn resolve_ref(
             source: candidates[0].0,
             column: candidates[0].1,
         }),
+        // Nothing in the FROM holds the name as a column. The three rowid names
+        // are the only names a rowid table answers to besides its own columns,
+        // so one of them is answered here and everything else falls through to
+        // the message below.
+        //
+        // A real column always wins, and the order this is reached in is what
+        // makes that true: `matches` is empty, so no source has a column of
+        // that name. `CREATE TABLE shadowrowid(rowid, a)` therefore reads the
+        // COLUMN `rowid` and never reaches here, while `_rowid_` and `oid` on
+        // that same table do, and resolve to the row's key -- measured against
+        // sqlite3 3.53.4, which answers 9 for `rowid` and 1 for the other two.
+        //
+        // A rowid is a row's identity and not a value a table owns, so a
+        // self-join makes it ambiguous exactly as a shared column would:
+        // `SELECT rowid FROM t, u` is `ambiguous column name: rowid`.
+        0 if is_rowid_name(name) => {
+            let holders: Vec<usize> = from
+                .sources
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| match table {
+                    Some(t) => s.name.eq_ignore_ascii_case(t),
+                    None => true,
+                })
+                .filter(|(_, s)| source_has_rowid(s))
+                .map(|(i, _)| i)
+                .collect();
+            match holders.len() {
+                1 => Ok(Ref::Rowid {
+                    source: holders[0],
+                }),
+                0 => Err(Unresolved::new(match table {
+                    Some(t) => Msg::NoSuchColumnQualified.render(&[t.into(), name.into()]),
+                    None => Msg::NoSuchColumn.render(&[name.into()]),
+                })),
+                _ => {
+                    let shown = if star {
+                        let s = &from.sources[holders[0]];
+                        format!("main.{}.{}", s.name, name)
+                    } else {
+                        match table {
+                            Some(t) => format!("{t}.{name}"),
+                            None => name.to_string(),
+                        }
+                    };
+                    Err(Unresolved::new(format!("ambiguous column name: {shown}")))
+                }
+            }
+        }
         0 => Err(Unresolved::new(match table {
             // A three-part reference names the column first: `main.T.x` is the
             // column `x` of table `T` in schema `main`, and it has to be echoed
@@ -689,6 +786,15 @@ pub fn read(row: &JoinedRow, from: &From, r: &Ref) -> Value {
             .get(*column)
             .cloned()
             .unwrap_or(Value::Null),
+        // The key is not in the record at all -- it is the b-tree cell this row
+        // was found under -- so it is read from where the scan put it. A
+        // source that contributed no row has no key, and that reads as NULL
+        // rather than as 0: it is the right side of an outer join that matched
+        // nothing, and SQLite reports `NULL` for `rowid` there, not 0.
+        Ref::Rowid { source } => match row.rowids.get(*source).copied().flatten() {
+            Some(v) => Value::Integer(v),
+            None => Value::Null,
+        },
         // The holders are in FROM order, and the first that has a row supplies
         // the value. A source that contributed no row is a placeholder an outer
         // join left NULL, so it is skipped; a real NULL in a real row is a
@@ -902,12 +1008,51 @@ pub fn bind_all(from: &From, exprs: &[&Expr], aliases: &[String]) -> Result<Vec<
 /// first one holding the column owns it. `SELECT BB FROM Users` reports `Bb`
 /// for the same reason `SELECT p.x` reports `x` -- the name is the schema's,
 /// whichever way the statement wrote it.
+///
+/// # The three rowid names borrow the alias column's name
+///
+/// A rowid is not in the column list, so the search above cannot find it, and
+/// SQLite's answer is not a fixed name: it is the rowid alias column's name
+/// where the table has one, and `rowid` where it does not. Measured against
+/// sqlite3 3.53.4 with headers on, over a plain table `t` and a table whose
+/// INTEGER PRIMARY KEY is `x`:
+///
+/// ```text
+/// SELECT rowid, _rowid_, oid, t.rowid FROM t   ->  rowid | rowid | rowid | rowid
+/// SELECT rowid, _rowid_, oid, x     FROM ipk  ->  x     | x     | x     | x
+/// SELECT q.rowid              FROM ipk AS q  ->  x
+/// ```
+///
+/// All three spellings, the qualified one and the one reached through an alias
+/// all report the SAME name, so the rule is a property of the source's table
+/// and not of the qualifier: the alias is named only for as long as the name is
+/// being resolved. It is also not a naming policy this module invents -- the
+/// column it names is a real column and the value is the real column's value,
+/// so naming the pseudo-column after it is consistent with what it reads.
 pub fn schema_column_name(from: &From, qualifier: &str, column: &str) -> Option<String> {
     let base = strip_schema_qualifier(qualifier).unwrap_or(qualifier);
     let src = from
         .sources
         .iter()
         .find(|s| base.is_empty() || s.name.eq_ignore_ascii_case(base))?;
+    // A rowid name is answered only by a source that has one, and only when no
+    // real column of that name shadows it -- a table with a column called
+    // `rowid` has a `rowid` that IS that column, which is the branch below.
+    // `resolve_ref` decides which of the two a reference means and has already
+    // made the same choice, so the two agree.
+    if is_rowid_name(column) && source_has_rowid(src) {
+        let shadowed = src
+            .table
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(column));
+        if !shadowed {
+            return Some(match src.table.rowid_alias {
+                Some(i) => src.table.columns[i].name.clone(),
+                None => ROWID_NAMES[0].to_string(),
+            });
+        }
+    }
     src.table
         .columns
         .iter()

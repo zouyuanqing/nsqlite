@@ -354,6 +354,81 @@ pub fn out_of_range(n: usize, width: usize) -> Error {
         .error(&[crate::msg::count(n as u64), crate::msg::count(width as u64)])
 }
 
+/// Decides what every ORDER BY term of a **compound** SELECT means.
+///
+/// A compound is not [`resolve_keys`]'s case and the difference is not a detail.
+/// Its arms have been merged and their tables are gone, so a term that is an
+/// expression has nothing left to read: there is no FROM to resolve a column
+/// against and no projection to substitute an alias from. What a compound still
+/// has is the *whole* set of names its arms wrote, so a bare name naming any
+/// arm's column reads that column of the merged row -- `SELECT 1 AS x UNION
+/// SELECT 2 AS y ORDER BY y` sorts, and it is the one form that does.
+///
+/// The three rules survive in that order and the other two are strict:
+///
+/// * an integer literal is an ordinal, checked against the compound's width;
+/// * a bare name is one of the arms' column names, matched case-insensitively;
+/// * **anything else is an error.** `ORDER BY 1+0` is not the ordinal 1 with a
+///   `+0` on it, and `ORDER BY zzz` is not a column of a table named `zzz`:
+///   both are `Nth ORDER BY term does not match any column in the result set`.
+///   That is a third wording, neither the out-of-range one nor `no such
+///   column`, and it is what a simple SELECT's third rule would otherwise have
+///   become.
+///
+/// Measured against sqlite3 3.53.4:
+///
+/// ```text
+/// SELECT 1 AS x UNION SELECT 2 AS y ORDER BY y      ->  sorts
+/// SELECT 1 AS x UNION SELECT 2 AS y ORDER BY 1      ->  sorts
+/// SELECT 1 AS x UNION SELECT 2 AS y ORDER BY 9      ->  1st ORDER BY term out of range
+/// SELECT 1 AS x UNION SELECT 2 AS y ORDER BY 1+0    ->  does not match any column
+/// SELECT 1 AS x UNION SELECT 2 AS y ORDER BY y+1    ->  does not match any column
+/// SELECT 1 AS x UNION SELECT 2 AS y ORDER BY zzz    ->  does not match any column
+/// ```
+pub fn resolve_compound_keys(
+    sel: &Select,
+    names: &[String],
+    arm_names: &[String],
+) -> Result<Vec<Key>> {
+    let width = names.len();
+    let mut keys = Vec::with_capacity(sel.order_by.len());
+    for (i, (expr, ascending)) in sel.order_by.iter().enumerate() {
+        let key = if let Some(n) = ordinal_of(expr) {
+            if n < 1 || n > width as i64 {
+                return Err(out_of_range(i + 1, width));
+            }
+            Key {
+                kind: KeyKind::Ordinal,
+                at: Some(n as usize - 1),
+                expr: None,
+                ascending: *ascending,
+            }
+        } else if let Expr::Column {
+            table: None, name, ..
+        } = expr
+        {
+            // The compound's own reported names come from the leftmost arm, and
+            // a later arm may have written a name the leftmost one did not --
+            // which is `SELECT 1 AS x UNION SELECT 2 AS y ORDER BY y`. The
+            // leftmost is asked first so a name both arms wrote reads the
+            // leftmost, and a name only a later arm wrote still reads.
+            let at = position_of(names, name)
+                .or_else(|| position_of(arm_names, name))
+                .ok_or_else(|| crate::msg::order_by_term_no_match(i + 1))?;
+            Key {
+                kind: KeyKind::OutputName,
+                at: Some(at),
+                expr: None,
+                ascending: *ascending,
+            }
+        } else {
+            return Err(crate::msg::order_by_term_no_match(i + 1));
+        };
+        keys.push(key);
+    }
+    Ok(keys)
+}
+
 /// The first result column with that name, matching case-insensitively.
 pub fn position_of(names: &[String], name: &str) -> Option<usize> {
     names.iter().position(|n| n.eq_ignore_ascii_case(name))

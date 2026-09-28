@@ -36,6 +36,12 @@ pub enum Value {
     Integer(i64),
     Real(f64),
     Text(String),
+    /// Text whose bytes are not valid UTF-8, which is what
+    /// `CAST(<blob> AS TEXT)` produces. sqlite3 keeps the bytes verbatim --
+    /// `hex(CAST(x'FF' AS TEXT))` is `FF` and `length(CAST(x'FF41' AS
+    /// TEXT))` is 2 -- so a `String` cannot hold the value and the bytes need
+    /// their own case.
+    TextBytes(Vec<u8>),
     Blob(Vec<u8>),
 }
 
@@ -54,7 +60,7 @@ impl Value {
             Value::Null => Datatype::Null,
             Value::Integer(_) => Datatype::Integer,
             Value::Real(_) => Datatype::Real,
-            Value::Text(_) => Datatype::Text,
+            Value::Text(_) | Value::TextBytes(_) => Datatype::Text,
             Value::Blob(_) => Datatype::Blob,
         }
     }
@@ -85,6 +91,16 @@ impl Value {
         }
     }
 
+    /// The text's bytes. Both text cases answer: a `String` already holds the
+    /// bytes it was built from.
+    pub fn text_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Value::Text(s) => Some(s.as_bytes()),
+            Value::TextBytes(b) => Some(b),
+            _ => None,
+        }
+    }
+
     pub fn as_blob(&self) -> Option<&[u8]> {
         match self {
             Value::Blob(b) => Some(b),
@@ -111,6 +127,9 @@ impl Value {
             (Real(x), Real(y)) => cmp_real(*x, *y),
             (Integer(x), Real(y)) => cmp_int_real(*x, *y),
             (Real(x), Integer(y)) => cmp_int_real(*y, *x).reverse(),
+            (TextBytes(x), TextBytes(y)) => x.as_slice().cmp(y),
+            (Text(x), TextBytes(y)) => x.as_bytes().cmp(y),
+            (TextBytes(x), Text(y)) => x.as_slice().cmp(y.as_bytes()),
             (Text(x), Text(y)) => x.as_bytes().cmp(y.as_bytes()),
             (Blob(x), Blob(y)) => x.cmp(y),
             (Null, _) => Less,
@@ -200,10 +219,18 @@ impl Value {
             Value::Null => vec![CLASS_NULL],
             Value::Integer(i) => numeric_key(*i as i128, 0),
             Value::Real(r) => real_key(*r),
+            // Both text spellings share a class and a key shape, so a
+            // `TextBytes` and the `Text` of the same bytes are one identity.
             Value::Text(s) => {
                 let mut out = vec![CLASS_TEXT];
                 out.extend_from_slice(&(s.len() as u64).to_be_bytes());
                 out.extend_from_slice(s.as_bytes());
+                out
+            }
+            Value::TextBytes(b) => {
+                let mut out = vec![CLASS_TEXT];
+                out.extend_from_slice(&(b.len() as u64).to_be_bytes());
+                out.extend_from_slice(b);
                 out
             }
             Value::Blob(b) => {
@@ -577,6 +604,9 @@ impl fmt::Display for Value {
             Value::Integer(i) => write!(f, "{i}"),
             Value::Real(r) => f.write_str(&format_real(*r)),
             Value::Text(s) => f.write_str(s),
+            // Not a `write!` of a borrowed `str`, because these bytes need not
+            // be UTF-8 and the lossy conversion is what keeps `fmt` total.
+            Value::TextBytes(b) => f.write_str(&String::from_utf8_lossy(b)),
             Value::Blob(b) => write!(f, "x'{}'", hex(b)),
         }
     }
@@ -936,6 +966,9 @@ mod tests {
             }
             Value::Real(r) => format!("{r:?}"),
             Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+            // A text literal cannot spell a byte that is not UTF-8, so the
+            // literal is built from the bytes directly.
+            Value::TextBytes(b) => format!("x'{}", b.iter().map(|byte| format!("{byte:02X}")).collect::<String>()),
             Value::Blob(b) => format!(
                 "x'{}'",
                 b.iter()
@@ -1133,3 +1166,4 @@ mod tests {
         );
     }
 }
+

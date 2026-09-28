@@ -5,9 +5,14 @@ against the real `sqlite3` (3.53.4) on this machine, with every claim below
 produced by running a command rather than by reasoning about the code.
 
 Ordered smallest repro first. Each entry gives the statement, what each engine
-answered, and which one is right. **Where they differ, `sqlite3` is right** —
-every entry was checked against the real shell and none of the disagreements
-is a matter of taste or formatting.
+answered, and which one is right. **Every entry was run against the real shell
+before it was written down**, and in every case except entry 11 the engine is
+wrong and `sqlite3` is right.
+
+Entry 11 is the single exception and it is marked as such: both engines return
+infinity there, and they differ only in how that value is spelled when it
+becomes text. Everywhere else the disagreement is about a value, not about
+formatting.
 
 The class worth chasing is the one the four earlier passes found: the engine
 returns a **wrong answer rather than an error**, so nothing fails loudly. That
@@ -381,10 +386,10 @@ both ends, the boundary values stored in a column and read back, and the
 boundary passed through `abs()`, `round()`, `ceil()` and `floor()`. The whole
 of section 9a-9f agrees.
 
-### 11. Float overflow produces a real infinity, not SQLite's rendering
+### 11. An infinite real is stored, but the text of it is spelled differently
 
 ```sql
-SELECT 1e308 * 10;
+SELECT quote(1e400);
 ```
 
 | | |
@@ -392,18 +397,22 @@ SELECT 1e308 * 10;
 | sqlite3 | `9.0e+999` |
 | nsqlited | `Inf` |
 
-Both are the same value in IEEE terms, and `typeof` agrees (`real` on both), so
-this is a **rendering** difference rather than a wrong value — the first entry
-in this document that is one. It is listed because `quote()` and `printf()` of
-an infinite real will both differ, so anything that turns the value into text
-is affected. `SELECT 1e400` returns `Inf` on both.
+The same holds for the arithmetic that overflows: `quote(1e308 * 10)` is
+`9.0e+999` on sqlite3 and `Inf` on nsqlited, and `quote(-1e308 * 10)` is
+`-9.0e+999` against `-Inf`.
 
----
+**Both are infinity and both are `real`** -- `typeof(1e400)` is `real` on both
+and `1e400 > 1e308` is true on both -- so this is a **rendering** difference
+and not a wrong value. It is listed because `quote()`, `printf()`, and storing
+an infinite real into a TEXT column all turn the value into text, and in each
+of those the text is a different string. A TEXT column holding the result is
+therefore a genuinely different value.
 
-## Capabilities that are missing (refusals, not wrong answers)
-
-These are visible failures rather than silent ones, and are listed separately
-because they are a different kind of work.
+A caution about measuring this: the sqlite3 shell *displays* the result as
+`Inf`, which is what makes it look like the two agree. Only `quote()` shows what
+is actually stored, and this corpus compares `quote()`. An earlier draft of
+this entry claimed both sides returned `Inf`; that was read off the shell's
+display and was wrong.
 
 ### 12. `ALTER TABLE ... ADD COLUMN` is not implemented
 
@@ -500,6 +509,66 @@ Both engines refuse it (the corpus splitter left a stray `;` inside the
 literal) and both name the same span; the difference is whether the closing
 double quote is repeated. Cosmetic, and listed only because the suite compares
 text exactly.
+
+---
+
+## A compound's dedup is an ephemeral b-tree, and where it runs decides the answer
+
+UNION, UNION ALL, EXCEPT and INTERSECT are implemented. What the work turned up
+is that a compound's dedup is not a step in the operator: SQLite builds an
+ephemeral b-tree keyed by the row, *every* operator's result comes back through
+it, and a row the tree already holds is not written again. So a `UNION ALL` in
+the middle of a compound is not a licence to repeat, and the tree's insert rule
+— a b-tree keeps the key that got there first — decides which storage class
+answers when two spellings of one value meet.
+
+Three consequences, all measured on 3.53.4 and none of them guessable from the
+operator being applied:
+
+```sql
+SELECT 1   AS c1 UNION ALL SELECT 1.0 UNION SELECT 2;  -- 1,     2
+SELECT 1.0 AS c1 UNION ALL SELECT 1   UNION SELECT 2;  -- 1.0,   2
+```
+
+The same two values, in opposite order, with opposite answers. Neither "the
+integer wins" nor "the left arm wins" is the rule, and the pair is what rules
+them both out.
+
+The part that was actually wrong here is instructive. The dedup was being run
+*after* the sort, keeping the first row of each run of equal values. A b-tree
+insert keeps the row that arrived first, so the survivor is the earliest of the
+run **in the order the merge emitted it** — and sorting first silently picks the
+other one. The two steps commute, so this looked like a working implementation
+on every short compound and was wrong on every compound where a later deduping
+operator had a `UNION ALL` beneath it. The same pass also had to move from
+keeping the first of a sorted run to keeping the first *written*: `SELECT 1.0
+UNION ALL SELECT 1.0 UNION ALL SELECT 1.0 UNION SELECT 1` is `1`, where the real
+went in first and no integer was beside it to beat it.
+
+Two more things the tree's ordering settled that a value comparison cannot. The
+tiebreak between two spellings of one value is the *encoded record compared as
+bytes*, header included, and the header is what decides it: the integer 1 is
+`02 09` and the real 1.0 is `02 07 3f f0 ...`, so the integer is the greater
+record and sorts first. Comparing only the body reverses every one of these
+cases. And `SELECT 1 UNION ALL SELECT 1.0` is *two* rows while a trailing
+`UNION ALL` never dedups at all — `SELECT 1 UNION ALL SELECT 1.0 UNION ALL
+SELECT 1.0` is three — because the last operator's own result is what the tree
+sees, and `UNION ALL` hands it the concatenation untouched.
+
+One ordering bug was found alongside this and is worth naming because it is
+invisible for any input where a compound is not involved. A result column name
+written by a **later** arm is a legal `ORDER BY` term — `SELECT 1 AS x UNION
+SELECT 2 AS y ORDER BY y DESC` is `2, 1` — and it reads the result column it
+stood for *in that arm*. The names were being collected into one list with the
+later arms appended, so `y` landed at index 1 of a one-column list, the sort
+read past the end of every row, and the compound came out in its merge order
+with the `ORDER BY` silently ignored: right answer for ASC, wrong for DESC, and
+no error either way.
+
+A `COLLATE NOCASE` arm is the one measured compound case still wrong, and it is
+not a compound defect: this engine does not model collation at all, so
+`SELECT 'a' = 'A' COLLATE NOCASE` is `0` here and `1` on the real engine. It
+belongs with the collation gap, not here.
 
 ---
 

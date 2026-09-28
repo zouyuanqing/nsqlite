@@ -29,10 +29,13 @@
 //! the only way to guarantee that is for them to call the same code.
 
 use crate::catalog::Table;
-use crate::connection::{Connection, Outcome};
+use crate::connection::{
+    find_unique_conflict, key_names, Connection, Outcome,
+};
 use crate::error::{Error, Result, ResultCode};
-use crate::insert_select::{InsertTarget, Source};
-use crate::parser::Select;
+use crate::insert_select::{InsertTarget, Source, UniqueOutcome};
+use crate::parser::{ConflictAction, Select};
+use crate::table_tree::TableTree;
 use crate::value::Value;
 
 impl InsertTarget for Connection {
@@ -88,6 +91,86 @@ impl InsertTarget for Connection {
     /// duplicate rowid alias gets.
     fn write_row(&mut self, table: &Table, rowid: i64, values: Vec<Value>) -> Result<()> {
         self.insert_row(table, rowid, values)
+    }
+
+    /// Enforces a UNIQUE constraint for one row of an `INSERT ... SELECT`, and
+    /// performs the OR IGNORE and OR REPLACE actions.
+    ///
+    /// The three actions, as measured against sqlite3 3.53.4:
+    ///
+    /// * the default, and OR ABORT / OR FAIL / OR ROLLBACK, all refuse. Only
+    ///   ABORT is atomic across the statement, and it is here for free: the
+    ///   check runs before the row is written, so the rows ahead of the one that
+    ///   fails are not yet in the b-tree. That is what makes
+    ///   `INSERT INTO u SELECT x FROM s` with a duplicate in `s` leave 0 rows.
+    /// * OR IGNORE skips the row and the statement continues.
+    /// * OR REPLACE deletes the row it collides with and carries on, so the
+    ///   rows that did not conflict all survive.
+    fn write_unique(
+        &mut self,
+        table: &Table,
+        values: &[Value],
+        conflict: ConflictAction,
+        pending: &[(Vec<usize>, Vec<Value>)],
+    ) -> Result<UniqueOutcome> {
+        let keys = self.unique_constraints(table);
+        if keys.is_empty() {
+            return Ok(UniqueOutcome::Write);
+        }
+        // Rows this statement wrote are checked before the table is read: that
+        // needs no page, and it is the case that decides whether the statement
+        // is refused at all.
+        let hit = match find_unique_conflict(&keys, values, pending) {
+            Some(i) => Some(i),
+            None => self.stored_unique_conflict(table, &keys, values, None)?,
+        };
+        let Some(index) = hit else {
+            return Ok(UniqueOutcome::Write);
+        };
+        // Named here, not inside the Replace arm: the refusal message names
+        // every column of the key that collided, comma-space joined, the same
+        // way whether the statement asked for REPLACE or not.
+        let key = keys[index].clone();
+        match conflict {
+            ConflictAction::Ignore => Ok(UniqueOutcome::Skip),
+            ConflictAction::Replace => {
+                if let Some(doomed) = self.conflicting_rowid(table, &key, values)? {
+                    let mut tree = TableTree::open(&mut self.pager, table.root_page)?;
+                    tree.remove(&mut self.pager, doomed)?;
+                }
+                Ok(UniqueOutcome::Write)
+            }
+            _ => Err(crate::index_ddl::unique_violation(
+                &table.name,
+                &key_names(table, &key),
+            )),
+        }
+    }
+
+    /// The keys a written row should be remembered under for the rest of the
+    /// statement. A key holding a NULL is dropped: it can never conflict.
+    fn written_keys(&self, table: &Table, values: &[Value]) -> Vec<Vec<usize>> {
+        self.unique_constraints(table)
+            .into_iter()
+            .filter(|key| {
+                !key.iter()
+                    .any(|i| values.get(*i).map(|v| v.is_null()).unwrap_or(true))
+            })
+            .collect()
+    }
+
+    fn unique_keys(&self, table: &Table) -> Vec<Vec<usize>> {
+        self.unique_constraints(table)
+    }
+
+    fn stored_unique_conflict(
+        &mut self,
+        table: &Table,
+        keys: &[Vec<usize>],
+        values: &[Value],
+        exclude: Option<i64>,
+    ) -> Result<Option<usize>> {
+        Connection::stored_unique_conflict(self, table, keys, values, exclude)
     }
 
     /// Publishes the statement's effect: the change count, the last insert

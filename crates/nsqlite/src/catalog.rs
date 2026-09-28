@@ -42,6 +42,17 @@ pub struct Table {
     pub columns: Vec<Column>,
     /// The rowid alias, which is at most one column.
     pub rowid_alias: Option<usize>,
+    /// Every uniqueness constraint on this table, as the columns of each key.
+    ///
+    /// One entry per key, not per column: `UNIQUE(a,b)` is one entry naming
+    /// both, and a row violates it only when *all* of them match a row already
+    /// stored. A column-level `a UNIQUE` is a one-entry key.
+    ///
+    /// The rowid alias is deliberately absent. Its uniqueness is the b-tree's
+    /// own key check, which already refuses a duplicate before this is asked,
+    /// and including it would make `OR REPLACE` delete the row it is about to
+    /// write. See `Connection::check_unique`.
+    pub unique_sets: Vec<Vec<usize>>,
     /// A WITHOUT ROWID table has no rowid, which this engine does not yet
     /// implement, so such a table is recorded but not creatable.
     pub without_rowid: bool,
@@ -243,25 +254,11 @@ impl Catalog {
         columns: &[ColumnDef],
         table_constraints: &[Constraint],
     ) -> Table {
-        // A table-level PRIMARY KEY names its columns, and a single INTEGER one
-        // of those is the alias.
-        let mut pk_from_constraint: Option<Vec<String>> = None;
-        for c in table_constraints {
-            if let Constraint::PrimaryKey { .. } = c {
-                // The parser does not retain the column list, so a table-level
-                // primary key is treated as no alias, which is the safe reading:
-                // claiming an alias that does not exist would make writes put
-                // the value in the wrong slot.
-                pk_from_constraint = Some(Vec::new());
-            }
-        }
-        let _ = pk_from_constraint;
-
         // A column-level INTEGER PRIMARY KEY, in a table without WITHOUT ROWID,
         // is the alias. `PRIMARY KEY DESC` is deliberately excluded: SQLite
         // does not make such a column an alias, because the alias is looked up
         // in ascending order.
-        let alias: Option<usize> = columns.iter().position(|c| {
+        let column_alias: Option<usize> = columns.iter().position(|c| {
             c.constraints.iter().any(|k| {
                 matches!(
                     k,
@@ -284,20 +281,106 @@ impl Catalog {
                     .iter()
                     .any(|k| matches!(k, Constraint::NotNull)),
                 default: c.constraints.iter().find_map(|k| match k {
-                    Constraint::Default(e) => Some(e.clone()),
+                    Constraint::Default { expr: e, .. } => Some(e.clone()),
                     _ => None,
                 }),
                 rowid_alias: false,
             })
             .collect();
 
+        // Every uniqueness constraint, from the three places one can be written,
+        // resolved to column positions. The rowid alias is dropped at the end,
+        // not here: it is a uniqueness constraint like any other until the
+        // b-tree's own key check has already refused its duplicate, and the
+        // exclusion is easier to see in one place.
+        let mut unique_sets: Vec<Vec<usize>> = Vec::new();
+
+        // `a UNIQUE` on a column of its own.
+        for (i, c) in columns.iter().enumerate() {
+            if c.constraints
+                .iter()
+                .any(|k| matches!(k, Constraint::Unique { .. }))
+            {
+                unique_sets.push(vec![i]);
+            }
+        }
+
+        // A column-level `a PRIMARY KEY` is a uniqueness constraint too, unless
+        // it is the alias -- which is the whole difference between `a PRIMARY
+        // KEY` and `a INTEGER PRIMARY KEY` on the same table. This is what
+        // sqlite3 reports `UNIQUE constraint failed: t.a` for, and the b-tree
+        // never sees it, so nothing else would refuse it.
+        for (i, c) in columns.iter().enumerate() {
+            if column_alias != Some(i)
+                && c.constraints.iter().any(|k| {
+                    matches!(k, Constraint::PrimaryKey { ascending: true, .. })
+                })
+            {
+                unique_sets.push(vec![i]);
+            }
+        }
+
+        // The table-level forms, which name their columns and so carry a key of
+        // any width. A name the table does not have contributes nothing rather
+        // than making the key unrestrictable: the reference refuses such a
+        // table at CREATE time, and this engine does not, so the key is simply
+        // the columns that resolved.
+        for c in table_constraints {
+            let names: &[String] = match c {
+                Constraint::PrimaryKey { columns, .. } if columns.len() > 1 => columns,
+                Constraint::Unique { columns } => columns,
+                _ => continue,
+            };
+            let mut key = Vec::with_capacity(names.len());
+            for n in names {
+                if let Some(i) = cols.iter().position(|c| c.name.eq_ignore_ascii_case(n)) {
+                    key.push(i);
+                }
+            }
+            if !key.is_empty() {
+                unique_sets.push(key);
+            }
+        }
+
+        // A table-level `PRIMARY KEY(a)` is the alias when `a` is the single
+        // INTEGER column it names, and a uniqueness constraint otherwise. Only
+        // a column-level INTEGER primary key was consulted above, so this is
+        // the one case a table-level key can still be an alias.
+        let mut table_alias: Option<usize> = None;
+        for c in table_constraints {
+            if let Constraint::PrimaryKey { columns, .. } = c {
+                if columns.len() != 1 {
+                    continue;
+                }
+                if let Some(i) = cols
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&columns[0]))
+                {
+                    if cols[i].affinity == Affinity::Integer {
+                        table_alias = Some(i);
+                    }
+                }
+            }
+        }
+        // A column-level INTEGER primary key wins: it is unambiguous, whereas
+        // the table-level form is a second opinion about the same table.
+        let alias = column_alias.or(table_alias);
+
         let mut table = Table {
             name: name.to_owned(),
             columns: cols,
             rowid_alias: alias,
+            unique_sets,
             without_rowid: false,
             root_page: 0,
         };
+        // The alias is enforced by the b-tree, which refuses a duplicate key
+        // before this table's `unique_sets` is ever consulted, so a key that is
+        // only the alias would double every check -- and under OR REPLACE would
+        // make the conflict handling delete the row it is about to write.
+        table.unique_sets.retain(|key| {
+            !(key.len() == 1 && table.rowid_alias == Some(key[0]))
+        });
         if let Some(i) = table.rowid_alias {
             table.columns[i].rowid_alias = true;
         }

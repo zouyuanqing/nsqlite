@@ -588,11 +588,25 @@ fn folds_operands(expr: &Expr) -> bool {
     }
 }
 
-/// Whether a source answers to `name`. The three rowid names count as columns
-/// of every source, since a rowid table has them either way.
+/// Whether a source answers to `name`.
+///
+/// The three rowid names count, because a rowid table answers to them as well
+/// as to its own columns: `SELECT count(*) FROM t GROUP BY rowid` groups by the
+/// row's key and is not `no such column: rowid`. They are asked of
+/// [`crate::join::is_rowid_name`] rather than of a list kept here, because a
+/// second list is a second answer to the same question and the two would drift —
+/// a fourth name added to the resolver would be missing from this one, and the
+/// symptom would be a GROUP BY that reported `no such column` for a name the
+/// very same statement's projection had just resolved.
+///
+/// A real column of one of those names wins, which is why the columns are
+/// checked first and why this is an `||` rather than a choice: a table with a
+/// column called `rowid` answers `rowid` to that column, and `rowid` is in both
+/// lists so either answer resolves. The values differ, and that is settled by
+/// the resolver rather than here — all this has to decide is whether the NAME
+/// resolves.
 fn has_column(cols: &[String], name: &str) -> bool {
-    cols.iter().any(|c| c.eq_ignore_ascii_case(name))
-        || ROWID_NAMES.iter().any(|r| r.eq_ignore_ascii_case(name))
+    cols.iter().any(|c| c.eq_ignore_ascii_case(name)) || crate::join::is_rowid_name(name)
 }
 
 /// `no such column: a`, or `no such column: t.a` for a qualified one.
@@ -614,10 +628,6 @@ fn no_such_column(qualifier: Option<&str>, name: &str) -> String {
         None => format!("no such column: {name}"),
     }
 }
-
-/// The names a rowid table answers to besides its own columns. SQLite has
-/// three, and any of them resolves in a GROUP BY like a column.
-const ROWID_NAMES: [&str; 3] = ["rowid", "_rowid_", "oid"];
 
 /// Builds the [`Names`] for a statement's FROM out of the catalog.
 ///

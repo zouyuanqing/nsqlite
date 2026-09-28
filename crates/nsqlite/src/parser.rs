@@ -289,16 +289,72 @@ pub enum Constraint {
     PrimaryKey {
         ascending: bool,
         autoincrement: bool,
+        /// The columns a *table-level* `PRIMARY KEY(a,b)` named, in the order
+        /// it wrote them. A column-level primary key leaves it empty, because
+        /// the column carrying the constraint is the key and the catalog knows
+        /// which one that is. It is the same rule the table's rowid alias uses,
+        /// so one reading covers both.
+        columns: Vec<String>,
     },
     NotNull,
-    Unique,
-    Default(Expr),
+    /// A uniqueness constraint: `UNIQUE` on a column, or a table-level
+    /// `UNIQUE(a,b)`. `columns` is as it is for a table-level primary key.
+    Unique { columns: Vec<String> },
+    /// A `DEFAULT`, and whether it was written inside parentheses.
+    ///
+    /// The parentheses are not decoration: SQLite's grammar reads an
+    /// unparenthesised `DEFAULT a` as a *string literal* and a parenthesised
+    /// `DEFAULT (a)` as a *reference* to a column, and refuses the reference
+    /// with `default value of column [c] is not constant` wherever it appears.
+    /// The two spellings produce the same expression tree and differ only in
+    /// this flag, so the flag is what has to survive the parse for that
+    /// refusal to be reachable at all.
+    Default {
+        expr: Expr,
+        parenthesized: bool,
+    },
     Check(Expr),
     ForeignKey {
         table: String,
         columns: Vec<String>,
     },
     Collate(String),
+}
+
+/// What a write does when it hits a UNIQUE or PRIMARY KEY conflict: the
+/// `OR IGNORE` / `OR REPLACE` / `OR ABORT` / `OR FAIL` / `OR ROLLBACK` clause,
+/// and the absence of one.
+///
+/// This used to be parsed and thrown away in a single `advance()`, which left
+/// no way to tell `INSERT OR IGNORE` from `INSERT` and made three different
+/// behaviours indistinguishable. The default is [`ConflictAction::Abort`]
+/// because ABORT is what a statement with no clause does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConflictAction {
+    /// Skip the row that conflicts and carry on with the rest. Does not apply to
+    /// a NOT NULL violation, which is not a conflict and still aborts.
+    Ignore,
+    /// Delete the conflicting row and insert the new one. This is a delete
+    /// followed by an insert, so the surviving row has a *new* rowid.
+    Replace,
+    /// Undo the whole statement and report the error. The default.
+    #[default]
+    Abort,
+    /// Stop the statement and report the error, keeping what earlier statements
+    /// wrote.
+    Fail,
+    /// Undo the whole transaction. Like Abort for a statement outside one,
+    /// which is the only kind this engine has.
+    Rollback,
+}
+
+impl ConflictAction {
+    /// Whether a conflict leaves this statement's earlier rows behind, which is
+    /// what tells FAIL and ROLLBACK apart from ABORT when there is no
+    /// transaction to roll back.
+    pub fn leaves_prior_rows(self) -> bool {
+        matches!(self, ConflictAction::Fail | ConflictAction::Rollback)
+    }
 }
 
 /// A statement the engine can execute.
@@ -329,6 +385,33 @@ pub enum Stmt {
         name: String,
         if_exists: bool,
     },
+    /// `ALTER TABLE <name> ADD COLUMN <column>`, the one ALTER shape this
+    /// engine runs.
+    ///
+    /// The other two -- `RENAME TO` and `DROP COLUMN` -- are separate and
+    /// larger, and stay in [`Stmt::Unsupported`] rather than being refused as
+    /// syntax errors.
+    AlterTableAddColumn {
+        name: String,
+        /// The added column's `DEFAULT (name)`, when it had one: a reference
+        /// rather than a constant, which SQLite refuses -- but only after the
+        /// table has been resolved, since a missing table is the louder
+        /// answer. See [`Parser::default_name_reference`].
+        default_name_reference: Option<String>,
+        /// The new column, read by the same `column_def` a `CREATE TABLE`
+        /// reads, so the four name quotings and the constraint list are the
+        /// ones the table grammar already accepts.
+        column: ColumnDef,
+        /// The added column's own source text, from the first token of its
+        /// name through the end of its last constraint.
+        ///
+        /// This is what gets spliced into the stored `CREATE TABLE` text, and
+        /// it is sliced out of the source rather than rebuilt from
+        /// [`Self::AlterTableAddColumn::column`]: SQLite keeps the spelling
+        /// the statement used, so `DEFAULT x'00FF'` and `DEFAULT (1+2)` both
+        /// have to survive verbatim.
+        column_sql: String,
+    },
     CreateIndex {
         name: Option<String>,
         table: String,
@@ -344,11 +427,16 @@ pub enum Stmt {
         table: String,
         columns: Option<Vec<String>>,
         source: InsertSource,
+        /// What to do about a UNIQUE conflict. `Abort` when the statement said
+        /// nothing, which is what the reference does.
+        conflict: ConflictAction,
     },
     Update {
         table: String,
         sets: Vec<(String, Expr)>,
         where_: Option<Expr>,
+        /// As on INSERT: the default is `Abort`.
+        conflict: ConflictAction,
     },
     Delete {
         table: String,
@@ -448,6 +536,11 @@ impl Stmt {
                 let _ = name;
                 ""
             }
+            // The added column keeps the statement's own spelling, which is the
+            // text a `"..."` name has to be read back out of: this variant is
+            // the one whose names are in its own copy rather than the
+            // caller's, exactly as the two DDL shapes above are.
+            Stmt::AlterTableAddColumn { column_sql, .. } => column_sql.as_str(),
             Stmt::Unsupported(_)
             | Stmt::Pragma(_)
             | Stmt::Begin
@@ -741,6 +834,18 @@ struct Parser<'a> {
     index: usize,
     depth: usize,
     sql: &'a str,
+    /// The column whose `DEFAULT (name)` is a reference, and so is not a
+    /// constant, set by the column grammar and cleared by whoever consumes it.
+    ///
+    /// It is held here rather than raised on the spot because the order of two
+    /// refusals is measured and the two belong to different layers. SQLite
+    /// refuses it in its *grammar*, so a `CREATE TABLE t(a,b DEFAULT (a))` is
+    /// a parse error and a parse error is not overridable. The same grammar
+    /// rule applies to an `ALTER TABLE`, but SQLite resolves the table first
+    /// there, so `ALTER TABLE nosuch ADD COLUMN c DEFAULT (a)` says `no such
+    /// table: nosuch` instead (both measured on 3.53.4). One flag, consulted
+    /// where the order is known, is what lets the two agree.
+    default_name_reference: Option<String>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
@@ -752,6 +857,7 @@ impl<'a> Parser<'a> {
             index: 0,
             depth: 0,
             sql,
+            default_name_reference: None,
             _marker: std::marker::PhantomData,
         })
     }
@@ -1302,6 +1408,7 @@ impl<'a> Parser<'a> {
             Some(Token::Keyword(Keyword::Delete)) => self.delete(),
             Some(Token::Keyword(Keyword::Create)) => self.create(),
             Some(Token::Keyword(Keyword::Drop)) => self.drop(),
+            Some(Token::Keyword(Keyword::Alter)) => self.alter(),
             Some(Token::Keyword(Keyword::Begin)) => {
                 self.advance();
                 self.skip_to_semicolon()?;
@@ -2752,9 +2859,15 @@ impl<'a> Parser<'a> {
 
     fn insert(&mut self) -> Result<Stmt> {
         self.advance(); // INSERT or REPLACE
-                        // OR IGNORE / OR REPLACE / OR ABORT / OR FAIL / OR ROLLBACK.
+        // OR IGNORE / OR REPLACE / OR ABORT / OR FAIL / OR ROLLBACK. The
+        // leading `REPLACE` is consumed by the `advance()` above and cannot be
+        // told from `INSERT` here, so `REPLACE INTO t VALUES(1)` is
+        // indistinguishable from `INSERT INTO t VALUES(1)` -- which is how the
+        // grammar has always read it. `OR REPLACE` does reach this arm and is
+        // not lost.
+        let mut conflict = ConflictAction::Abort;
         if self.eat_keyword(Keyword::Or)? {
-            self.advance();
+            conflict = self.conflict_action();
         }
         // INTO is optional.
         self.eat_keyword(Keyword::Into)?;
@@ -2794,6 +2907,7 @@ impl<'a> Parser<'a> {
             table: full,
             columns,
             source,
+            conflict,
         })
     }
 
@@ -2845,8 +2959,9 @@ impl<'a> Parser<'a> {
 
     fn update(&mut self) -> Result<Stmt> {
         self.advance();
+        let mut conflict = ConflictAction::Abort;
         if self.eat_keyword(Keyword::Or)? {
-            self.advance();
+            conflict = self.conflict_action();
         }
         let table = self.query_name("after UPDATE")?;
         let mut full = table;
@@ -2879,6 +2994,7 @@ impl<'a> Parser<'a> {
             table: full,
             sets,
             where_,
+            conflict,
         })
     }
 
@@ -2914,7 +3030,11 @@ impl<'a> Parser<'a> {
         if self.eat_keyword(Keyword::Table)? {
             return self.create_table(temp);
         }
-        if self.eat_keyword(Keyword::Unique)? || self.at_keyword(Keyword::Index) {
+        // `CREATE UNIQUE INDEX` must NOT eat the UNIQUE here. It is
+        // `create_index` that reads it, so that the flag it records is the one
+        // the statement actually carried: consuming it twice left every UNIQUE
+        // index recorded as non-unique, and nothing then enforced it.
+        if self.at_keyword(Keyword::Unique) || self.at_keyword(Keyword::Index) {
             return self.create_index();
         }
         if self.eat_keyword(Keyword::View)? {
@@ -2984,6 +3104,16 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(Punct::RParen, "closing a table definition")?;
+        // A `DEFAULT (name)` is refused here rather than in the column
+        // grammar, and the difference is only in where it can be seen. On the
+        // CREATE path the grammar *is* the whole answer -- a parse error
+        // cannot be overridden -- so this is raised before the statement is
+        // handed on. Measured on 3.53.4: `CREATE TABLE t(a,b DEFAULT (a))` is
+        // `default value of column [b] is not constant`, and so is
+        // `DEFAULT (+a)` and `DEFAULT (a COLLATE nocase)`.
+        if let Some(column) = self.default_name_reference.take() {
+            return Err(msg::cannot_add::default_not_constant(&column));
+        }
         let mut without_rowid = false;
         let mut strict = false;
         // Table options, in any order.
@@ -3032,6 +3162,100 @@ impl<'a> Parser<'a> {
             strict,
             temp,
             sql,
+        })
+    }
+
+    /// `ALTER TABLE`, of which this engine runs `ADD COLUMN`.
+    ///
+    /// `ADD` and `ADD COLUMN` are one clause: measured against sqlite3
+    /// 3.53.4, `ALTER TABLE t ADD c` stores `CREATE TABLE t(a,b, c)` exactly
+    /// as `ALTER TABLE t ADD COLUMN c` does, so the `COLUMN` word is optional
+    /// and is not part of the text that gets spliced either way.
+    ///
+    /// `RENAME TO` and `DROP COLUMN` are not this, and neither is a bare
+    /// `ALTER TABLE t`. All three are refused as [`Stmt::Unsupported`] with the
+    /// tokens consumed up to the semicolon, so they keep answering `rename is
+    /// not supported yet` rather than regressing into the `near "ALTER":
+    /// syntax error` the statement dispatcher used to hand back for the whole of
+    /// `ALTER`.
+    ///
+    /// Only the two ALTER shapes that name an unimplemented *feature* take that
+    /// channel. A statement that is merely malformed is a syntax error, and
+    /// keeping the two apart is the point: measured on 3.53.4,
+    /// `ALTER TABLE t RENAME TO z2` is a real statement this engine does not
+    /// run, while `ALTER TABLE t` with no clause and `ALTER TABLE t XYZZY` are
+    /// not statements at all and are `near ";": syntax error` and
+    /// `near "XYZZY": syntax error`.
+    fn alter(&mut self) -> Result<Stmt> {
+        self.expect_keyword(Keyword::Alter, "after a statement keyword")?;
+        self.expect_keyword(Keyword::Table, "after ALTER")?;
+        let mut name = self.query_name("after ALTER TABLE")?;
+        while self.eat_punct(Punct::Dot)? {
+            name.push('.');
+            name.push_str(&self.query_name("after a table qualifier")?);
+        }
+        if !self.at_keyword(Keyword::Add) {
+            // RENAME and DROP COLUMN land here. The keyword goes into the
+            // message, so `ALTER TABLE t RENAME TO z2` says `rename is not
+            // supported yet` -- the same refusal a `DROP INDEX` gets, rather
+            // than a syntax error about a statement this engine never
+            // implemented.
+            let what = match self.peek() {
+                // These two *are* ALTER clauses SQLite defines, and they are the
+                // ones this engine has not written.
+                Some(Token::Keyword(Keyword::Rename)) | Some(Token::Keyword(Keyword::Drop)) => {
+                    let k = self.peek().and_then(|t| match t {
+                        Token::Keyword(k) => Some(k.as_str().to_string()),
+                        _ => None,
+                    });
+                    k.unwrap_or_else(|| "alter".to_string())
+                }
+                // Anything else is a token where an ALTER clause belongs, which
+                // is a syntax error rather than a missing feature -- including
+                // the end of the statement, which is `near ";": syntax error`
+                // and not an `incomplete input`, measured.
+                _ => {
+                    let span = self.span();
+                    self.skip_to_semicolon()?;
+                    return Err(msg::syntax_error(&self.text_at(span)));
+                }
+            };
+            self.skip_to_semicolon()?;
+            return Ok(Stmt::Unsupported(what));
+        }
+        self.advance();
+        // COLUMN is the optional word, not a second thing to require.
+        self.eat_keyword(Keyword::Column)?;
+
+        // The column's own text runs from the first token of its name to the
+        // end of its last constraint, and it is recorded by span before the
+        // parse so the text is the statement's spelling and not a
+        // reconstruction. `column_def` stops at the token it cannot use, which
+        // is the `;` here and is a comma in a script that has one.
+        let start = self
+            .tokens
+            .get(self.index)
+            .map(|(_, s)| s.start)
+            .unwrap_or(0);
+        let column = self.column_def()?;
+        let end = self
+            .tokens
+            .get(self.index.saturating_sub(1))
+            .map(|(_, s)| s.end)
+            .unwrap_or(start);
+        let column_sql = self.sql.get(start..end).unwrap_or("").trim().to_string();
+        // `column_def` stops at a token it cannot use, and a token that is not
+        // the end of the statement means the statement was not this one:
+        // `DEFAULT 1+2` is `near "+": syntax error`, not an ADD COLUMN whose
+        // default is `1`. Consuming the tail here would swallow that.
+        if self.peek().is_some() && !self.eat_punct(Punct::Semicolon)? {
+            return Err(self.syntax_error_here());
+        }
+        Ok(Stmt::AlterTableAddColumn {
+            name,
+            default_name_reference: self.default_name_reference.take(),
+            column,
+            column_sql,
         })
     }
 
@@ -3121,7 +3345,7 @@ impl<'a> Parser<'a> {
         }
         let mut constraints = Vec::new();
         loop {
-            if let Some(c) = self.column_constraint()? {
+            if let Some(c) = self.column_constraint(&name)? {
                 constraints.push(c);
             } else {
                 break;
@@ -3167,7 +3391,29 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn column_constraint(&mut self) -> Result<Option<Constraint>> {
+    /// Reads the `COLLATE name` that may sit on a `DEFAULT`, returning the
+    /// expression with it attached.
+    ///
+    /// The `COLLATE` is the last thing an unparenthesised `DEFAULT` can be
+    /// followed by, so this runs once and takes whatever it finds; a second
+    /// `COLLATE` is left for the caller to refuse as the syntax error it is.
+    fn eat_default_collation(&mut self, e: Expr) -> Result<Expr> {
+        if !self.eat_keyword(Keyword::Collate)? {
+            return Ok(e);
+        }
+        let collation = self.name("after COLLATE")?;
+        Ok(Expr::Collate {
+            expr: Box::new(e),
+            collation,
+        })
+    }
+
+    /// Reads one constraint on a column, or `None` when the next token does
+    /// not start one.
+    ///
+    /// `column` is the name the column was declared under, which is the name
+    /// the one refusal here has to report. See the `DEFAULT` arm.
+    fn column_constraint(&mut self, column: &str) -> Result<Option<Constraint>> {
         if self.eat_keyword(Keyword::Primary)? {
             self.expect_keyword(Keyword::Key, "after PRIMARY")?;
             self.eat_keyword(Keyword::Asc)?;
@@ -3188,6 +3434,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Constraint::PrimaryKey {
                 ascending,
                 autoincrement,
+                columns: Vec::new(),
             }));
         }
         if self.eat_keyword(Keyword::Not)? {
@@ -3205,7 +3452,7 @@ impl<'a> Parser<'a> {
                 self.eat_keyword(Keyword::Conflict)?;
                 self.advance();
             }
-            return Ok(Some(Constraint::Unique));
+            return Ok(Some(Constraint::Unique { columns: Vec::new() }));
         }
         if self.eat_keyword(Keyword::Check)? {
             self.expect_punct(Punct::LParen, "after CHECK")?;
@@ -3214,13 +3461,40 @@ impl<'a> Parser<'a> {
             return Ok(Some(Constraint::Check(e)));
         }
         if self.eat_keyword(Keyword::Default)? {
+            // A parenthesised default is SQLite's expression form, and it is
+            // kept as that rather than reduced to a NULL the way the
+            // parenthesised case used to be: a `DEFAULT (a)` has to be told
+            // apart from a `DEFAULT a`, and the two are not the same value.
+            // See `is_builtin_constant_default` for what SQLite accepts and
+            // `is_a_name_reference` for the spelling it refuses.
             if self.eat_punct(Punct::LParen)? {
-                self.expr()?;
+                let e = self.expr()?;
                 self.expect_punct(Punct::RParen, "closing a DEFAULT expression")?;
-                return Ok(Some(Constraint::Default(Expr::Literal(Literal::Null))));
+                // Recorded rather than raised: see
+                // [`Parser::default_name_reference`] for why the two callers
+                // that reach here answer differently.
+                if is_a_name_reference(&e) {
+                    self.default_name_reference = Some(column.to_string());
+                }
+                return Ok(Some(Constraint::Default {
+                    expr: e,
+                    parenthesized: true,
+                }));
             }
+            // Without the parens SQLite's grammar does not read a default as an
+            // expression at all: it reads a literal, a signed literal, or a
+            // collation applied to either. The measured width of that is
+            // `literal +/- COLLATE name`, and anything past it is a syntax
+            // error at the token that ends it -- `DEFAULT 1+2` is `near "+"`,
+            // `DEFAULT abs(1)` is `near "("` -- so the expression stops here
+            // rather than taking a run of operators into the next column's
+            // definition.
             let e = self.expr_unary()?;
-            return Ok(Some(Constraint::Default(e)));
+            let e = self.eat_default_collation(e)?;
+            return Ok(Some(Constraint::Default {
+                expr: e,
+                parenthesized: false,
+            }));
         }
         if self.eat_keyword(Keyword::Collate)? {
             let c = self.name("after COLLATE")?;
@@ -3246,7 +3520,7 @@ impl<'a> Parser<'a> {
         // follows, which the caller already consumed.
         if self.eat_keyword(Keyword::Constraint)? {
             self.quoted_name("after CONSTRAINT")?;
-            return self.column_constraint();
+            return self.column_constraint(column);
         }
         Ok(None)
     }
@@ -3305,19 +3579,11 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
             self.expect_punct(Punct::LParen, "after PRIMARY KEY")?;
-            // The column list is consumed; enforcement comes later.
-            let mut depth = 1;
-            while depth > 0 {
-                match self.advance() {
-                    Some(Token::Punct(Punct::LParen)) => depth += 1,
-                    Some(Token::Punct(Punct::RParen)) => depth -= 1,
-                    Some(_) => {}
-                    None => break,
-                }
-            }
+            let columns = self.indexed_column_list()?;
             return Ok(Constraint::PrimaryKey {
                 ascending,
                 autoincrement,
+                columns,
             });
         }
         if self.eat_keyword(Keyword::Unique)? {
@@ -3326,16 +3592,8 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
             self.expect_punct(Punct::LParen, "after UNIQUE")?;
-            let mut depth = 1;
-            while depth > 0 {
-                match self.advance() {
-                    Some(Token::Punct(Punct::LParen)) => depth += 1,
-                    Some(Token::Punct(Punct::RParen)) => depth -= 1,
-                    Some(_) => {}
-                    None => break,
-                }
-            }
-            return Ok(Constraint::Unique);
+            let columns = self.indexed_column_list()?;
+            return Ok(Constraint::Unique { columns });
         }
         if self.eat_keyword(Keyword::Check)? {
             self.expect_punct(Punct::LParen, "after CHECK")?;
@@ -3370,6 +3628,52 @@ impl<'a> Parser<'a> {
             return Ok(Constraint::ForeignKey { table, columns });
         }
         Err(self.unexpected("parsing a table constraint"))
+    }
+
+    /// The word naming a conflict action, with the cursor left on it.
+    ///
+    /// A word that is not one of the five is a syntax error in the reference, but
+    /// this parser's job here is only to tell the actions apart, and ABORT is
+    /// what an absent clause means anyway -- so an unrecognised one advances and
+    /// reads as ABORT rather than refusing a statement the old parser accepted.
+    fn conflict_action(&mut self) -> ConflictAction {
+        let action = match self.peek() {
+            Some(Token::Keyword(Keyword::Ignore)) => ConflictAction::Ignore,
+            Some(Token::Keyword(Keyword::Replace)) => ConflictAction::Replace,
+            Some(Token::Keyword(Keyword::Fail)) => ConflictAction::Fail,
+            Some(Token::Keyword(Keyword::Rollback)) => ConflictAction::Rollback,            // ABORT is a keyword, and the default arm covers it and anything
+            // else. Falling through to ABORT rather than erroring keeps every
+            // statement the old parser took still parsing.
+            _ => ConflictAction::Abort,
+        };
+        self.advance();
+        action
+    }
+
+    /// The comma-separated column names inside a table constraint's parentheses,
+    /// as in `UNIQUE(a,b)` or `PRIMARY KEY(a,b)`.
+    ///
+    /// This list used to be swallowed token by token, which made a multi-column
+    /// constraint unenforceable: the catalog is told a key exists but not which
+    /// columns it is over. Only the names are taken. A per-column `COLLATE` or
+    /// `ASC`/`DESC` is left where it is, which is not a column name and not a
+    /// comma, so it ends the list and a following `)` is still in the right
+    /// place. A collation on a unique key is a real thing sqlite3 honours and
+    /// this does not, so `UNIQUE(a COLLATE NOCASE)` lands here as just `a` --
+    /// a key over the right column, compared the way this engine compares
+    /// every key. That is the same case the write path already has for
+    /// `CREATE UNIQUE INDEX ... COLLATE`, and it is narrower than getting the
+    /// common case wrong.
+    fn indexed_column_list(&mut self) -> Result<Vec<String>> {
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.quoted_name("in a constraint column list")?);
+            if !self.eat_punct(Punct::Comma)? {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RParen, "closing a constraint column list")?;
+        Ok(columns)
     }
 
     fn create_index(&mut self) -> Result<Stmt> {
@@ -3514,6 +3818,108 @@ fn set_natural(item: &mut FromItem, kind: Option<JoinKind>) -> Result<()> {
             crate::error::ResultCode::Error,
             "a subquery in FROM is not supported yet",
         )),
+    }
+}
+
+/// Whether an expression is a *reference* to a name rather than a value.
+///
+/// This is the one shape SQLite's `DEFAULT` grammar refuses wherever it
+/// appears, and it is decided on the spelling rather than on the name: a bare
+/// `a` is a string literal and a parenthesised `(a)` is a reference, so the
+/// same word is a constant in one and is not in the other. Measured on
+/// 3.53.4, `CREATE TABLE t(a,b DEFAULT (a))` is `default value of column [b]
+/// is not constant` while `DEFAULT a` is accepted, and a `COLLATE` on either
+/// side does not change the answer -- `DEFAULT (a COLLATE nocase)` is still
+/// refused and `DEFAULT a COLLATE nocase` is still fine.
+///
+/// Every other expression is a value as far as this check is concerned,
+/// including `(1+2)`: whether *that* one is constant is a different question,
+/// asked of a table's contents and answered in the executor.
+pub fn is_a_name_reference(e: &Expr) -> bool {
+    match e {
+        Expr::Column { .. } => true,
+        Expr::Collate { expr, .. } => is_a_name_reference(expr),
+        // A sign does not make a name into a literal: `(+a)` is a reference
+        // just as `(a)` is, and is refused the same way. Measured on 3.53.4,
+        // `(+a)`, `(-a)` and `(+ nosuchcol)` are all `default value of column
+        // [c] is not constant`, and the parentheses are not what decides it --
+        // `+a` without them is the string-literal form and is accepted.
+        Expr::Unary { expr, .. } => is_a_name_reference(expr),
+        _ => false,
+    }
+}
+
+/// Whether a `DEFAULT` is one of the spellings SQLite will store as a value it
+/// can supply again later.
+///
+/// An `ALTER TABLE ... ADD COLUMN` does not rewrite the rows already on disk,
+/// so a default on the new column is applied when one of those rows is *read*.
+/// That is only possible if the default is a value the executor can produce
+/// from the stored text without the table, and the shapes below are the ones
+/// that qualify. They are not a reading of "constant" in general: `1+2` is
+/// constant in every ordinary sense and is *not* on this list, which is why the
+/// check is a list rather than an evaluation.
+///
+/// `parenthesized` is the `Constraint::Default` flag of the same name, and it
+/// is not a detail: SQLite's grammar reads a bare default as a *literal* and a
+/// parenthesised one as an *expression*, and the two lists below are the two
+/// grammars.
+///
+/// Measured on 3.53.4, all of these are accepted against a table that already
+/// has a row:
+///
+/// ```text
+/// 7   -7   +7   - 3   x'00FF'   'str'   NULL   0x10   TRUE   a
+/// anything COLLATE name
+/// (7)  (-7)  ((7))  (- (- (-7)))  (NULL)  ('str')  (x'00')  (0x10)  (+(-(+2)))
+/// ```
+///
+/// and these are not, each with `Cannot add a column with non-constant
+/// default`: `(1+2)`, `(1+2)` and every other parenthesised operator,
+/// `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, every function call,
+/// and `(x COLLATE name)` for any literal `x` -- the parentheses are what make
+/// a collation fatal, so `1 COLLATE nocase` is fine and
+/// `(1 COLLATE nocase)` is not.
+///
+/// A bare name is on the first list for a reason of its own: it is a string
+/// literal by that grammar. This engine does not have the bare-name functions
+/// SQLite has, so a default that is *only* a name is accepted here and left to
+/// fail where it is used. That is the status quo for `DEFAULT
+/// CURRENT_TIMESTAMP` at `CREATE TABLE` time, which this engine has always
+/// accepted and never evaluated, and it is not made worse by saying so.
+pub fn is_builtin_constant_default(e: &Expr, parenthesized: bool) -> bool {
+    match e {
+        Expr::Literal(_) => true,
+        // A bare name is a string literal only when the parentheses are
+        // absent, which is what the flag records. Measured on 3.53.4,
+        // `DEFAULT a` and `DEFAULT nosuchcol` are accepted against a table
+        // that already has a row, and `DEFAULT (a)` is refused -- by the
+        // parser, before the executor is reached, which is why the
+        // parenthesised form never actually gets this far.
+        Expr::Column { .. } => !parenthesized,
+        // The parentheses are what make a COLLATE fatal, and the flag is
+        // exactly that difference. Measured on 3.53.4 against a table that
+        // already holds a row: `DEFAULT 1 COLLATE nocase` and
+        // `DEFAULT 'a' COLLATE nocase` are both accepted, while
+        // `DEFAULT (1 COLLATE nocase)` and `DEFAULT ('a' COLLATE nocase)` are
+        // both `Cannot add a column with non-constant default`. The bare form
+        // is read as a literal with a collation attached, which is one of the
+        // values listed above; the parenthesised one is read as an expression,
+        // and an expression is never one of them.
+        Expr::Collate { .. } => !parenthesized,
+        // A sign is part of the literal, not an operator applied to one, so
+        // `-7` and `(+(-(+2)))` are both values however deeply the signs nest.
+        // Measured on 3.53.4, all of `(+3)`, `(- 3)`, `(-(-(-7)))`,
+        // `(+(-(+2)))`, `(+x'00FF')`, `(-'a')` and `(+NULL)` are accepted
+        // against a table that already has a row.
+        //
+        // `~` is not a sign and is not on the list: `(~1)` is refused, as are
+        // `NOT` and anything else, because those are operators and this is a
+        // list of literals.
+        Expr::Unary { op, expr } => {
+            matches!(op, UnaryOp::Negate | UnaryOp::Plus) && is_builtin_constant_default(expr, false)
+        }
+        _ => false,
     }
 }
 

@@ -451,6 +451,12 @@ impl CStmt {
             Value::Integer(i) => i.to_string().into_bytes(),
             Value::Real(r) => render_real(*r).into_bytes(),
             Value::Text(s) => s.clone().into_bytes(),
+            // Text whose bytes need not be UTF-8 is still TEXT, and the bytes
+            // are the value: `CAST(x'FF' AS TEXT)` is the text FF, not a
+            // rendering of it. So it is handed out verbatim rather than
+            // lossily decoded, which is the same rule the CLI's record stream
+            // follows.
+            Value::TextBytes(b) => b.clone(),
             Value::Blob(b) => b.clone(),
         }
     }
@@ -1752,6 +1758,13 @@ fn sql_literal(v: &Value) -> String {
             }
         }
         Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        // The bytes are quoted as they are, without a lossy decode, because a
+        // decode would both change the value and could not be represented in
+        // this `String` to begin with.
+        Value::TextBytes(b) => {
+            let s = String::from_utf8_lossy(b);
+            format!("'{}'", s.replace('\'', "''"))
+        }
         Value::Blob(b) => {
             let hex: String = b.iter().map(|x| format!("{x:02X}")).collect();
             format!("x'{hex}'")

@@ -268,7 +268,9 @@ fn run_self_test() -> (bool, String, String) {
     )
 }
 
-fn run_corpus(extra: &[&str]) -> (bool, String, String) {
+/// `tag` names the scratch directory, so two tests in this binary do not
+/// share one; `extra` is passed to the runner as arguments.
+fn run_corpus(tag: &str, extra: &[&str]) -> (bool, String, String) {
     let bin = difftest3_bin();
     let cases = case_file();
     let bash = difftest3_bash();
@@ -292,7 +294,18 @@ fn run_corpus(extra: &[&str]) -> (bool, String, String) {
     // database file" -- which reads as a total engine failure and is a fact
     // about the path. Measured: with the default the whole corpus disagrees on
     // all 372 statements; with a D: path the same corpus runs.
-    let work = std::env::temp_dir().join(format!("nsqlite-difftest5-{}", std::process::id()));
+    //
+    // The directory is named per TEST, not per process. Cargo runs the tests in
+    // one binary in parallel threads, and two runs sharing one WORKDIR write
+    // the same two database files at the same time. The result is not a clean
+    // failure: each run finds the other's half-written file, so the counts
+    // come out as 50 agreements on one run and 291 on another for a corpus
+    // that is deterministic, and a finding appears on one run and not on the
+    // next. Measured: three runs of the corpus back to back on one workdir
+    // gave 294, 291 and 290; three runs on separate workdirs gave 294, 294 and
+    // 294. So the name carries the test's own name.
+    let work =
+        std::env::temp_dir().join(format!("nsqlite-difftest5-{}-{}", std::process::id(), tag));
     let _ = std::fs::remove_dir_all(&work);
     cmd.env("WORKDIR", windows_path_to_shell(&work));
     let out = cmd.output().expect("running tools/difftest3.sh");
@@ -305,35 +318,51 @@ fn run_corpus(extra: &[&str]) -> (bool, String, String) {
 
 /// The finding counts from the runner's own summary line.
 ///
+/// The line is:
+///
+/// ```text
+/// 341 statements: 294 agreed, 40 wrong answers, 2 refusals, 5 worded differently
+/// ```
+///
 /// Parsed rather than asserted against a fixed string, because the counts
 /// change as the engine is fixed and a test that pinned them would go red for
 /// the right reason and read as a defect in the test.
+///
+/// The five numbers are `(total, agreed, wrong, refusals, worded)`. They are
+/// read positionally off the four comma-separated clauses rather than by
+/// looking for a fixed substring, because a substring match against a summary
+/// that is only *mostly* the expected shape returns a count assembled out of
+/// the wrong fields -- which is worse than not matching, because the test then
+/// passes on numbers nobody read. An earlier version of this function did
+/// exactly that: it required the line to end in a string containing
+/// `0 refused`, a run that only ever holds when there happen to be no
+/// refusals, so on any other run it fell through and the test failed with
+/// "the runner printed no summary line" and named no number at all.
 fn summarise(stdout: &str) -> Option<(usize, usize, usize, usize, usize)> {
     for line in stdout.lines() {
         let t = line.trim();
-        if !t.ends_with("statements agreed, 0 refused, 0 worded differently")
-            && !t.contains(" statements: ") && !t.contains(" statements: 0 agreed")
-        {
+        let Some((head, after)) = t.split_once("statements:") else {
             continue;
-        }
-        if !t.contains("statements:") {
-            continue;
-        }
-        let num = |s: &str| -> Option<usize> {
-            s.trim()
-                .split(' ')
-                .next()
-                .and_then(|w| w.parse::<usize>().ok())
         };
-        // "12 statements: 3 agreed, 4 wrong answers, 5 refusals, 6 worded differently"
-        let after = t.split("statements:").nth(1)?;
+        let Some(total) = head
+            .split_whitespace()
+            .last()
+            .and_then(|w| w.parse::<usize>().ok())
+        else {
+            continue;
+        };
         let parts: Vec<&str> = after.split(',').collect();
         if parts.len() < 4 {
             continue;
         }
+        let num = |s: &str| -> Option<usize> {
+            s.split_whitespace()
+                .next()
+                .and_then(|w| w.parse::<usize>().ok())
+        };
         return Some((
-            num(parts[0].rsplit(' ').next().unwrap_or(""))?,
-            num(parts[0].trim_start_matches(|c: char| !c.is_ascii_digit()))?,
+            total,
+            num(parts[0])?,
             num(parts[1])?,
             num(parts[2])?,
             num(parts[3])?,
@@ -388,7 +417,7 @@ fn the_corpus_is_actually_run() {
         eprintln!("skipping: no real sqlite3 found, so there is nothing to compare against");
         return;
     }
-    let (ok, stdout, stderr) = run_corpus(&[]);
+    let (ok, stdout, stderr) = run_corpus("run", &[]);
     let total = summarise(&stdout).map(|t| t.0).unwrap_or(0);
     assert!(
         total > 200,
@@ -421,20 +450,20 @@ fn the_findings_are_well_formed() {
         eprintln!("skipping: no real sqlite3 found, so there is nothing to compare against");
         return;
     }
-    let (_ok, stdout, stderr) = run_corpus(&[]);
+    let (_ok, stdout, stderr) = run_corpus("shape", &[]);
     let parsed = summarise(&stdout).expect("the runner printed no summary line");
 
-    let wrong = parsed.2;
-    let refuse = parsed.3;
-    let wording = parsed.4;
-    let total = parsed.1;
+    // `parsed` is (total, agreed, wrong, refusals, worded). The sum check is
+    // over total MINUS agreed, since the agreements are the statements that
+    // were compared and found equal -- they are not findings.
+    let (total, agreed, wrong, refuse, wording) = parsed;
 
     assert_eq!(
-        wrong + refuse + wording,
+        agreed + wrong + refuse + wording,
         total,
-        "the four counts do not sum to the number of statements: {parsed:?}.\n\
-         A statement that is in none of the four classes was compared and its \
-         result thrown away.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        "the counts do not account for every statement: {parsed:?}.\n\
+         A statement in none of the four classes was compared and its result \
+         thrown away.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
 
     // Every finding must name a statement AND, for a `wrong` answer, show both
@@ -492,7 +521,8 @@ fn the_findings_are_well_formed() {
     );
     if wrong > 0 {
         assert_eq!(
-            findings, wrong + refuse + wording,
+            findings,
+            wrong + refuse + wording,
             "the summary counts {wrong} wrong, {refuse} refusals and {wording} worded \
              differently, but the report lists {findings} findings. The counts and the \
              report must agree, or one of them is a lie.\n--- stdout ---\n{stdout}"

@@ -173,11 +173,17 @@ impl Aggregate {
     fn new_acc(&self, sep: Option<Value>) -> Result<Acc> {
         let args: Vec<Value> = match self.name.as_str() {
             "group_concat" | "string_agg" if self.args.len() == 2 => {
-                let s = match sep {
-                    None | Some(Value::Null) => String::new(),
-                    Some(v) => v.to_string(),
+                // The separator joins by its bytes rather than by its text
+                // rendering, so a blob separator is the bytes it holds and
+                // not `x'FF'`. It is handed on as `TextBytes` for that reason.
+                // A NULL separator is still not an error: it means "no
+                // separator at all", which is the empty byte string.
+                let bytes = match sep {
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(Value::Blob(b)) | Some(Value::TextBytes(b)) => b,
+                    Some(v) => v.to_string().into_bytes(),
                 };
-                vec![Value::Null, Value::Text(s)]
+                vec![Value::Null, Value::TextBytes(bytes)]
             }
             // `string_agg` requires the separator, which `group_concat` defaults
             // to a comma.
@@ -899,6 +905,9 @@ pub fn literal_of(v: Value) -> Expr {
         Value::Integer(i) => Expr::Literal(Literal::Integer(i)),
         Value::Real(r) => Expr::Literal(Literal::Real(r)),
         Value::Text(s) => Expr::Literal(Literal::Text(s)),
+        // No literal spells text that is not UTF-8, so a substituted
+        // aggregate carries these bytes as the blob they are.
+        Value::TextBytes(b) => Expr::Literal(Literal::Blob(b)),
         Value::Blob(b) => Expr::Literal(Literal::Blob(b)),
     }
 }

@@ -591,6 +591,7 @@ fn the_affinity_map_and_the_comparison_rule_use_the_same_key() {
             rowid_alias: false,
         }],
         rowid_alias: None,
+        unique_sets: Vec::new(),
         without_rowid: false,
         root_page: 0,
     };

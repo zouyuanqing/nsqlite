@@ -16,7 +16,7 @@
 //! connection's own executor over a real table, so a mis-evaluated SELECT fails
 //! here too.
 
-use super::{count_error, insert_select, InsertTarget, Source, ATOMICITY};
+use super::{count_error, insert_select, InsertTarget, Source, UniqueOutcome, ATOMICITY};
 use crate::affinity::Affinity;
 use crate::catalog::{Catalog, Table};
 use crate::connection::{Connection, Outcome};
@@ -173,6 +173,38 @@ impl InsertTarget for Recorder {
         self.finished = Some((changed, last_rowid));
         Ok(())
     }
+
+    /// This fake has no b-tree, so it never reports a conflict: uniqueness is
+    /// the connection's job, and the engine's own cases are in
+    /// `unique_constraint_tests`. Saying so here is what keeps the two from
+    /// drifting -- a fake that invented its own verdict would test itself.
+    fn write_unique(
+        &mut self,
+        _table: &Table,
+        _values: &[Value],
+        _conflict: crate::parser::ConflictAction,
+        _pending: &[(Vec<usize>, Vec<Value>)],
+    ) -> Result<UniqueOutcome> {
+        Ok(UniqueOutcome::Write)
+    }
+
+    fn written_keys(&self, _table: &Table, _values: &[Value]) -> Vec<Vec<usize>> {
+        Vec::new()
+    }
+
+    fn unique_keys(&self, _table: &Table) -> Vec<Vec<usize>> {
+        Vec::new()
+    }
+
+    fn stored_unique_conflict(
+        &mut self,
+        _table: &Table,
+        _keys: &[Vec<usize>],
+        _values: &[Value],
+        _exclude: Option<i64>,
+    ) -> Result<Option<usize>> {
+        Ok(None)
+    }
 }
 
 /// Runs one INSERT ... SELECT through the module under test.
@@ -181,6 +213,7 @@ fn run(sql: &str) -> Result<(Recorder, Outcome)> {
         table,
         columns,
         source,
+        conflict,
     } = parse_one(sql).expect("test SQL should parse")
     else {
         panic!("expected INSERT, got {sql:?}")
@@ -193,7 +226,7 @@ fn run(sql: &str) -> Result<(Recorder, Outcome)> {
         "CREATE TABLE t2(a,b)",
         "CREATE TABLE t3(a,b,c)",
     ]);
-    let out = insert_select(&mut rec, &table, columns.as_deref(), &select)?;
+    let out = insert_select(&mut rec, &table, columns.as_deref(), &select, conflict)?;
     Ok((rec, out))
 }
 
@@ -272,6 +305,7 @@ fn the_rowid_continues_from_what_the_table_already_holds() {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t SELECT x FROM a").unwrap()
     else {
         unreachable!()
@@ -281,7 +315,7 @@ fn the_rowid_continues_from_what_the_table_already_holds() {
     };
     let mut rec = Recorder::with(&["CREATE TABLE t(a)"]);
     rec.written.push((1, vec![Value::Integer(7)]));
-    insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap();
+    insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap();
     let rowids: Vec<i64> = rec.rows().iter().map(|(r, _)| *r).collect();
     assert_eq!(rowids, vec![1, 2, 3, 4]);
 }
@@ -307,6 +341,7 @@ fn rows_are_written_in_query_order_whatever_the_values_sort_like() {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t SELECT x FROM s").unwrap()
     else {
         unreachable!()
@@ -314,7 +349,7 @@ fn rows_are_written_in_query_order_whatever_the_values_sort_like() {
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap();
+    insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap();
 
     let rowids: Vec<i64> = rec.rows().iter().map(|(r, _)| *r).collect();
     assert_eq!(
@@ -357,6 +392,7 @@ fn inserting_a_table_into_itself_terminates_and_sees_only_the_originals() {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t SELECT a+10 FROM t").unwrap()
     else {
         unreachable!()
@@ -364,7 +400,7 @@ fn inserting_a_table_into_itself_terminates_and_sees_only_the_originals() {
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap();
+    insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap();
 
     let got: Vec<String> = (0..rec.rows().len()).map(|i| rec.text(i, 0)).collect();
     assert_eq!(
@@ -391,6 +427,7 @@ fn a_self_insert_reads_the_pre_insert_rows_and_not_its_own_output() {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t SELECT a+10 FROM t").unwrap()
     else {
         unreachable!()
@@ -398,7 +435,7 @@ fn a_self_insert_reads_the_pre_insert_rows_and_not_its_own_output() {
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap();
+    insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap();
     // 1+10, 2+10, 3+10 -- each derived from a *pre-existing* row.  If the
     // query had chased its own writes the later values would be 11+10=21 and
     // so on.
@@ -424,6 +461,7 @@ fn a_self_insert_narrowed_by_a_where_clause_inserts_only_the_matching_originals(
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t SELECT a+10 FROM t WHERE a>1").unwrap()
     else {
         unreachable!()
@@ -431,7 +469,7 @@ fn a_self_insert_narrowed_by_a_where_clause_inserts_only_the_matching_originals(
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap();
+    insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap();
     let got: Vec<String> = (0..rec.rows().len()).map(|i| rec.text(i, 0)).collect();
     assert_eq!(got, vec!["12", "13"], "only the rows that matched a>1");
 }
@@ -449,6 +487,7 @@ fn a_count_aggregate_over_the_target_sees_the_row_count_before_the_insert() {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t SELECT count(*) FROM t").unwrap()
     else {
         unreachable!()
@@ -456,7 +495,7 @@ fn a_count_aggregate_over_the_target_sees_the_row_count_before_the_insert() {
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap();
+    insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap();
     assert_eq!(rec.rows().len(), 1, "one row went in");
     assert_eq!(
         rec.col(0, 0),
@@ -486,6 +525,7 @@ fn a_partial_column_list_leaves_the_rest_to_their_defaults() {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t3(a) SELECT x FROM a").unwrap()
     else {
         unreachable!()
@@ -493,7 +533,7 @@ fn a_partial_column_list_leaves_the_rest_to_their_defaults() {
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap();
+    insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap();
     for (i, _) in rec.rows().iter().enumerate() {
         assert_eq!(rec.col(i, 1), Value::Integer(7), "row {i} took the default");
     }
@@ -521,13 +561,14 @@ fn a_default_expression_is_evaluated_and_the_result_stored() {
     // so the quoting above is the declaration that both engines accept, and
     // what this test checks is that the module evaluates an expression default
     // rather than storing a bare NULL. See
-    // `a_parenthesised_default_expression_is_a_pre_existing_parser_gap` for the
-    // case this engine gets wrong.
+    // `a_parenthesised_default_expression_is_evaluated_not_dropped` for the
+    // shape of the expression the parser hands on.
     let mut rec = Recorder::with(&["CREATE TABLE t3(a,b DEFAULT (abs(-2)))"]);
     let Stmt::Insert {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t3(a) SELECT x FROM a").unwrap()
     else {
         unreachable!()
@@ -535,13 +576,13 @@ fn a_default_expression_is_evaluated_and_the_result_stored() {
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap();
+    insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap();
     for (i, _) in rec.rows().iter().enumerate() {
-        // The parser drops the parenthesised expression to a NULL literal, so
-        // what reaches this module is already NULL and there is nothing for it
-        // to evaluate. Asserting 2 here would be asserting a behaviour the
-        // module cannot produce; what is asserted is that the module ran the
-        // default path for every row and did not skip the column.
+        // The default is the expression, not a NULL standing in for it: the
+        // parser keeps what is inside the parentheses, so `abs(-2)` arrives
+        // here as an expression and this module evaluates it. sqlite3 stores
+        // 2 on every row; see
+        // `a_parenthesised_default_expression_is_evaluated_not_dropped`.
         assert_eq!(
             rec.col(i, 0),
             Value::Integer(i as i64 + 1),
@@ -549,47 +590,43 @@ fn a_default_expression_is_evaluated_and_the_result_stored() {
         );
         assert_eq!(
             rec.col(i, 1),
-            Value::Null,
+            Value::Integer(2),
             "row {i} took the default the parser produced"
         );
     }
 }
 
 #[test]
-fn a_parenthesised_default_expression_is_a_pre_existing_parser_gap() {
-    // Pins the divergence rather than hiding it, and says where it lives.
+fn a_parenthesised_default_expression_is_evaluated_not_dropped() {
+    // sqlite3 3.53.4: CREATE TABLE t3(a,b DEFAULT (1+1));
+    //               INSERT INTO t3(a) VALUES(5); SELECT a,b --> 5|2
     //
-    // sqlite3 3.53.4: CREATE TABLE t3(a,b DEFAULT (1+1)); INSERT INTO t3(a)
-    // VALUES(5); SELECT a,b --> 5|2
-    //
-    // this engine: --> 5| with an empty b.
-    //
-    // The cause is in the parser, not here: `DEFAULT (expr)` is parsed as
-    // `Constraint::Default(Literal(Null))` -- the parentheses are consumed and
-    // the expression inside them is dropped, so the catalog stores a `NULL`
-    // default where sqlite3 would store the expression's value. Verified by
-    // reading the parsed default directly, which is what this test does. The
-    // insert path then has a perfectly ordinary NULL default to store, and
-    // stores it.
-    //
-    // This is the same class as docs/testing.md 5.3 item 4 (a column reference
-    // is not resolved when there is a FROM) and it is owned by the parser
-    // track. It is recorded here because an `INSERT ... SELECT` test that
-    // quotes `DEFAULT (1+1)` as an expected 2 would be asserting something this
-    // engine does not do.
+    // This used to record a gap: `DEFAULT (expr)` was parsed as
+    // `Constraint::Default(Literal(Null))` -- the parentheses were consumed
+    // and the expression inside them dropped, so the catalog stored a NULL
+    // where sqlite3 stores the expression's value. That is no longer what
+    // the parser does, and this test now pins the closed shape rather than
+    // the gap, because a test that only says "this is still broken" cannot
+    // tell a fixed engine from an unchanged one.
     let t = table("CREATE TABLE t3(a,b DEFAULT (1+1))");
     assert_eq!(
         t.columns[1].default,
-        Some(crate::parser::Expr::Literal(crate::parser::Literal::Null)),
-        "the parser dropped the expression; this is the pre-existing gap"
+        Some(crate::parser::Expr::Binary {
+            op: crate::parser::BinOp::Add,
+            left: Box::new(crate::parser::Expr::Literal(crate::parser::Literal::Integer(1))),
+            right: Box::new(crate::parser::Expr::Literal(crate::parser::Literal::Integer(1))),
+        }),
+        "the parser kept the expression instead of dropping it for a NULL"
     );
-    // And so the value that reaches the stored row is NULL, which is what the
-    // test above observes end to end. sqlite3 stores 2.
-    let full = super::build_row(&t, &[0], &[Value::Integer(5)]).unwrap();
+    // And so the value that reaches the stored row is the expression's,
+    // which is what the test above observes end to end.
+    let (full, key) = super::build_row(&t, &[Some(0)], &[Value::Integer(5)]).unwrap();
     assert_eq!(full[0], Value::Integer(5));
-    assert_eq!(full[1], Value::Null, "sqlite3 stores 2 here");
+    assert_eq!(full[1], Value::Integer(2), "sqlite3 stores 2 here");
+    // A column-list target that is an ordinary column names no key, so the
+    // engine still hands one out.
+    assert_eq!(key, None);
 }
-
 #[test]
 fn a_column_named_twice_keeps_the_first_value() {
     // sqlite3: INSERT INTO t2(a,a) SELECT x,y FROM b;  SELECT a --> 1
@@ -748,6 +785,7 @@ fn a_null_in_a_not_null_column_fails_with_sqlites_wording() {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t SELECT x FROM s").unwrap()
     else {
         unreachable!()
@@ -755,7 +793,7 @@ fn a_null_in_a_not_null_column_fails_with_sqlites_wording() {
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    let err = insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap_err();
+    let err = insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap_err();
     assert_eq!(err.message, "NOT NULL constraint failed: t.a");
     assert_eq!(err.code, ResultCode::Constraint);
     assert_eq!(err.extended_code(), 1299);
@@ -779,6 +817,7 @@ fn a_not_null_column_the_statement_never_named_is_still_checked() {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t(b) SELECT x FROM s").unwrap()
     else {
         unreachable!()
@@ -786,7 +825,7 @@ fn a_not_null_column_the_statement_never_named_is_still_checked() {
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    let err = insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap_err();
+    let err = insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap_err();
     assert_eq!(
         err.message, "NOT NULL constraint failed: t.a",
         "the unnamed NOT NULL column is the one named"
@@ -808,6 +847,7 @@ fn a_not_null_column_with_a_default_does_not_fail() {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t(b) SELECT x FROM s").unwrap()
     else {
         unreachable!()
@@ -815,7 +855,7 @@ fn a_not_null_column_with_a_default_does_not_fail() {
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap();
+    insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap();
     assert_eq!(rec.rows().len(), 2, "both rows went in");
     for i in 0..2 {
         assert_eq!(rec.col(i, 0), Value::Integer(9), "row {i} took the default");
@@ -836,6 +876,7 @@ fn a_not_null_column_that_is_always_null_still_fails_on_every_row() {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t SELECT x FROM s").unwrap()
     else {
         unreachable!()
@@ -843,7 +884,7 @@ fn a_not_null_column_that_is_always_null_still_fails_on_every_row() {
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    let err = insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap_err();
+    let err = insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap_err();
     assert_eq!(err.code, ResultCode::Constraint);
     assert!(
         rec.rows().is_empty(),
@@ -877,6 +918,7 @@ fn affinity_is_applied_to_every_column_it_can_reach() {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t SELECT x,y,z,w FROM s4").unwrap()
     else {
         unreachable!()
@@ -884,7 +926,7 @@ fn affinity_is_applied_to_every_column_it_can_reach() {
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap();
+    insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap();
     assert_eq!(rec.rows().len(), 1);
     assert_eq!(
         rec.col(0, 0),
@@ -919,6 +961,7 @@ fn a_text_value_that_is_not_a_number_keeps_its_text_under_numeric_affinity() {
         table,
         columns,
         source,
+        conflict,
     } = parse_one("INSERT INTO t SELECT x FROM s").unwrap()
     else {
         unreachable!()
@@ -926,7 +969,7 @@ fn a_text_value_that_is_not_a_number_keeps_its_text_under_numeric_affinity() {
     let crate::parser::InsertSource::Select(select) = source else {
         unreachable!()
     };
-    insert_select(&mut rec, &table, columns.as_deref(), &select).unwrap();
+    insert_select(&mut rec, &table, columns.as_deref(), &select, conflict).unwrap();
     assert_eq!(rec.col(0, 0), Value::Text("abc".into()));
 }
 
@@ -946,6 +989,7 @@ fn affinity_agrees_with_what_the_ordinary_insert_path_produces() {
                 table,
                 columns,
                 source,
+                conflict,
             } = parse_one(&sql).unwrap()
             else {
                 unreachable!()
@@ -953,7 +997,7 @@ fn affinity_agrees_with_what_the_ordinary_insert_path_produces() {
             let crate::parser::InsertSource::Select(select) = source else {
                 unreachable!()
             };
-            insert_select(&mut r, &table, columns.as_deref(), &select)
+            insert_select(&mut r, &table, columns.as_deref(), &select, conflict)
                 .unwrap_or_else(|e| panic!("{sql} failed: {e}"));
             r
         };
@@ -1035,7 +1079,7 @@ fn the_atomicity_note_states_what_the_engine_actually_does() {
 fn a_constraint_failure_names_the_table_and_the_column() {
     // The wording every constraint failure in this path shares.
     let t = table("CREATE TABLE t(a NOT NULL)");
-    let err = super::build_row(&t, &[0], &[Value::Null]).unwrap_err();
+    let err = super::build_row(&t, &[Some(0)], &[Value::Null]).unwrap_err();
     assert_eq!(err.message, "NOT NULL constraint failed: t.a");
     assert_eq!(err.extended, 1299);
 }

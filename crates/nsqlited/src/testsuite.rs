@@ -49,9 +49,17 @@ fn field(out: &mut String, v: &Value) {
             out.push('B');
             push_hex(out, b);
         }
+        // Text is tagged with its *bytes* and not with its rendered form,
+        // because the bytes of a `TextBytes` need not be UTF-8 and are what
+        // the value is: `CAST(x'FF' AS TEXT)` is the text FF, not a
+        // rendering of it.
         Value::Text(s) => {
             out.push('T');
             push_hex(out, s.as_bytes());
+        }
+        Value::TextBytes(b) => {
+            out.push('T');
+            push_hex(out, b);
         }
         other => {
             out.push(match other {
@@ -83,6 +91,7 @@ fn render(v: &Value) -> String {
         Value::Integer(i) => i.to_string(),
         Value::Real(r) => format_real(*r),
         Value::Text(s) => s.clone(),
+        Value::TextBytes(b) => String::from_utf8_lossy(b).into_owned(),
         Value::Blob(b) => b.iter().map(|x| format!("{x:02X}")).collect(),
     }
 }

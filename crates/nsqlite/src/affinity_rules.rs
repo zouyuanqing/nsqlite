@@ -68,7 +68,7 @@ impl StorageClass {
             Value::Null => StorageClass::Null,
             Value::Integer(_) => StorageClass::Integer,
             Value::Real(_) => StorageClass::Real,
-            Value::Text(_) => StorageClass::Text,
+            Value::Text(_) | Value::TextBytes(_) => StorageClass::Text,
             Value::Blob(_) => StorageClass::Blob,
         }
     }
@@ -205,6 +205,23 @@ fn affinity_of_ref(from: &crate::join::From, r: &crate::join::Ref) -> Option<Aff
         crate::join::Ref::Coalesced { holders, name } => {
             holders.first().and_then(|i| column_of(*i, Some(name)))
         }
+        // A rowid has no DECLARED type, and SQLite gives it the numeric
+        // affinity the rule gives any value with none -- so it does convert the
+        // other operand, which is the whole difference between answering `1`
+        // and answering `0` for `rowid = ' 1'`. Measured against sqlite3 3.53.4:
+        //
+        // ```text
+        // SELECT rowid = ' 1' FROM t                    ->  1
+        // SELECT rowid = 'abc' FROM t                   ->  0
+        // SELECT (SELECT rowid FROM t) = a FROM t2     ->  1   (a is TEXT '1')
+        // SELECT (SELECT rowid FROM t) = b FROM tb    ->  0   (b is BLOB x'31')
+        // ```
+        //
+        // The BLOB line is what says NUMERIC and not INTEGER: a real INTEGER
+        // column applies its affinity to the other operand, and a BLOB operand
+        // keeps its bytes. NUMERIC only converts a value that LOOKS numeric, so
+        // the blob is left alone and the comparison is blob against integer.
+        crate::join::Ref::Rowid { .. } => Some(crate::affinity::Affinity::Numeric),
     }
 }
 

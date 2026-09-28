@@ -250,12 +250,16 @@ fn insert_forms_parse() {
         table,
         columns,
         source,
+        conflict,
     } = ok("INSERT INTO t (a, b) VALUES (1, 'x')")
     else {
         panic!()
     };
     assert_eq!(table, "t");
     assert_eq!(columns, Some(vec!["a".into(), "b".into()]));
+    // A statement that says nothing about a conflict is an ABORT, which is what
+    // the reference does with one.
+    assert_eq!(conflict, ConflictAction::Abort);
     let InsertSource::Values(rows) = source else {
         panic!()
     };
@@ -277,6 +281,7 @@ fn update_and_delete_parse() {
         table,
         sets,
         where_,
+        conflict,
     } = ok("UPDATE t SET a = 1, b = b + 1 WHERE c = 2")
     else {
         panic!()
@@ -284,6 +289,7 @@ fn update_and_delete_parse() {
     assert_eq!(table, "t");
     assert_eq!(sets.len(), 2);
     assert!(where_.is_some());
+    assert_eq!(conflict, ConflictAction::Abort);
 
     let Stmt::Delete { table, where_ } = ok("DELETE FROM t WHERE a = 1") else {
         panic!()
@@ -306,6 +312,7 @@ fn create_table_captures_columns_and_constraints() {
     assert_eq!(columns[0].ty, "integer");
     assert!(columns[0].constraints.contains(&Constraint::PrimaryKey {
         ascending: true,
+        columns: Vec::new(),
         autoincrement: true
     }));
     assert!(columns[1].constraints.contains(&Constraint::NotNull));
@@ -324,8 +331,14 @@ fn create_table_with_a_table_constraint_parses() {
         panic!()
     };
     assert_eq!(columns.len(), 2, "the constraint is not a column");
+    // A *table-level* key names the columns it covers, in the order it wrote
+    // them. That is what makes `PRIMARY KEY(a,b)` a uniqueness constraint over
+    // the pair -- measured: the duplicate reports `UNIQUE constraint failed:
+    // t.a, t.b` -- where a column-level primary key names none, because the
+    // column carrying the constraint is the key.
     assert!(constraints.contains(&Constraint::PrimaryKey {
         ascending: true,
+        columns: vec!["a".into(), "b".into()],
         autoincrement: false
     }));
 }
@@ -705,4 +718,321 @@ fn a_keyword_that_is_only_a_join_word_is_still_a_table_name() {
         from_items("SELECT * FROM a AS outer")[0],
         "a AS outer join=None on=n using=[]"
     );
+}
+
+// --- ALTER TABLE ... ADD COLUMN --------------------------------------------
+
+#[test]
+fn alter_table_add_column_captures_the_column_and_its_own_text() {
+    // The spliced text is the *source* slice, not a reconstruction from the
+    // parsed column, so what the statement wrote is what lands in
+    // sqlite_schema. Measured against sqlite3 3.53.4: every one of these is
+    // the exact text it stores.
+    for (sql, name, ty, column_sql) in [
+        (
+            "ALTER TABLE t ADD COLUMN c",
+            "c",
+            "",
+            "c",
+        ),
+        // The COLUMN word is optional, and is not part of the text either way.
+        (
+            "ALTER TABLE t ADD c",
+            "c",
+            "",
+            "c",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c TEXT",
+            "c",
+            // The *parsed* type is folded, as every declared type in this
+            // engine is; the spliced text keeps the statement's spelling,
+            // which is the one that has to survive.
+            "text",
+            "c TEXT",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c NOT NULL DEFAULT 3",
+            "c",
+            "",
+            "c NOT NULL DEFAULT 3",
+        ),
+        // A default the evaluator could not re-render still has to survive.
+        (
+            "ALTER TABLE t ADD COLUMN c DEFAULT (1+2)",
+            "c",
+            "",
+            "c DEFAULT (1+2)",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c DEFAULT x'00FF'",
+            "c",
+            "",
+            "c DEFAULT x'00FF'",
+        ),
+        // A quoted name keeps its quoting, which is what reusing the table
+        // grammar's `column_def` buys.
+        (
+            "ALTER TABLE t ADD COLUMN \"c d\"",
+            "c d",
+            "",
+            "\"c d\"",
+        ),
+    ] {
+        let Stmt::AlterTableAddColumn {
+            name: table,
+            default_name_reference,
+            column,
+            column_sql: got,
+        } = ok(sql)
+        else {
+            panic!("expected an ADD COLUMN from {sql}")
+        };
+        assert_eq!(table, "t", "for {sql:?}");
+        // None of these carries a `DEFAULT (name)`, so the pending refusal
+        // must not have been left set on the statement for a later one in the
+        // same script to pick up.
+        assert_eq!(default_name_reference, None, "for {sql:?}");
+        assert_eq!(column.name, name, "for {sql:?}");
+        assert_eq!(column.ty, ty, "for {sql:?}");
+        assert_eq!(got, column_sql, "for {sql:?}");
+    }
+}
+
+#[test]
+fn alter_table_add_column_reads_a_qualified_table_name() {
+    let Stmt::AlterTableAddColumn { name, .. } = ok("ALTER TABLE main.t ADD COLUMN c") else {
+        panic!()
+    };
+    assert_eq!(name, "main.t");
+}
+
+#[test]
+fn rename_and_drop_column_are_unsupported_rather_than_syntax_errors() {
+    // Both are ALTER clauses this engine has not written. Reporting them as a
+    // syntax error about `ALTER` was the specific lie this replaced: the
+    // statement is well-formed and the *feature* is missing, which is what
+    // `Stmt::Unsupported` is for.
+    for (sql, what) in [
+        ("ALTER TABLE t RENAME TO z", "rename"),
+        ("ALTER TABLE t DROP COLUMN b", "drop"),
+    ] {
+        let Stmt::Unsupported(w) = ok(sql) else {
+            panic!("expected Unsupported from {sql}")
+        };
+        assert_eq!(w, what, "for {sql:?}");
+    }
+}
+
+#[test]
+fn a_malformed_alter_is_a_syntax_error_naming_its_token() {
+    // The other side of the same line: these are not statements at all, and
+    // saying "not supported yet" about them would be as wrong as the syntax
+    // error was about RENAME. Measured on 3.53.4.
+    for (sql, token) in [
+        ("ALTER TABLE t;", ";"),
+        ("ALTER TABLE t XYZZY;", "XYZZY"),
+        ("ALTER TABLE t DEFAULT 7;", "DEFAULT"),
+        ("ALTER TABLE t ADD COLUMN c DEFAULT 1+2;", "+"),
+    ] {
+        let e = err(sql);
+        assert_eq!(
+            e.message,
+            format!("near \"{token}\": syntax error"),
+            "for {sql:?}"
+        );
+    }
+}
+
+#[test]
+fn a_parenthesised_default_is_kept_as_the_expression_it_is() {
+    // The paren used to discard the expression and store a NULL, which lost
+    // two things at once: the value, and the difference between a default that
+    // is a string literal and one that is a reference to a column. Both are
+    // visible in the column the parser now hands on.
+    // `text` is what lands in sqlite_schema and `expr` is what the column
+    // was read as. The two differ for `(1)`, which keeps its parentheses
+    // in the text and loses them in the expression, and that difference is
+    // the point: neither of them is a NULL any more.
+    for (sql, text, want_expr) in [
+        (
+            "ALTER TABLE t ADD COLUMN c DEFAULT (1+2)",
+            "(1+2)",
+            Expr::Binary {
+                op: BinOp::Add,
+                left: Box::new(Expr::Literal(Literal::Integer(1))),
+                right: Box::new(Expr::Literal(Literal::Integer(2))),
+            },
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c DEFAULT ((1))",
+            "((1))",
+            Expr::Literal(Literal::Integer(1)),
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c DEFAULT (1)",
+            "(1)",
+            Expr::Literal(Literal::Integer(1)),
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c DEFAULT (NULL)",
+            "(NULL)",
+            Expr::Literal(Literal::Null),
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c DEFAULT (x'00FF')",
+            "(x'00FF')",
+            Expr::Literal(Literal::Blob(vec![0x00, 0xFF])),
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c DEFAULT 7",
+            "7",
+            Expr::Literal(Literal::Integer(7)),
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c DEFAULT -5",
+            "-5",
+            Expr::Literal(Literal::Integer(-5)),
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c DEFAULT 'txt'",
+            "'txt'",
+            Expr::Literal(Literal::Text("txt".to_string())),
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c DEFAULT 1 COLLATE nocase",
+            "1 COLLATE nocase",
+            // A COLLATE is the last thing a default may carry, and it
+            // wraps the default rather than replacing it.
+            Expr::Collate {
+                expr: Box::new(Expr::Literal(Literal::Integer(1))),
+                collation: "nocase".to_string(),
+            },
+        ),
+    ] {
+        let want = text;
+        let Stmt::AlterTableAddColumn {
+            column: ColumnDef { constraints, .. },
+            column_sql,
+            ..
+        } = ok(sql)
+        else {
+            panic!("expected an ADD COLUMN from {sql}")
+        };
+        // The spliced text is the statement's own, sliced rather than
+        // rebuilt, so it is checked first and on its own terms: it is the
+        // whole of what lands in sqlite_schema, parentheses included.
+        assert_eq!(column_sql, format!("c DEFAULT {want}"), "for {sql:?}");
+        // And separately, the shape the column was actually read as. Before
+        // this, every parenthesised default became a bare NULL whatever it
+        // said, so a `(1+2)` and a `(NULL)` were the same column.
+        assert_eq!(constraints.len(), 1, "for {sql:?}");
+        // The variant is a struct, not a tuple: it also carries whether the
+        // default was written parenthesised, which is load-bearing rather than
+        // incidental. `is_builtin_constant_default` needs it, because SQLite's
+        // grammar reads an unparenthesised `a` as a string literal and a
+        // parenthesised `(a)` as a reference, and `ALTER TABLE ... ADD COLUMN`
+        // accepts one and refuses the other. Destructuring only `expr` here
+        // would have left that flag unchecked by this test.
+        let Constraint::Default { expr: got, parenthesized } = &constraints[0] else {
+            panic!("expected a DEFAULT from {sql}")
+        };
+        assert_eq!(got, &want_expr, "for {sql:?}");
+        assert_eq!(
+            *parenthesized,
+            text.contains('('),
+            "for {sql:?}: the parenthesised flag must match what was written"
+        );
+    }
+}
+
+#[test]
+fn a_parenthesised_name_default_is_recorded_and_the_bare_one_is_not() {
+    // SQLite's grammar reads an unparenthesised `a` as a string literal and
+    // a parenthesised `(a)` as a reference, so the same word is a constant in
+    // one and is not in the other. The two spellings produce the same
+    // expression tree and differ only in the `parenthesized` flag, so this
+    // test reads that flag rather than the refusal.
+    //
+    // The refusal itself is not raised here, and that is measured: on the
+    // CREATE path it is (sqlite3 answers `CREATE TABLE t(a,b DEFAULT (a))`
+    // with `default value of column [b] is not constant`, and a parse error
+    // cannot be overridden), while on the ALTER path the table is resolved
+    // first and `ALTER TABLE nosuch ADD COLUMN c DEFAULT (a)` is `no such
+    // table: nosuch`. See `Parser::default_name_reference` for why one flag
+    // serves both.
+    for sql in [
+        "ALTER TABLE t ADD COLUMN c DEFAULT (a)",
+        "ALTER TABLE t ADD COLUMN c DEFAULT (a COLLATE nocase)",
+        "ALTER TABLE t ADD COLUMN c DEFAULT (\"a\")",
+        "ALTER TABLE t ADD COLUMN c DEFAULT (+a)",
+    ] {
+        let Stmt::AlterTableAddColumn {
+            default_name_reference,
+            column,
+            ..
+        } = ok(sql)
+        else {
+            panic!("expected an ADD COLUMN from {sql}")
+        };
+        assert_eq!(
+            default_name_reference.as_deref(),
+            Some("c"),
+            "for {sql:?}"
+        );
+        assert!(
+            matches!(
+                column.constraints[0],
+                Constraint::Default {
+                    parenthesized: true,
+                    ..
+                }
+            ),
+            "for {sql:?}"
+        );
+    }
+
+    // The bare spelling is the same word and is not a reference, which is
+    // the whole of the distinction.
+    for sql in [
+        "ALTER TABLE t ADD COLUMN c DEFAULT a",
+        "ALTER TABLE t ADD COLUMN c DEFAULT a COLLATE nocase",
+    ] {
+        let Stmt::AlterTableAddColumn {
+            default_name_reference,
+            ..
+        } = ok(sql)
+        else {
+            panic!("expected an ADD COLUMN from {sql}")
+        };
+        assert_eq!(
+            default_name_reference, None,
+            "for {sql:?}"
+        );
+    }
+}
+
+#[test]
+fn a_create_table_parenthesised_name_default_is_a_parse_error() {
+    // The other half of the ordering, and the one that *is* raised by the
+    // parser: on the CREATE path there is no table to resolve, so the
+    // grammar is the whole answer. Measured on 3.53.4, and the message names
+    // the column rather than the name written as the default.
+    for (sql, column) in [
+        ("CREATE TABLE t(a,b DEFAULT (a))", "b"),
+        ("CREATE TABLE t(a,b DEFAULT (+a))", "b"),
+        ("CREATE TABLE t(a,b DEFAULT (a COLLATE nocase))", "b"),
+        ("CREATE TABLE t(a,b DEFAULT (nosuchcol))", "b"),
+    ] {
+        let e = err(sql);
+        assert_eq!(
+            e.message,
+            format!("default value of column [{column}] is not constant"),
+            "for {sql:?}"
+        );
+    }
+
+    // And the bare spelling is accepted, which is the distinction the
+    // parentheses make.
+    let _ = ok("CREATE TABLE t(a,b DEFAULT a)");
 }

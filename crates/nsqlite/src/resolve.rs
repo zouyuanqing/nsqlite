@@ -635,6 +635,7 @@ mod tests {
             name: name.to_string(),
             columns: cols.iter().map(|c| col(c)).collect(),
             rowid_alias: None,
+            unique_sets: Vec::new(),
             without_rowid: false,
             root_page: 0,
         };

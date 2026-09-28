@@ -100,6 +100,10 @@ fn serial_type_of(v: &Value) -> i64 {
 /// Appends a value's body bytes, given its serial type.
 fn push_body(out: &mut Vec<u8>, v: &Value) {
     match v {
+        // Stored by the TEXT serial type, which `record::serial_type` gives for
+        // both text spellings, so the bytes go out verbatim and the row is a
+        // text entry rather than a blob one.
+        Value::TextBytes(b) => out.extend_from_slice(b),
         Value::Null => {}
         Value::Integer(_) => {
             // The rowid slot is written by the caller as eight bytes; every

@@ -1,4 +1,10 @@
 /target
+# Scratch build directories. `CARGO_TARGET_DIR=target-<something>` is the way to
+# build a baseline while another process holds the real `target`, and a few of
+# these were created that way during the differential work. They are build
+# output, not source: nothing in the repository reads them, and one of them was
+# committed by accident, which is what this rule exists to stop happening again.
+/target-*/
 *.db
 *.db-wal
 *.db-shm
@@ -59,3 +65,14 @@ pg2.db
 # Scratch databases the ad-hoc checks leave behind.
 tmp/
 *.log
+
+# Scratch directories and files the differential and suite harnesses write
+# while measuring. Each one names a specific measurement rather than anything
+# the engine reads, and committing them buries the source changes: a sweep
+# script's generated corpus alone is 188k lines.
+/tmpwork/
+/tmp_parsecheck/
+/verify-tmp/
+/target-*/
+/result.tsv
+/*.sql
