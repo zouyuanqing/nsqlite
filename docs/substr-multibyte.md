@@ -50,6 +50,28 @@ length counts from that gap — so `substr(S,0,1)` is empty. A negative start co
 back from the end without being clamped; a negative length means "stop that many
 before the end", so `substr(S,2,-1)` is the first character.
 
+## What is NOT broken
+
+Measured on the same three characters, by VALUE comparison (so immune to the
+record-stream trap below). Every one returns 1 on **both** engines, so all four
+are already correct and must not be "fixed":
+
+```sql
+SELECT length(S) = 3;                                          -- 1 / 1
+SELECT instr(S, CAST(x'E69CAC' AS TEXT)) = 2;                  -- 1 / 1
+SELECT replace(S, CAST(x'E69CAC' AS TEXT),'X')
+     = CAST(x'E697A558E8AA9E' AS TEXT);                        -- 1 / 1
+SELECT upper(S) = S;                                           -- 1 / 1
+```
+
+`instr` returning **1, 2, 3** for the three characters is the interesting one: a
+byte-oriented implementation would answer 1, 4, 7. So `instr` is already
+character-indexed, and `replace` and `upper` already preserve the bytes.
+
+The defect is confined to `substr`. That is worth stating explicitly, because
+"character-aware string handling" invites a rewrite of the whole module and four
+of the five functions here are already right.
+
 ## Three rules that are not obvious
 
 ### 1. A character is never split, and an invalid byte is one whole character
