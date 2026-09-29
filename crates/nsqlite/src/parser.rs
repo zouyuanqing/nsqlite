@@ -133,6 +133,18 @@ pub enum Expr {
         escape: Option<Box<Expr>>,
         negated: bool,
     },
+    /// `expr MATCH expr` and `expr NOT MATCH expr`.
+    ///
+    /// A separate variant rather than a `BinOp` because `MATCH` is not a
+    /// comparison: it is a call the *planner* has to hand to a virtual table,
+    /// and it is a syntax error to write it where no virtual table can take
+    /// it. See the `eval` arm for the message that is measured against the
+    /// reference.
+    Match {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        negated: bool,
+    },
     Function {
         name: String,
         args: Vec<Expr>,
@@ -703,6 +715,12 @@ fn expr_spans(e: &Expr, visit: &mut impl FnMut(Span)) {
             if let Some(x) = escape {
                 expr_spans(x, visit);
             }
+        }
+        Expr::Match {
+            expr, pattern, ..
+        } => {
+            expr_spans(expr, visit);
+            expr_spans(pattern, visit);
         }
         Expr::Between {
             expr, low, high, ..
@@ -2331,6 +2349,7 @@ impl<'a> Parser<'a> {
                         | Some(Token::Keyword(Keyword::Like))
                         | Some(Token::Keyword(Keyword::Glob))
                         | Some(Token::Keyword(Keyword::Regexp))
+                        | Some(Token::Keyword(Keyword::Match))
                         | Some(Token::Keyword(Keyword::Between))
                 ) {
                 self.advance();
@@ -2353,6 +2372,20 @@ impl<'a> Parser<'a> {
                     expr: Box::new(left),
                     pattern: Box::new(pattern),
                     escape,
+                    negated,
+                };
+                continue;
+            }
+            if self.eat_keyword(Keyword::Match)? {
+                // MEASURED on 3.53.4: the right operand of MATCH is a full
+                // `expr`, not a bitwise one, and it is greedy -- `'a' MATCH 'b'
+                // 'c'` is accepted and is still the one MATCH, so the trailing
+                // 'c' is not a syntax error. `expr_bitwise` stops before AND
+                // and OR, which is the same right operand LIKE gets.
+                let pattern = self.expr_bitwise()?;
+                left = Expr::Match {
+                    expr: Box::new(left),
+                    pattern: Box::new(pattern),
                     negated,
                 };
                 continue;

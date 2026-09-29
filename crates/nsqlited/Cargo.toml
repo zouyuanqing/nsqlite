@@ -8,6 +8,10 @@ description = "Command-line shell for the nsqlite engine"
 
 [dependencies]
 nsqlite = { path = "../nsqlite" }
+# The vec0 module's adapter. It lives here, in the crate that depends on both,
+# because `nsqlite-vector` must not depend on the engine and `nsqlite` does not
+# depend on the vector crate -- see crates/nsqlited/src/vec0.rs.
+nsqlite-vector = { path = "../nsqlite-vector" }
 
 [[bin]]
 name = "nsqlited"

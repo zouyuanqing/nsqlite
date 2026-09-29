@@ -2121,6 +2121,9 @@ fn children(expr: &Expr) -> Vec<&Expr> {
             vec![expr]
         }
         Binary { left, right, .. } => vec![left, right],
+        Match {
+            expr, pattern, ..
+        } => vec![expr, pattern],
         Between {
             expr, low, high, ..
         } => vec![expr, low, high],

@@ -619,6 +619,24 @@ pub enum Msg {
     UnsupportedYet,
     /// `REASON: X is not supported yet`
     UnsupportedYetIn,
+    /// `unable to use function MATCH in the requested context`
+    ///
+    /// **MEASURED** on sqlite3 3.53.4, for every shape that has no virtual
+    /// table to hand the `MATCH` to:
+    ///
+    /// ```text
+    /// $ SELECT 'a' MATCH 'a';
+    /// Error: unable to use function MATCH in the requested context
+    /// ```
+    ///
+    /// It is a *runtime* error, not a parse error, and that is the load-bearing
+    /// part: `EXPLAIN SELECT 'a' MATCH 'a'` prints a complete program with
+    /// `Function 3 2 1 match(2)`, and a `SELECT` whose `MATCH` is never
+    /// reached answers normally. See the `eval` arm of `Expr::Match`.
+    ///
+    /// A fixed phrase with no holes, so it is in [`Msg::FIXED`]: the name `MATCH`
+    /// is the operator's own spelling and not a name out of the statement.
+    MatchNotInContext,
 }
 
 /// The rule for every name hole in a message whose names all came out of the
@@ -793,6 +811,10 @@ impl Msg {
             | Msg::ValuesForColumnsCount
             | Msg::UnsupportedYet
             | Msg::UnsupportedYetIn => &[],
+
+            // No holes: a fixed phrase naming the operator, not a name the
+            // statement supplied. `MATCH` here is the operator's own spelling.
+            Msg::MatchNotInContext => &[],
         }
     }
 
@@ -846,6 +868,7 @@ impl Msg {
         Msg::UnrecognizedToken,
         Msg::UnsupportedYet,
         Msg::UnsupportedYetIn,
+        Msg::MatchNotInContext,
     ];
     /// The messages with no holes, in the order the walk test quotes them.
     ///
@@ -861,6 +884,7 @@ impl Msg {
         Msg::IntegerOverflow,
         Msg::TooManyCompoundTerms,
         Msg::IncompleteInput,
+        Msg::MatchNotInContext,
     ];
 
     /// Whether this message has a hole in it, and so takes arguments.
@@ -878,6 +902,7 @@ impl Msg {
                 | Msg::IntegerOverflow
                 | Msg::TooManyCompoundTerms
                 | Msg::IncompleteInput
+                | Msg::MatchNotInContext
         )
     }
 
@@ -1054,6 +1079,15 @@ impl Msg {
             (Msg::UnsupportedYet, [Arg::Name(what)]) => format!("{what} is not supported yet"),
             (Msg::UnsupportedYetIn, [Arg::Name(reason), Arg::Name(what)]) => {
                 format!("{reason}: {what} is not supported yet")
+            }
+
+            // SQLite's own wording, not one of ours, and a fixed phrase.
+            // MEASURED: this is what 3.53.4 answers for `expr MATCH expr`
+            // wherever no virtual table can take the constraint. The operator
+            // is spelled in capitals because SQLite's own text does, even
+            // though the query may have written it in lower case.
+            (Msg::MatchNotInContext, []) => {
+                "unable to use function MATCH in the requested context".to_string()
             }
 
             (_, _) => panic!("wrong number of arguments for {self:?}: got {} parts", args.len()),
@@ -1360,6 +1394,18 @@ pub fn unsupported_yet(what: &str) -> Error {
 /// A `REASON: X is not supported yet` error, for a gap in this engine.
 pub fn unsupported_yet_in(reason: &str, what: &str) -> Error {
     Msg::UnsupportedYetIn.error(&[reason.into(), what.into()])
+}
+
+/// `unable to use function MATCH in the requested context`.
+///
+/// The message the reference gives for a `MATCH` that no virtual table can
+/// take. It is SQLite's own wording, kept verbatim because the differential
+/// suite compares error text byte for byte, and it is raised at *evaluation*
+/// time rather than at parse time: `EXPLAIN SELECT 'a' MATCH 'a'` prints a
+/// complete program, so a parse-time refusal would disagree with the reference
+/// on that too.
+pub fn match_not_in_context() -> Error {
+    Msg::MatchNotInContext.error(&[])
 }
 
 /// A count as an English ordinal: 1st, 2nd, 3rd, 4th, 11th, 21st, 112th.
@@ -1765,6 +1811,17 @@ mod tests {
         c(Msg::IncompleteInput, vec![], "SELECT 1 ORDER BY", "incomplete input"),
         c(Msg::IncompleteInput, vec![], "SELECT 1 GROUP BY", "incomplete input"),
         c(Msg::IncompleteInput, vec![], "SELECT a FROM", "incomplete input"),
+        // MEASURED on 3.53.4. The error is a RUNTIME one, so each of these
+        // statements has to be run to completion to see it, and the ones that
+        // answer normally are recorded because the laziness is the part that is
+        // easy to get wrong: a refusal raised at parse time would disagree with
+        // every row below that expects a value or no rows.
+        c(Msg::MatchNotInContext, vec![], "SELECT 'a' MATCH 'a'", "unable to use function MATCH in the requested context"),
+        c(Msg::MatchNotInContext, vec![], "SELECT 'a' NOT MATCH 'a'", "unable to use function MATCH in the requested context"),
+        c(Msg::MatchNotInContext, vec![], "CREATE TABLE t(x); INSERT INTO t VALUES('a'); SELECT x FROM t WHERE x MATCH 'a'", "unable to use function MATCH in the requested context"),
+        c(Msg::MatchNotInContext, vec![], "CREATE TABLE t(x); INSERT INTO t VALUES('a'); SELECT x FROM t WHERE x NOT MATCH 'a'", "unable to use function MATCH in the requested context"),
+        c(Msg::MatchNotInContext, vec![], "SELECT NULL MATCH 'a'", "unable to use function MATCH in the requested context"),
+        c(Msg::MatchNotInContext, vec![], "SELECT 'a' MATCH NULL", "unable to use function MATCH in the requested context"),
         c(Msg::IncompleteInput, vec![], "SELECT (1", "incomplete input"),
         c(Msg::IncompleteInput, vec![], "SELECT 1,", "incomplete input"),
         c(Msg::IncompleteInput, vec![], "SELECT 1 IN", "incomplete input"),
@@ -1892,7 +1949,7 @@ mod tests {
     /// The number of rows [`build_cases`] builds, and the number of generated
     /// tests there are. They have to be equal: one test per row, each reaching
     /// its own row and no other.
-    const CASE_COUNT: usize = 205;
+    const CASE_COUNT: usize = 211;
 
     /// The case at `index`, or a panic that says the table and the index
     /// disagree.
@@ -2014,6 +2071,10 @@ mod tests {
                 "too many terms in compound SELECT",
             ),
             (Msg::IncompleteInput, "incomplete input"),
+            (
+                Msg::MatchNotInContext,
+                "unable to use function MATCH in the requested context",
+            ),
         ];
         assert_eq!(
             expected.len(),
@@ -2123,6 +2184,8 @@ mod tests {
             | Msg::CannotAddNotNullColumn
             | Msg::CannotAddNonConstantDefault => Vec::new(),
             Msg::DefaultValueNotConstant => vec![name("c")],
+            // A fixed phrase: no holes, so the walk is empty.
+            Msg::MatchNotInContext => Vec::new(),
         }
     }
 
@@ -2220,6 +2283,9 @@ mod tests {
             Msg::UnrecognizedToken => "unrecognized token: \"Table\"".to_string(),
             Msg::UnsupportedYet => "Widget is not supported yet".to_string(),
             Msg::UnsupportedYetIn => "Reason: Widget is not supported yet".to_string(),
+            Msg::MatchNotInContext => {
+                "unable to use function MATCH in the requested context".to_string()
+            }
         }
     }
 

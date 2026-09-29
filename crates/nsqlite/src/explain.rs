@@ -1110,6 +1110,9 @@ fn expr_has_aggregate(e: &Expr) -> bool {
                 || expr_has_aggregate(pattern)
                 || escape.as_deref().is_some_and(expr_has_aggregate)
         }
+        Expr::Match {
+            expr, pattern, ..
+        } => expr_has_aggregate(expr) || expr_has_aggregate(pattern),
         Expr::Case {
             operand,
             whens,
@@ -2053,6 +2056,12 @@ fn collect_list_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a Select>) {
             for i in list {
                 collect_list_subqueries(i, out);
             }
+        }
+        Expr::Match {
+            expr, pattern, ..
+        } => {
+            collect_list_subqueries(expr, out);
+            collect_list_subqueries(pattern, out);
         }
         Expr::Like {
             expr,
@@ -4031,6 +4040,12 @@ fn add_columns(e: &Expr, out: &mut BTreeSet<String>) {
             }
         }
         Expr::InSelect { expr, .. } => add_columns(expr, out),
+        Expr::Match {
+            expr, pattern, ..
+        } => {
+            add_columns(expr, out);
+            add_columns(pattern, out);
+        }
         Expr::Like {
             expr,
             pattern,
@@ -4109,6 +4124,12 @@ fn add_correlated_refs(e: &Expr, table: &str, out: &mut BTreeSet<String>) {
         Expr::InSelect { expr, select, .. } => {
             add_correlated_refs(expr, table, out);
             add_qualified_in_body(&select.body, table, out);
+        }
+        Expr::Match {
+            expr, pattern, ..
+        } => {
+            add_correlated_refs(expr, table, out);
+            add_correlated_refs(pattern, table, out);
         }
         Expr::Like {
             expr,
@@ -4223,6 +4244,12 @@ fn add_qualified_in_expr(e: &Expr, table: &str, out: &mut BTreeSet<String>) {
             for i in list {
                 add_qualified_in_expr(i, table, out);
             }
+        }
+        Expr::Match {
+            expr, pattern, ..
+        } => {
+            add_qualified_in_expr(expr, table, out);
+            add_qualified_in_expr(pattern, table, out);
         }
         Expr::Like {
             expr,

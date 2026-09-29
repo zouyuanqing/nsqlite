@@ -10,10 +10,12 @@
 //! not what that shim reads.
 
 use std::process::ExitCode;
+use std::rc::Rc;
 
 use nsqlite::connection::{Connection, Outcome};
 
 mod testsuite;
+mod vec0;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -65,6 +67,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // `vec0` is registered on every connection, including `:memory:`. It is
+    // the one module this shell has, so a `CREATE VIRTUAL TABLE ... USING
+    // vec0(...)` works wherever a `CREATE TABLE` would, and `PRAGMA
+    // module_list` reports it. Registering it here rather than in
+    // `Connection::open` is the arrangement the engine documents: the module
+    // lives in a crate that deliberately does not depend on the engine, so the
+    // wiring belongs to whoever holds both, and that is this crate.
+    conn.register_vtab_module(Rc::new(vec0::Vec0VTabModule::new()));
 
     if suite_mode {
         // The record stream is the shim's only channel, so an error goes on it

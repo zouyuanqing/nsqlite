@@ -253,6 +253,12 @@ fn collect_columns(expr: &Expr, out: &mut Vec<(Option<String>, String)>) {
                 collect_columns(i, out);
             }
         }
+        Expr::Match {
+            expr, pattern, ..
+        } => {
+            collect_columns(expr, out);
+            collect_columns(pattern, out);
+        }
         Expr::Like {
             expr,
             pattern,

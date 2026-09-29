@@ -714,10 +714,12 @@ pub struct RowUpdate {
 /// 13. Run the four shadow `CREATE TABLE`s through the ordinary table path.
 /// 14. Never open a vtab's b-tree; its `rootpage` is 0.
 pub const ENGINE_CONTRACT: &str = "\
-1.  parse CREATE VIRTUAL TABLE into (name, module, args-as-text). Today
-    parser::create_statement falls through to Stmt::Unsupported(\"virtual\") at
-    crates/nsqlite/src/parser.rs:2931, and executing one gives
-    `ERROR: virtual is not supported yet` -- measured on this engine.
+1.  parse CREATE VIRTUAL TABLE into (name, module, args-as-text). DONE:
+    parser::Parser::create (crates/nsqlite/src/parser.rs:3077) returns
+    Stmt::CreateVirtualTable, falling through to Stmt::Unsupported only for
+    what it does not recognise (crates/nsqlite/src/parser.rs:3111-3120).
+    Executing one whose module is not registered now gives
+    `no such module: vec0` -- the reference's own sentence, measured on both.
 2.  let sqlite_schema hold type='table' with rootpage=0. MEASURED: the real
     sqlite3 3.53.4 stores a virtual table exactly that way, with the original
     CREATE VIRTUAL TABLE text verbatim in .sql.

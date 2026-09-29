@@ -77,6 +77,40 @@ pub trait VtabModule {
     /// to prevent.
     fn connect(&self, name: &str, args: &str) -> Result<Box<dyn VtabInstance>, VtabError>;
 
+    /// `xConnect` for a table whose rows are being handed in rather than looked
+    /// up.
+    ///
+    /// **This is the reopen path, and it exists because `connect` cannot cover
+    /// it.** A module keeps its tables in whatever state it likes -- and
+    /// `vec0`'s is an in-memory map, so a fresh module in a fresh process has
+    /// none. `connect` would answer `no such vtable` for a table whose data is
+    /// sitting in the file, which is the exact failure the reference
+    /// implementation documented when it gave up on reopening: its HNSW graph
+    /// is in memory only and "must be repopulated by re-inserting rows after
+    /// each open". Handing the rows in is what makes the *data* outlive the
+    /// process and the index be rebuilt from it.
+    ///
+    /// The rows are the two payload shadow tables, `(rowid, blob)` each,
+    /// because that is the shape a table's storage takes in this engine -- an
+    /// ordinary table per shadow table. Which two is the module's business;
+    /// the engine passes what the module's `shadow_tables` implies and lets the
+    /// module decide what it can use.
+    ///
+    /// The default forwards to [`VtabModule::connect`], so a module whose
+    /// tables survive in the module needs nothing here. That is the right
+    /// default rather than a required method: it is the honest answer for a
+    /// module with no on-disk representation of its rows.
+    fn connect_from_shadow(
+        &self,
+        name: &str,
+        args: &str,
+        vectors: &[(i64, Vec<u8>)],
+        chunks: &[(i64, Option<Vec<u8>>)],
+    ) -> Result<Box<dyn VtabInstance>, VtabError> {
+        let _ = (vectors, chunks);
+        self.connect(name, args)
+    }
+
     /// The tables this module wants backing a virtual table, as
     /// `(name, CREATE TABLE text)` pairs, in creation order.
     ///
@@ -109,6 +143,11 @@ pub trait VtabInstance {
 }
 
 /// One row of a virtual table.
+///
+/// `Clone` because `VtabInstance::scan` takes `&self` and so has to hand back a
+/// fresh `Vec` each call, and a handle that materialises its rows once -- the
+/// reopen path does exactly that -- cannot answer twice without one.
+#[derive(Debug, Clone, PartialEq)]
 pub struct VtabRow {
     /// The row's identifier, which goes in the rowid and not in a column —
     /// `join::nested_loop` recovers rowids from the row's own field.

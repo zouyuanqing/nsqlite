@@ -150,6 +150,7 @@ name = "nsqlited"
 version = "0.1.0"
 dependencies = [
  "nsqlite",
+ "nsqlite-vector",
 ]
 
 [[package]]

@@ -931,6 +931,12 @@ pub fn bind_expr(from: &From, expr: &Expr, out: &mut Vec<Bound>) {
                 bind_expr(from, item, out);
             }
         }
+        Expr::Match {
+            expr, pattern, ..
+        } => {
+            bind_expr(from, expr, out);
+            bind_expr(from, pattern, out);
+        }
         Expr::Like {
             expr,
             pattern,

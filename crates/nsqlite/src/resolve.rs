@@ -382,6 +382,9 @@ fn children_of(expr: &Expr) -> Vec<&Expr> {
             vec![expr]
         }
         Binary { left, right, .. } => vec![left, right],
+        Match {
+            expr, pattern, ..
+        } => vec![expr, pattern],
         Between {
             expr, low, high, ..
         } => vec![expr, low, high],
@@ -469,6 +472,19 @@ fn check_expr(from: &From, expr: &Expr, aliases: &[(String, Expr)], scope: Scope
                 check_expr(from, e, aliases, scope)?;
             }
             Ok(())
+        }
+        // A column on either side of MATCH binds like any other column, and
+        // that is what the vec0 contract's MATCH item needs: the left side is
+        // the table name and the right side is the term, and both have to
+        // resolve before planning ever sees them. MEASURED: the reference
+        // resolves these names at PARSE time -- `SELECT nosuchcol MATCH 'a'` is
+        // `no such column: nosuchcol`, not the context fault -- so an
+        // unresolvable operand here is the same error it would be for LIKE.
+        Expr::Match {
+            expr, pattern, ..
+        } => {
+            check_expr(from, expr, aliases, scope)?;
+            check_expr(from, pattern, aliases, scope)
         }
         // A star names every column of one source or of all of them, so it
         // resolves by construction. It is not a function call and its name is
@@ -586,6 +602,9 @@ fn count_refs(expr: &Expr) -> usize {
                 + count_refs(pattern)
                 + escape.as_ref().map(|e| count_refs(e)).unwrap_or(0)
         }
+        Expr::Match {
+            expr, pattern, ..
+        } => count_refs(expr) + count_refs(pattern),
         Expr::Function { star, args, .. } => {
             if *star {
                 0
