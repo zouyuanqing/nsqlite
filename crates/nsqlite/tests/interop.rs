@@ -228,8 +228,7 @@ fn reads_every_storage_class_from_a_real_file() {
 /// flushes, and a read-only statement never did:
 ///
 /// ```text
-/// $ printf 'SELECT 1;
-' | nsqlited --testsuite fresh.db
+/// $ printf 'SELECT 1;\n' | nsqlited --testsuite fresh.db
 /// $ xxd -s 100 -l 8 fresh.db          ->  0000 0000 0000 0000
 /// $ sqlite3 fresh.db "PRAGMA integrity_check;"
 /// Parse error: database disk image is malformed (11)
@@ -264,4 +263,84 @@ fn a_read_only_statement_leaves_a_valid_database_behind() {
     // file that claims zero pages.
     let pages = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
     assert!(pages >= 1, "the header claims {pages} pages, which is not a database");
+}
+
+/// A `UNIQUE` constraint, or a `PRIMARY KEY` that is not the rowid alias, is
+/// an INDEX in SQLite, and a file missing it is one the reference refuses.
+///
+/// MEASURED, and the fix went through three wrong answers before the right one,
+/// which is why each step is named here:
+///
+/// ```text
+/// $ printf 'CREATE TABLE t(a TEXT PRIMARY KEY, b);\n' | nsqlited --testsuite x.db
+/// $ sqlite3 x.db "PRAGMA integrity_check;"
+/// Error: database disk image is malformed
+/// ```
+///
+/// 1. Writing the index at all. The engine recorded the constraint and built
+///    nothing, so the file named an index root page that held no index.
+/// 2. Storing NULL rather than `''` in the `sql` column, which is what the
+///    reference does — `SELECT quote(sql)` for `sqlite_autoindex_t_1` is
+///    `NULL` — and the two are not interchangeable to a reader.
+/// 3. Writing the TABLE's schema row first. `sqlite_schema` is read in rowid
+///    order, and an index row that arrives before its table's is an orphan:
+///    `malformed database schema (sqlite_autoindex_t_1) - orphan index`, with
+///    the two rows otherwise byte-identical to the reference's.
+///
+/// An `INTEGER PRIMARY KEY` gets no such index, and must not: it is the
+/// b-tree's own key, so an index over it would enforce something the b-tree
+/// already enforces.
+#[test]
+fn a_unique_constraint_writes_the_index_the_reference_writes() {
+    for ddl in [
+        "CREATE TABLE t(a TEXT PRIMARY KEY, b);",
+        "CREATE TABLE t(a UNIQUE, b);",
+        "CREATE TABLE t(a, b, UNIQUE(a, b));",
+    ] {
+        let dir = std::env::temp_dir().join(format!("nsqlite-uniq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let path = dir.join("u.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut conn = nsqlite::connection::Connection::open(&path).expect("open");
+            conn.execute_script(ddl).expect("the DDL must be accepted");
+        }
+        // The index row is found by READING the schema, not by scanning the
+        // file for the name: a b-tree record is length-prefixed and may carry
+        // overflow, so the name is not necessarily contiguous text. Reading it
+        // back is also the thing that matters -- a row written but unreadable
+        // is what the reference refused.
+        let mut conn = nsqlite::connection::Connection::open(&path).expect("reopen");
+        let rows = conn
+            .execute_script("SELECT type, name, tbl_name, rootpage FROM sqlite_schema ORDER BY rowid;")
+            .expect("reading the schema back");
+        let nsqlite::connection::Outcome::Query { rows, .. } =
+            rows.into_iter().last().expect("one outcome")
+        else {
+            panic!("expected rows")
+        };
+        let got: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                r.values
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect();
+        // The TABLE is rowid 1 and its INDEX is rowid 2. The order is what
+        // `integrity_check` checks first, and a reversed pair is an "orphan
+        // index" to the reference even when both rows are otherwise identical.
+        assert_eq!(
+            got.first().map(|s| s.as_str()),
+            Some("table|t|t|2"),
+            "{ddl:?}: the table must be the first schema row"
+        );
+        assert_eq!(
+            got.get(1).map(|s| s.as_str()),
+            Some("index|sqlite_autoindex_t_1|t|3"),
+            "{ddl:?}: the implicit index must be the second schema row"
+        );
+    }
 }
