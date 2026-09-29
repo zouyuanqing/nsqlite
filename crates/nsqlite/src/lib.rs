@@ -64,6 +64,7 @@ pub mod value;
 pub mod varint;
 pub mod vtab;
 pub mod vec0_bridge;
+pub mod virtual_table;
 
 #[cfg(test)]
 #[path = "binary_text_tests.rs"]
@@ -72,6 +73,12 @@ mod binary_text_tests;
 #[cfg(test)]
 #[path = "unique_constraint_tests.rs"]
 mod unique_constraint_tests;
+
+#[cfg(test)]
+#[path = "match_tests.rs"]
+mod match_tests;
+#[path = "glob_tests.rs"]
+mod glob_tests;
 
 pub use error::{Error, Result, ResultCode};
 pub use text::Encoding;

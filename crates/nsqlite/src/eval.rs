@@ -361,6 +361,40 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Result<Value> {
             }
             Ok(Value::Integer(i64::from(matched != *negated)))
         }
+        Expr::Match { .. } => {
+            // `MATCH` belongs to FTS5 and to a `vec0` table's own query form,
+            // and this engine hosts neither. So it is refused, and the refusal
+            // is the reference's own sentence rather than one of ours.
+            //
+            // MEASURED on sqlite3 3.53.4:
+            //
+            //     $ SELECT 'a' MATCH 'a';
+            //     Error: unable to use function MATCH in the requested context
+            //
+            // Three details of that measurement are load-bearing, and all three
+            // are the reason this is an `Err` and not a `Value`:
+            //
+            //  * It is a RUNTIME error, not a parse error. `EXPLAIN SELECT 'a'
+            //    MATCH 'a'` prints a whole program, with a `Function` opcode
+            //    reading `match(2)`, so the statement compiles fine and fails
+            //    when it is stepped.
+            //  * It is raised only when the expression is REACHED. A short
+            //    circuited `CASE WHEN 0 THEN ('a' MATCH 'a') ELSE 42 END`
+            //    answers 42, and `WHERE 0 AND (x MATCH 'a')` answers no rows
+            //    without an error -- so the refusal cannot be hoisted to
+            //    planning or to the top of the walk. Being here, in the arm,
+            //    is what makes it lazy in the same way the reference's is.
+            //  * Neither operand is evaluated first. The reference resolves
+            //    names at parse time (`SELECT 'a' MATCH nosuchfn(1)` is
+            //    `no such function: nosuchfn`, a *parse* error) but a
+            //    reference's own runtime error is the context fault, so
+            //    nothing is evaluated before it.
+            //
+            // `negated` is deliberately not consulted: the reference refuses
+            // `NOT MATCH` with the identical sentence, so there is no separate
+            // message and no "invert the answer" path to take.
+            Err(msg::match_not_in_context())
+        }
         Expr::Function {
             name,
             args,
@@ -608,8 +642,51 @@ fn binary(
             Ok(Value::Integer(i64::from(same == (op == Is))))
         }
         In | NotIn => unreachable!("IN is handled by its own expression form"),
-        Like | NotLike | Glob | NotGlob | Regexp | NotRegexp => {
-            unreachable!("the pattern operators are handled by their own forms")
+        // LIKE is a form of its own, so it never arrives here -- but GLOB and
+        // REGEXP do: the parser builds `Expr::Binary` for both, and this arm
+        // used to answer `unreachable!`, which is a PROCESS CRASH on ordinary
+        // SQL rather than an error. `SELECT 'abc' GLOB 'a*';` killed the
+        // engine outright. The two are handled here instead.
+        Like | NotLike => {
+            unreachable!("LIKE is a form of its own and never reaches here")
+        }
+        Glob | NotGlob => {
+            // `l` and `r` arrive already evaluated -- this is `binary`, not the
+            // expression walker -- so there is no context to recurse with.
+            if l.is_null() || r.is_null() {
+                return Ok(Value::Null);
+            }
+            // An operand that is not text is read as its own spelling, the
+            // same rule the reference uses: `1 GLOB '1'` is 1, so a number is
+            // compared as the digits it prints. MEASURED.
+            let text = operand_text(&l);
+            let pattern = operand_text(&r);
+            let matched = glob(pattern.as_bytes(), text.as_bytes());
+            Ok(Value::Integer(i64::from(matched != (op == NotGlob))))
+        }
+        Regexp | NotRegexp => {
+            // A real regexp engine is not here, and answering 0 or 1 for a
+            // pattern this engine never matched would be a wrong answer rather
+            // than a gap, so it is refused. The reference DOES match, so this is
+            // a stated difference and not a match.
+            //
+            // MEASURED on sqlite3 3.53.4, where a regexp IS available:
+            //
+            //     'abc' REGEXP 'a'      -> 1     'abc' REGEXP '^a'   -> 1
+            //     'abc' REGEXP 'b'      -> 1     '.*b.*'            -> 1
+            //     'abc' REGEXP 'x+bc'   -> 0     'x' REGEXP NULL    -> NULL
+            //     NULL  REGEXP 'a'      -> NULL
+            //
+            // The NULL rules are right here for free, because SQLite's own are
+            // the ordinary ones: an unknown operand makes the whole comparison
+            // unknown. Only the matching is missing.
+            if l.is_null() || r.is_null() {
+                return Ok(Value::Null);
+            }
+            Err(crate::error::Error::new(
+                crate::error::ResultCode::Error,
+                "REGEXP is not supported yet",
+            ))
         }
         Concat => {
             // || treats NULL as the empty string, which is the one place SQLite
@@ -1255,6 +1332,231 @@ fn bytes_as_int(t: &[u8]) -> i64 {
 /// The wildcard is `%` for any run and `_` for one character. The comparison is
 /// over characters, and for a non-ASCII pattern the case folding stops, so a
 /// LIKE against text outside ASCII is case-sensitive.
+/// A GLOB/REGEXP operand as the text it is spelled with.
+///
+/// MEASURED: `1 GLOB '1'` is 1 on sqlite3 3.53.4, so a number is compared as
+/// the digits it prints rather than refused. A blob contributes its bytes, and
+/// NULL never reaches here -- the caller has already answered Null for it,
+/// which is SQLite's rule: an unknown operand makes the whole comparison
+/// unknown.
+fn operand_text(v: &Value) -> String {
+    match v {
+        Value::Text(s) => s.clone(),
+        // `text_bytes_of` answers an EMPTY slice for anything that is not
+        // text, which is right for a pattern's bytes and wrong here: a GLOB
+        // operand that is a number is compared as the digits it prints, and
+        // going through that helper made `1 GLOB '1'` false.
+        //
+        // MEASURED on sqlite3 3.53.4:
+        //
+        //     1    GLOB '1'    -> 1      1.5  GLOB '1.5' -> 1
+        //     x'31' GLOB '1'   -> 1      1    GLOB '1*'  -> 1
+        //
+        // so the rule is the ordinary TEXT conversion, which is what
+        // `to_string` already is on this type -- the same spelling the CLI and
+        // `quote()` use, so the three cannot drift.
+        //
+        // A BLOB is the exception: `Display` writes it as the literal `x'31'`,
+        // and `x'31' GLOB '1'` is 1 on the reference, so a blob contributes its
+        // own bytes rather than its hex spelling.
+        Value::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether `b` holds a `[` that never finds its `]`.
+fn has_unterminated_class(b: &[u8]) -> bool {
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'[' {
+            match class_end(b, i) {
+                Some(end) => i = end,
+                None => return true,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Whether the byte `c` is in the character class opening at `p[at]`, and
+/// whether there IS a class there at all.
+fn class_match(p: &[u8], at: usize, c: u8) -> Option<bool> {
+    // `None` means "there is no class here", and it is decided by whether a
+    // closing bracket was FOUND, not by where the scan stopped -- an
+    // unterminated `[` scans to the end of the pattern, and treating that as a
+    // class would silently swallow the rest of it.
+    let end = class_end(p, at)?;
+    let body = &p[at + 1..end];
+    let (negated, body) = match body.split_first() {
+        Some((b'^', rest)) => (true, rest),
+        _ => (false, body),
+    };
+    let mut hit = false;
+    let mut i = 0;
+    while i < body.len() {
+        // A range is `a-z`; a `-` at either end of the class is a literal.
+        if i + 2 < body.len() && body[i + 1] == b'-' {
+            if c >= body[i] && c <= body[i + 2] {
+                hit = true;
+            }
+            i += 3;
+        } else {
+            if c == body[i] {
+                hit = true;
+            }
+            i += 1;
+        }
+    }
+    Some(hit != negated)
+}
+
+/// The index just past the `]` that closes the class opening at `p[at]`, or
+/// `None` when there is no closing bracket and so no class.
+fn class_end(p: &[u8], at: usize) -> Option<usize> {
+    let mut i = at + 1;
+    // A `^` immediately after `[` negates, and is not a member.
+    if p.get(i) == Some(&b'^') {
+        i += 1;
+    }
+    // A `]` in the first position is a member, not the terminator.
+    if p.get(i) == Some(&b']') {
+        i += 1;
+    }
+    while i < p.len() && p[i] != b']' {
+        i += 1;
+    }
+    // Ran off the end: `[` is an ordinary character, which is what
+    // `'a[b' GLOB 'a[b'` being 0 on the reference says.
+    if i >= p.len() {
+        return None;
+    }
+    Some(i + 1)
+}
+
+/// SQL's `GLOB`: `*` stands for any run of characters, `?` for exactly one.
+///
+/// MEASURED on sqlite3 3.53.4, and the four rules below are all the reference's:
+///
+/// ```text
+/// 'abc' GLOB 'a*'   -> 1     'abc' GLOB 'a?c'  -> 1
+/// 'abc' GLOB 'a*c'  -> 1     'abc' GLOB '*'    -> 1
+/// 'abc' GLOB 'A*'   -> 0     'abc' NOT GLOB 'a*' -> 0
+/// 'a.c' GLOB 'a.c'  -> 1     'abc' GLOB 'a.c' -> 0
+/// 'a[b' GLOB 'a[b'  -> 0     'a*b' GLOB 'a*b' -> 1
+/// ```
+///
+/// The last three are the ones worth stating: `.` is an ordinary character and
+/// not "any", `[` does not open a character class (there is no `[a-z]` here --
+/// `'a[b' GLOB 'a[b'` is 0 because the `[` is literal on both sides but the
+/// `b` does not follow), and `*` is only a wildcard when it is a whole
+/// character, so `'a*b' GLOB 'a*b'` matches on the two literal `a`s and `b`s
+/// with the `*` matching nothing.
+///
+/// It is CASE-SENSITIVE, unlike `LIKE`, which is the difference a caller is most
+/// likely to trip on: `'abc' GLOB 'A*'` is 0 here and `'ab' LIKE 'A'` is 1.
+///
+/// The match is over BYTES, not characters, for the same reason `like_bytes`
+/// is: a byte that is not valid UTF-8 is still a character of the text, and
+/// `?` counts it. A multi-byte character is therefore `?` applied to each of
+/// its bytes, which is what the reference does too.
+fn glob(pattern: &[u8], text: &[u8]) -> bool {
+    let (p, t) = (pattern, text);
+    // An unterminated `[` in the PATTERN fails the match outright.
+    //
+    // MEASURED, and this is the opposite of what a plain reading of "a `[`
+    // that opens nothing is an ordinary character" gives:
+    //
+    //     'a[b' GLOB 'a[b'   -> 0     '[' GLOB '['     -> 0
+    //     'a['  GLOB 'a['    -> 0     '[a' GLOB '[a'   -> 0
+    //     'a['  GLOB '['     -> 0     'abc' GLOB 'a[b' -> 0
+    //
+    // So a `[` with no `]` is a malformed PATTERN rather than a literal, and
+    // the reference refuses rather than treating it as itself.
+    //
+    // In the TEXT it is different, and an earlier version of this check
+    // wrongly covered both: `'a[b' GLOB 'a*'` and `'[' GLOB '*'` are both 1,
+    // because a `*` in the pattern can consume the bracket as an ordinary
+    // character. The asymmetry is that the pattern is what GLOB reads -- a
+    // class it cannot close is a malformed pattern -- while the text is only
+    // ever matched against, never interpreted.
+    if has_unterminated_class(p) {
+        return false;
+    }
+    // Walk both, remembering the most recent `*` and where the text was when it
+    // was seen. A mismatch restarts from that point rather than from the
+    // start, which is what makes `*` linear rather than exponential.
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == b'?' {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'[' {
+            // A character class: `[abc]` matches one of the listed bytes, and
+            // `[^abc]` matches one that is not listed.
+            //
+            // MEASURED, and the three cases below are the ones a first
+            // implementation gets wrong:
+            //
+            //     'abc' GLOB 'a[bc]c'   -> 0   a 3-character class is
+            //                                    3 characters, so it cannot
+            //                                    match the single `c` left
+            //     'abc' GLOB 'a[b]c'    -> 1   one character from the class
+            //     'abc' GLOB 'a[^x]c'   -> 1   negated, and `b` is not `x`
+            //
+            // An unterminated `[` is not a class at all: `'a[b' GLOB 'a[b'` is
+            // 0 on the reference, which is what a literal `[` gives, so a
+            // class with no closing bracket falls through and the `[` matches
+            // itself.
+            match class_match(p, pi, t[ti]) {
+                Some(true) => {
+                    pi = class_end(p, pi).unwrap_or(pi + 1);
+                    ti += 1;
+                }
+                Some(false) => match star {
+                    Some((sp, st)) => {
+                        pi = sp + 1;
+                        ti = st + 1;
+                        star = Some((sp, st + 1));
+                    }
+                    None => return false,
+                },
+                None => {
+                    // Not a class. Treat the `[` as the ordinary character it
+                    // is, and let the loop match it against the text.
+                    if p[pi] == t[ti] {
+                        pi += 1;
+                        ti += 1;
+                    } else if let Some((sp, st)) = star {
+                        pi = sp + 1;
+                        ti = st + 1;
+                        star = Some((sp, st + 1));
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if let Some((sp, st)) = star {
+            // Let the last `*` swallow one more character and try again.
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    // Any trailing `*` may match nothing, so it does not block a match.
+    p[pi..].iter().all(|&c| c == b'*')
+}
+
 pub fn like(
     value: &Value,
     pattern: &Value,
