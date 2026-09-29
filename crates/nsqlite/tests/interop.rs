@@ -219,3 +219,49 @@ fn reads_every_storage_class_from_a_real_file() {
     // SQLite stores a REAL NaN as NULL, on both the write and the read side.
     assert_eq!(by_name("nan"), Value::Null);
 }
+
+/// A database created by a statement that writes nothing still has to be a
+/// valid database, because the file is left on disk for the next process.
+///
+/// MEASURED, and the failure is one the engine's own reader does not notice.
+/// A fresh file is a 100-byte header followed by zeroes until something
+/// flushes, and a read-only statement never did:
+///
+/// ```text
+/// $ printf 'SELECT 1;
+' | nsqlited --testsuite fresh.db
+/// $ xxd -s 100 -l 8 fresh.db          ->  0000 0000 0000 0000
+/// $ sqlite3 fresh.db "PRAGMA integrity_check;"
+/// Parse error: database disk image is malformed (11)
+/// ```
+///
+/// The zeros at offset 100 are the schema's own b-tree header. Without it,
+/// page 1 is a file header and nothing else, and that is not a shape the
+/// reference accepts. Every writing statement was fine, which is why this
+/// survived: the suite's shim materialises a new database with `SELECT 1;`
+/// before handing a name out, so that `SELECT` was leaving behind a file only
+/// this engine could open.
+#[test]
+fn a_read_only_statement_leaves_a_valid_database_behind() {
+    let dir = std::env::temp_dir().join(format!("nsqlite-readonly-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    let path = dir.join("fresh.db");
+    let _ = std::fs::remove_file(&path);
+    {
+        // Opening is what creates the file, and a SELECT through the
+        // connection is a statement that writes nothing.
+        let mut conn = nsqlite::connection::Connection::open(&path).expect("opening a fresh file");
+        conn.execute_script("SELECT 1;").expect("the SELECT itself must succeed");
+    }
+    let bytes = std::fs::read(&path).expect("the file must exist after the connection closed");
+    // 0x0d at offset 100 is the schema page's leaf b-tree header. It is what
+    // makes page 1 a schema leaf rather than a bare file header.
+    assert_eq!(
+        bytes[100], 0x0d,
+        "no b-tree header at offset 100, so the file does not describe itself"
+    );
+    // And the page count in the header must be at least one: SQLite rejects a
+    // file that claims zero pages.
+    let pages = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+    assert!(pages >= 1, "the header claims {pages} pages, which is not a database");
+}

@@ -82,6 +82,10 @@ impl Pager {
             Pager {
                 file,
                 page_size: 4096,
+                // The page count starts at 0 and becomes 1 when
+                // `Connection::init_schema_page` claims page 1, which is what
+                // a fresh database needs: the file header and the schema's
+                // b-tree root are the same page.
                 header: DbHeader::default(),
                 cache: HashMap::new(),
                 lru: Vec::new(),

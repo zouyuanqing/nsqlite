@@ -600,6 +600,21 @@ impl Connection {
         let leaf = crate::btree_write::LeafPage::empty(SCHEMA_ROOT, self.pager.page_size());
         leaf.write_to(&mut self.pager)?;
         self.pager.claim_page(SCHEMA_ROOT)?;
+        // A NEW page has to reach the file even if this statement writes
+        // nothing. A statement that does write calls `flush` on its way out, and
+        // this page goes with it; `SELECT 1;` on a fresh file does not, and the
+        // file was left 4096 bytes of header followed by zeroes, which the real
+        // sqlite3 rejects:
+        //
+        //     $ xxd -s 100 -l 8 fresh.db   ->  0000 0000 0000 0000
+        //     $ sqlite3 fresh.db "PRAGMA integrity_check;"
+        //     Parse error: database disk image is malformed (11)
+        //
+        // The b-tree header at offset 100 is what makes page 1 a schema leaf
+        // rather than a file header with nothing after it, so leaving it
+        // unwritten is not a "no changes yet" state -- it is a file that does
+        // not describe itself.
+        self.pager.flush()?;
         Ok(())
     }
 
