@@ -384,6 +384,8 @@ fn schema_table() -> Table {
         unique_sets: Vec::new(),
         without_rowid: false,
         root_page: SCHEMA_ROOT,
+        // The schema table is a real b-tree on page 1, not a module.
+        virtual_module: None,
     }
 }
 
@@ -910,6 +912,7 @@ impl Connection {
                 }
                 Ok(Outcome::Changed(0))
             }
+            Stmt::CreateVirtualTable { .. } => Err(msg::unsupported_yet("virtual")),
             Stmt::Unsupported(what) => Err(msg::unsupported_yet(&what)),
         }
     }
@@ -2348,6 +2351,10 @@ impl Connection {
             unique_sets: schema.unique_sets.clone(),
             without_rowid: schema.without_rowid,
             root_page: schema.root_page,
+            // Cloned rather than moved: the closure is called four times, and
+            // an `Option<String>` is not `Copy`. The schema table is never a
+            // module's, so this is always `None` in practice.
+            virtual_module: schema.virtual_module.clone(),
         };
         tables.push(aliased("sqlite_master"));
         tables.push(aliased("sqlite_schema"));

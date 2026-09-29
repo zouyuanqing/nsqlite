@@ -1100,6 +1100,8 @@ fn fixture_tables() -> Vec<crate::catalog::Table> {
             unique_sets: Vec::new(),
             without_rowid: false,
             root_page: 0,
+        // An ordinary table: no module hosts it.
+        virtual_module: None,
         }
     }
     vec![

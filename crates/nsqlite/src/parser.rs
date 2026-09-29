@@ -17,7 +17,7 @@
 //! than overflowing the stack, because a recursive-descent parser at 1000
 //! levels of nesting will exhaust a default-sized thread stack.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ResultCode};
 use crate::msg;
 use crate::tokenizer::{Keyword, Punct, Span, Token, Tokenizer};
 use crate::value::Value;
@@ -423,6 +423,25 @@ pub enum Stmt {
         /// written rather than a reconstruction.
         sql: String,
     },
+    /// `CREATE VIRTUAL TABLE name USING module(args)`.
+    ///
+    /// The four fields are exactly what `vec0_bridge::CreateVirtualTable`
+    /// asks the parser for. `args` is the parenthesised list **verbatim**,
+    /// parentheses included, because the module owns that grammar and a
+    /// re-serialised list would lose the original spelling -- which is the
+    /// same reason `CreateIndex` carries `sql`. Measured: the reference
+    /// stores `sql = <the whole CREATE VIRTUAL TABLE text>`, and a reopened
+    /// connection reads the definition back out of that column, so a
+    /// reconstruction is not equivalent to the original.
+    CreateVirtualTable {
+        name: String,
+        /// The module name -- `vec0`.
+        module: String,
+        /// The module's argument list, verbatim, parentheses included.
+        args: String,
+        /// The whole statement's text, which is what `sqlite_schema` stores.
+        sql: String,
+    },
     Insert {
         table: String,
         columns: Option<Vec<String>>,
@@ -495,7 +514,9 @@ impl Stmt {
     /// text they carry, so they are right whether or not `text` is.
     pub fn statement_text(&self, text: &str) -> String {
         let sql = match self {
-            Stmt::CreateTable { sql, .. } | Stmt::CreateIndex { sql, .. } => sql.as_str(),
+            Stmt::CreateTable { sql, .. }
+            | Stmt::CreateIndex { sql, .. }
+            | Stmt::CreateVirtualTable { sql, .. } => sql.as_str(),
             Stmt::Select(s) => {
                 let span = select_span(s);
                 text.get(span.start..span.end).unwrap_or("")
@@ -3054,7 +3075,10 @@ impl<'a> Parser<'a> {
             self.skip_to_semicolon()?;
             return Ok(Stmt::Unsupported(format!("view {name}")));
         }
-        // CREATE TRIGGER, VIRTUAL TABLE, and the rest.
+        if self.at_keyword(Keyword::Virtual) {
+            return self.create_virtual_table();
+        }
+        // CREATE TRIGGER, and the rest.
         let kind = self
             .advance()
             .map(|t| describe(&t))
@@ -3674,6 +3698,93 @@ impl<'a> Parser<'a> {
         }
         self.expect_punct(Punct::RParen, "closing a constraint column list")?;
         Ok(columns)
+    }
+
+    /// `CREATE VIRTUAL TABLE name USING module(args)`.
+    ///
+    /// The statement's own text starts at CREATE, exactly as `create_index`
+    /// finds it, and for the same reason: by the time this runs the cursor is
+    /// already past CREATE, VIRTUAL and TABLE, so the keyword is looked for
+    /// backwards rather than remembered.
+    fn create_virtual_table(&mut self) -> Result<Stmt> {
+        let start = self.tokens[..self.index]
+            .iter()
+            .rposition(|(t, _)| matches!(t, Token::Keyword(Keyword::Create)))
+            .map(|i| self.tokens[i].1.start);
+        self.expect_keyword(Keyword::Virtual, "after CREATE")?;
+        self.expect_keyword(Keyword::Table, "after CREATE VIRTUAL")?;
+        let name = self.quoted_name("after CREATE VIRTUAL TABLE")?;
+        self.expect_keyword(Keyword::Using, "after a virtual table name")?;
+        let module = self.quoted_name("after USING")?;
+        // The argument list is taken VERBATIM, parentheses and all, by
+        // recording where it starts and where the matching close parenthesis
+        // ends. The module owns that grammar -- `Schema::parse` strips the
+        // parentheses itself -- so re-serialising a token list here would lose
+        // both the original spacing and any quoting a module needs. The depth
+        // counter is what makes a nested list or a function call inside the
+        // arguments not end the capture early.
+        let args = match self.peek() {
+            Some(Token::Punct(Punct::LParen)) => {
+                let open = self.tokens[self.index].1.start;
+                let mut depth = 0i32;
+                loop {
+                    match self.advance() {
+                        Some(Token::Punct(Punct::LParen)) => depth += 1,
+                        Some(Token::Punct(Punct::RParen)) => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        Some(_) => {}
+                        None => {
+                            return Err(Error::new(
+                                ResultCode::Error,
+                                "unterminated argument list after USING",
+                            ))
+                        }
+                    }
+                }
+                // The close parenthesis's own end, taken from the token the
+                // cursor stopped on -- the same span `create_index` uses to
+                // find where its statement ends.
+                let to = self
+                    .tokens
+                    .get(self.index.saturating_sub(1))
+                    .map(|(_, s)| s.end)
+                    .unwrap_or(open);
+                Some(self.sql.get(open..to.max(open)).unwrap_or_default().to_string())
+            }
+            _ => None,
+        };
+        // Anything after the list -- the options some modules take -- belongs
+        // to the module too, so it is swept up rather than dropped.
+        self.skip_to_semicolon()?;
+        // The statement's own text, from CREATE to the last token of it. The
+        // script is tokenised up front, so the end is where the previous token
+        // ended rather than where the next one starts -- `create_index` reads
+        // it the same way, and `sqlite_schema` stores the result verbatim.
+        let sql = match start {
+            Some(a) => {
+                let to = self
+                    .tokens
+                    .get(self.index.saturating_sub(1))
+                    .map(|(_, s)| s.end)
+                    .unwrap_or(a);
+                self.sql.get(a..to.max(a)).unwrap_or_default().to_string()
+            }
+            None => String::new(),
+        };
+        Ok(Stmt::CreateVirtualTable {
+            name,
+            module,
+            // A module with no argument list gets an empty pair of parentheses
+            // rather than nothing, so `Schema::parse` reports its own
+            // "expected a parenthesised list" message instead of this layer
+            // inventing one.
+            args: args.unwrap_or_else(|| "()".to_string()),
+            sql,
+        })
     }
 
     fn create_index(&mut self) -> Result<Stmt> {

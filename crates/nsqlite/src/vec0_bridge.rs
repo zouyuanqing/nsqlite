@@ -360,15 +360,23 @@ mod tests {
     fn a_create_statement_round_trips_through_the_engine_parser() {
         // A virtual table's text is stored and read back verbatim, so the text
         // this module builds has to be something the engine's tokenizer can
-        // read -- even though the engine cannot execute it yet. This is what
-        // makes the statement a `Unsupported` rather than a parse error.
+        // read. This used to assert the statement stayed `Unsupported` --
+        // "the engine should recognise but not yet execute it" -- and that
+        // assertion is what this pass removed: the engine now parses it into a
+        // real `Stmt::CreateVirtualTable`, carrying back exactly the four
+        // fields this struct holds. A reopened connection rebuilds the table
+        // from that text, so what comes back out of the parser has to be what
+        // went in.
         let stmt =
             CreateVirtualTable::new("docs", "vec0", "(embedding float[3], distance_metric=L2)");
         let parsed = crate::parser::parse_one(&stmt.sql).expect("the stored text must tokenize");
-        assert!(
-            matches!(parsed, crate::parser::Stmt::Unsupported(_)),
-            "the engine should recognise but not yet execute it, got {parsed:?}"
-        );
+        let crate::parser::Stmt::CreateVirtualTable { name, module, args, sql } = parsed else {
+            panic!("the engine should parse it as a virtual table, got {parsed:?}")
+        };
+        assert_eq!(name, stmt.name);
+        assert_eq!(module, stmt.module);
+        assert_eq!(args, stmt.args, "the argument list must survive verbatim");
+        assert_eq!(sql, stmt.sql, "the stored text must survive verbatim");
     }
 
     #[test]

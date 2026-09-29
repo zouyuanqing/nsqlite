@@ -64,6 +64,8 @@ fn table(name: &str, columns: &[&str], root: u32) -> Table {
         unique_sets: Vec::new(),
         without_rowid: false,
         root_page: root,
+    // An ordinary table: no module hosts it.
+    virtual_module: None,
     }
 }
 

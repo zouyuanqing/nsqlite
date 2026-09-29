@@ -58,6 +58,14 @@ pub struct Table {
     pub without_rowid: bool,
     /// The page the table's b-tree is rooted at.
     pub root_page: u32,
+    /// The module a virtual table is hosted by, `None` for an ordinary table.
+    ///
+    /// A virtual table has no b-tree of its own, so `root_page` is 0 and every
+    /// read of it goes through the module instead. The table still lives in
+    /// `Catalog::tables` rather than beside it, because `Connection::table`
+    /// resolves a name through that one map and a table in a second map would
+    /// answer `no such table` to a query that should have worked.
+    pub virtual_module: Option<String>,
 }
 
 impl Table {
@@ -373,6 +381,10 @@ impl Catalog {
             unique_sets,
             without_rowid: false,
             root_page: 0,
+            // A `CREATE TABLE` never names a module; only
+            // `CREATE VIRTUAL TABLE` does, and that path builds the entry
+            // itself rather than coming through here.
+            virtual_module: None,
         };
         // The alias is enforced by the b-tree, which refuses a duplicate key
         // before this table's `unique_sets` is ever consulted, so a key that is

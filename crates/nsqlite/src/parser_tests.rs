@@ -1036,3 +1036,64 @@ fn a_create_table_parenthesised_name_default_is_a_parse_error() {
     // parentheses make.
     let _ = ok("CREATE TABLE t(a,b DEFAULT a)");
 }
+
+/// `CREATE VIRTUAL TABLE` is carried as a statement rather than swept into
+/// `Stmt::Unsupported`, and the pieces the engine needs are the module name,
+/// the argument list **verbatim**, and the statement's own text.
+///
+/// MEASURED against sqlite3 3.53.4: the reference stores `sql` as the whole
+/// `CREATE VIRTUAL TABLE` text byte for byte, and a reopened connection reads
+/// the definition back out of that column -- so a reconstruction is not
+/// equivalent, and `args` in particular must not be re-serialised from tokens.
+#[test]
+fn create_virtual_table_keeps_its_arguments_verbatim() {
+    let Stmt::CreateVirtualTable { name, module, args, sql } =
+        ok("CREATE VIRTUAL TABLE v USING vec0(a float[3])")
+    else {
+        panic!("expected a CREATE VIRTUAL TABLE")
+    };
+    assert_eq!(name, "v");
+    assert_eq!(module, "vec0");
+    // The parentheses, the spacing and the inner brackets all survive.
+    assert_eq!(args, "(a float[3])");
+    assert_eq!(sql, "CREATE VIRTUAL TABLE v USING vec0(a float[3])");
+}
+
+#[test]
+fn a_nested_argument_list_does_not_end_the_capture_early() {
+    // A `(` inside the argument list must not close it: a module that takes a
+    // parenthesised sub-expression is ordinary, and the depth counter is the
+    // only thing standing between that and a truncated `args`.
+    let Stmt::CreateVirtualTable { module, args, .. } =
+        ok("CREATE VIRTUAL TABLE t USING m(x int, part(a, b), y)")
+    else {
+        panic!("expected a CREATE VIRTUAL TABLE")
+    };
+    assert_eq!(module, "m");
+    assert_eq!(args, "(x int, part(a, b), y)");
+}
+
+#[test]
+fn a_quoted_module_name_and_a_quoted_table_name_both_survive() {
+    let Stmt::CreateVirtualTable { name, module, args, .. } =
+        ok("CREATE VIRTUAL TABLE \"my table\" USING \"my mod\"(a)")
+    else {
+        panic!("expected a CREATE VIRTUAL TABLE")
+    };
+    assert_eq!(name, "my table");
+    assert_eq!(module, "my mod");
+    assert_eq!(args, "(a)");
+}
+
+#[test]
+fn a_module_with_no_arguments_gets_an_empty_pair() {
+    // Not an error here: the module owns that grammar, and `Schema::parse`
+    // reports "expected a parenthesised list" itself, which is a better
+    // message than this layer inventing one.
+    let Stmt::CreateVirtualTable { module, args, .. } = ok("CREATE VIRTUAL TABLE t USING m")
+    else {
+        panic!("expected a CREATE VIRTUAL TABLE")
+    };
+    assert_eq!(module, "m");
+    assert_eq!(args, "()");
+}

@@ -594,6 +594,8 @@ fn the_affinity_map_and_the_comparison_rule_use_the_same_key() {
         unique_sets: Vec::new(),
         without_rowid: false,
         root_page: 0,
+    // An ordinary table: no module hosts it.
+    virtual_module: None,
     };
     let source = crate::join::Source {
         name: "t".into(),
