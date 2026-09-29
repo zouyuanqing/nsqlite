@@ -418,6 +418,8 @@ pub enum Msg {
     ///
     /// Query-sourced: `NAME` keeps the spelling the query used.
     NoSuchTable,
+    /// `no such module: NAME`
+    NoSuchModule,
     /// `no such table: SCHEMA.NAME`
     ///
     /// Raised when the schema qualifier names a database the engine has not
@@ -717,6 +719,7 @@ impl Msg {
             // two holes are counts), `AmbiguousColumnStar` three, and
             // `CompoundColumnCount` none.
             Msg::NoSuchTable
+            | Msg::NoSuchModule
             | Msg::NoSuchColumn
             | Msg::NoSuchColumnDoubleQuoted
             | Msg::AmbiguousColumn
@@ -897,6 +900,7 @@ impl Msg {
             // written, which is what sqlite3 does for every spelling of a table
             // reference: bare, quoted, and schema-qualified.
             (Msg::NoSuchTable, [Arg::Name(n)]) => format!("no such table: {n}"),
+            (Msg::NoSuchModule, [Arg::Name(n)]) => format!("no such module: {n}"),
             (Msg::NoSuchTableSchemaQualified, [Arg::Name(db), Arg::Name(n)]) => {
                 format!("no such table: {db}.{n}")
             }
@@ -1099,6 +1103,16 @@ impl fmt::Display for Msg {
 /// A `no such table` error, for the table name as written in the query.
 pub fn no_such_table(name: &str) -> Error {
     Msg::NoSuchTable.error(&[name.into()])
+}
+
+/// `no such module: NAME`, for `USING` a module this connection has not got.
+///
+/// MEASURED against sqlite3 3.53.4: `CREATE VIRTUAL TABLE t USING nosuch(x)`
+/// answers `no such module: nosuch` and leaves no row behind in
+/// `sqlite_schema`, so a failed registration rolls back cleanly rather than
+/// leaving a table whose shadow tables were never built.
+pub fn no_such_module(name: &str) -> Error {
+    Msg::NoSuchModule.error(&[name.into()])
 }
 
 /// A `no such table: DB.NAME` error, for a reference qualified by a database
@@ -2060,6 +2074,7 @@ mod tests {
         let three = || vec![name("Schema"), name("Table"), name("Column")];
         match msg {
             Msg::NoSuchTable
+            | Msg::NoSuchModule
             | Msg::NoSuchColumn
             | Msg::NoSuchColumnDoubleQuoted
             | Msg::AmbiguousColumn
@@ -2119,6 +2134,7 @@ mod tests {
     fn shape_text(msg: Msg) -> String {
         match msg {
             Msg::NoSuchTable => "no such table: Table".to_string(),
+            Msg::NoSuchModule => "no such module: Module".to_string(),
             Msg::NoSuchTableSchemaQualified => "no such table: Table.Column".to_string(),
             Msg::NoSuchColumn => "no such column: Table".to_string(),
             Msg::NoSuchColumnQualified => "no such column: Table.Column".to_string(),

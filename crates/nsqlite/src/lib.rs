@@ -62,6 +62,7 @@ pub mod text;
 pub mod tokenizer;
 pub mod value;
 pub mod varint;
+pub mod vtab;
 pub mod vec0_bridge;
 
 #[cfg(test)]

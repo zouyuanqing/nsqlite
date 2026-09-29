@@ -447,6 +447,14 @@ pub struct Connection {
     /// from the statement's own text here, on the way in, and cleared on the
     /// way out whether the statement ran or failed.
     double_quoted: Vec<String>,
+    /// The virtual-table modules this connection can host.
+    ///
+    /// Empty unless a caller registers one — `nsqlited` registers `vec0` at
+    /// startup — which is the right default, because a database with no
+    /// virtual table in it never consults it. The trait lives in
+    /// [`crate::vtab`] rather than in `nsqlite-vector` because that crate
+    /// deliberately does not depend on this one; see the module docs there.
+    vtabs: crate::vtab::VtabRegistry,
 }
 
 impl Connection {
@@ -463,6 +471,7 @@ impl Connection {
             column_name_flags: Connection::default_column_name_flags(),
             pending_outcome: None,
             double_quoted: Vec::new(),
+            vtabs: crate::vtab::VtabRegistry::new(),
         };
         conn.load_schema()?;
         Ok(conn)
@@ -482,6 +491,7 @@ impl Connection {
             column_name_flags: Connection::default_column_name_flags(),
             pending_outcome: None,
             double_quoted: Vec::new(),
+            vtabs: crate::vtab::VtabRegistry::new(),
         };
         conn.load_schema()?;
         Ok(conn)
@@ -912,12 +922,125 @@ impl Connection {
                 }
                 Ok(Outcome::Changed(0))
             }
-            Stmt::CreateVirtualTable { .. } => Err(msg::unsupported_yet("virtual")),
+            Stmt::CreateVirtualTable {
+                name,
+                module,
+                args,
+                sql,
+            } => {
+                self.create_virtual_table(name, module, args, sql)?;
+                Ok(Outcome::Changed(0))
+            }
             Stmt::Unsupported(what) => Err(msg::unsupported_yet(&what)),
         }
     }
 
     // --- DDL ------------------------------------------------------------
+
+    /// Registers a virtual-table module.
+    ///
+    /// This is how a host makes `vec0` — or any other module — available to
+    /// `CREATE VIRTUAL TABLE ... USING <name>`. It is separate from
+    /// [`Connection::open`] because the module lives in a crate that
+    /// deliberately does not depend on this one, so the wiring belongs to
+    /// whoever holds both: `nsqlited` for the CLI, or an embedder for the
+    /// library.
+    pub fn register_vtab_module(&mut self, module: std::rc::Rc<dyn crate::vtab::VtabModule>) {
+        self.vtabs.register(module);
+    }
+
+    /// The module names a `USING` clause on this connection can match.
+    pub fn vtab_modules(&self) -> Vec<String> {
+        self.vtabs.names()
+    }
+
+    /// `CREATE VIRTUAL TABLE name USING module(args)`.
+    ///
+    /// Four things happen, in this order, and the order is the point:
+    ///
+    /// 1. the module is found, and a missing one leaves **nothing** behind.
+    ///    MEASURED on sqlite3 3.53.4: `CREATE VIRTUAL TABLE t USING nosuch(x)`
+    ///    answers `no such module: nosuch` and writes no `sqlite_schema` row, so
+    ///    a failed registration rolls back rather than leaving a table whose
+    ///    shadow tables were never built.
+    /// 2. the module is asked to stand the table up. It owns the argument
+    ///    grammar, which is why `args` reaches it verbatim.
+    /// 3. each shadow table is created through the ordinary `create_table`
+    ///    path, so it is a real b-tree with its own `sqlite_schema` row and its
+    ///    own root page — which is what lets a reopened database find them, and
+    ///    what lets the real `sqlite3` read the file.
+    /// 4. the virtual table's own row is written with `rootpage = 0`, since it
+    ///    has no b-tree of its own.
+    ///
+    /// The shadow tables are created before the virtual table's row on
+    /// purpose. If the module refuses the arguments, nothing has been written;
+    /// if a shadow table's creation fails, the database is left with an
+    /// orphaned table and no virtual table claiming it, which is a state a
+    /// reader can see and recover. The reverse order would leave a virtual
+    /// table whose shadow tables do not exist, which reads as corruption.
+    fn create_virtual_table(
+        &mut self,
+        name: &str,
+        module: &str,
+        args: &str,
+        sql: &str,
+    ) -> Result<()> {
+        if self.catalog.contains(name) {
+            return Err(msg::table_exists(name));
+        }
+        let Some(mod_) = self.vtabs.lookup(module) else {
+            return Err(msg::no_such_module(module));
+        };
+        // The module reads and validates the arguments here, before anything is
+        // written. `vec0` parses its dimension list and the metric at this
+        // point, so a bad argument list never reaches the file.
+        mod_.create(name, args)
+            .map_err(|e| crate::error::Error::new(crate::error::ResultCode::Error, e.to_string()))?;
+        for (shadow_name, shadow_sql) in mod_
+            .shadow_tables(name, args)
+            .map_err(|e| crate::error::Error::new(crate::error::ResultCode::Error, e.to_string()))?
+        {
+            // Each shadow table's own text is what goes into `sqlite_schema`,
+            // so a reopened connection reads back the same definition rather
+            // than a reconstruction of it.
+            let Ok(crate::parser::Stmt::CreateTable {
+                columns,
+                constraints,
+                without_rowid,
+                ..
+            }) = crate::parser::parse_one(&shadow_sql)
+            else {
+                return Err(crate::error::Error::new(
+                    crate::error::ResultCode::Error,
+                    format!("{module}: shadow table {shadow_name} is not a CREATE TABLE"),
+                ));
+            };
+            self.create_table(&shadow_name, false, &columns, &constraints, without_rowid, &shadow_sql, false)?;
+        }
+        // The catalog entry carries the module name, which is what marks this
+        // table as virtual, and the declared columns, which is what a query
+        // resolves against — a virtual table's real definition is
+        // `CREATE VIRTUAL TABLE ... USING module(...)` and names no columns.
+        let declared = mod_
+            .declare(name, args)
+            .map_err(|e| crate::error::Error::new(crate::error::ResultCode::Error, e.to_string()))?;
+        let mut table = match crate::parser::parse_one(&declared) {
+            Ok(crate::parser::Stmt::CreateTable { columns, constraints, .. }) => {
+                self.catalog.table_from_create(name, &columns, &constraints)
+            }
+            _ => Catalog::new().table_from_create(name, &[], &[]),
+        };
+        table.virtual_module = Some(module.to_string());
+        table.root_page = 0;
+        self.catalog.put(table);
+        self.write_schema_object("table", name, name, 0, sql)?;
+        // Both the shadow tables' pages and the schema rows are dirty, and
+        // nothing flushes on the way out of a DDL statement. The suite's shim
+        // runs every statement in its own process, so without this the whole
+        // thing is gone by the time the next one opens the file.
+        self.pager.flush()?;
+        Ok(())
+    }
 
     fn create_table(
         &mut self,
