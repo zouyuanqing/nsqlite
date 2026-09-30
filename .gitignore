@@ -55,16 +55,16 @@ pg2.db
 /VACUUM*
 /ANALYZE*
 /ATTACH *
-/--*
-/-b*
-/-n*
-/-e*
-/-i
-*.log
+# One rule rather than five. The shell writes a file named after whatever
+# followed a redirect, so the set of possible names is whatever the shell
+# accepted, and /--* only caught the two-dash ones: `sqlite3 -header -list`
+# left `-header` and `-list`, both of them SQLite databases, and both of them
+# tracked. A file at the top level whose name starts with a dash is one of
+# these -- nothing the tree wants to keep is named that way.
+/-*
 
 # Scratch databases the ad-hoc checks leave behind.
 tmp/
-*.log
 
 # Scratch directories and files the differential and suite harnesses write
 # while measuring. Each one names a specific measurement rather than anything
@@ -76,3 +76,9 @@ tmp/
 /target-*/
 /result.tsv
 /*.sql
+
+# A whole runner script, dumped to the top level by a redirect while a
+# differential pass was being worked out. It is the third-generation runner
+# verbatim -- the one that lives at tools/difftest3.sh -- so tracking it gave
+# two copies of the same 84KB and a second place to forget to update.
+/src_body.sh
