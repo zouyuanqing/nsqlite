@@ -1966,8 +1966,9 @@ impl Connection {
                 Some(_) => return Err(msg::datatype_mismatch()),
             }
         }
+        let root = self.table_root(table);
         let max = {
-            let mut tree = TableTree::open(&mut self.pager, table.root_page)?;
+            let mut tree = TableTree::open(&mut self.pager, root)?;
             tree.max_rowid(&mut self.pager)?
         };
         // The next rowid is one past the largest, and 1 when the table is
@@ -2121,8 +2122,9 @@ impl Connection {
     }
 
     fn insert_row(&mut self, table: &Table, rowid: i64, values: Vec<Value>) -> Result<()> {
+        let root = self.table_root(table);
         let mut tree =
-            TableTree::open(&mut self.pager, table.root_page)?.with_rowid_alias(table.rowid_alias);
+            TableTree::open(&mut self.pager, root)?.with_rowid_alias(table.rowid_alias);
         let inserted = tree.insert(&mut self.pager, &crate::table_tree::Row { rowid, values });
         if let Err(e) = inserted {
             // A duplicate rowid on a table with an INTEGER PRIMARY KEY is that
@@ -2146,6 +2148,30 @@ impl Connection {
         // next statement, which opens the tree from the schema, writes to a page
         // the tree no longer reaches.
         self.write_table_root(table, tree.root())
+    }
+
+    /// The page a table's b-tree is rooted at *right now*.
+    ///
+    /// Not `table.root_page`. A `Table` reaching this engine's write path is
+    /// very often a snapshot taken when the statement began, and a split that
+    /// reaches the root moves the tree onto a new page mid-statement. The
+    /// catalog is the one copy that `write_table_root` keeps current, so it is
+    /// what a writer has to read.
+    ///
+    /// Reading the caller's copy instead is how a single `INSERT` with a long
+    /// `VALUES` list came to lose rows: at 480 tuples the table outgrows its
+    /// first leaf, the root moves, and every remaining row of the same statement
+    /// was written to the page the tree had just left behind. The statement
+    /// reported 480 rows changed and the file held 321, with three orphaned
+    /// pages and `integrity_check` reporting `Rowid 164 out of order`.
+    ///
+    /// The catalog is the fallback's other direction too: a table that is not in
+    /// the catalog at all -- which is what the unit tests build by hand -- still
+    /// resolves, through the snapshot it was given.
+    fn table_root(&self, table: &Table) -> u32 {
+        self.catalog
+            .get(&table.name)
+            .map_or(table.root_page, |t| t.root_page)
     }
 
     /// Records a table's current root page in the schema.
