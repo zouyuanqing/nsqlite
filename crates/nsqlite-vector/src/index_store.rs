@@ -39,9 +39,10 @@
 //! calls. A later step can swap in a persistent index; the trait below is what
 //! it would have to implement.
 
+use std::cell::{Ref, RefCell};
 use std::collections::BTreeMap;
 
-use crate::search::{FlatIndex, Neighbor, SearchError};
+use crate::search::{FlatIndex, HnswConfig, HnswIndex, Metric, Neighbor, SearchError};
 use crate::vtab::Schema;
 
 /// The bytes of a vector as stored in a shadow-table blob.
@@ -286,6 +287,56 @@ impl RowStore for MemoryRowStore {
 pub struct Vec0Table {
     schema: Schema,
     store: MemoryRowStore,
+    index: RefCell<Option<CachedIndex>>,
+}
+
+/// The cached index, borrowed out of the `RefCell` that holds it.
+///
+/// A named function rather than a closure so that `Ref::map` can infer what the
+/// closure returns; both call sites have just established that it is `Some`.
+fn held(cache: &Option<CachedIndex>) -> &CachedIndex {
+    cache
+        .as_ref()
+        .expect("the index cache was just found to hold one, or just filled")
+}
+
+/// A search index over the table's rows, and the HNSW built over it when one
+/// has been asked for.
+#[derive(Debug, Clone)]
+struct CachedIndex {
+    exact: FlatIndex,
+    ann: Option<HnswIndex>,
+}
+
+impl CachedIndex {
+    fn build(vectors: Vec<Vec<f64>>, metric: Metric, want_ann: bool) -> Result<Self, StoreError> {
+        let exact = FlatIndex::new(vectors, metric).map_err(StoreError::from)?;
+        let ann = if want_ann {
+            Some(HnswIndex::build(&exact, HnswConfig::default()).map_err(StoreError::from)?)
+        } else {
+            None
+        };
+        Ok(CachedIndex { exact, ann })
+    }
+}
+
+/// How a query turns rows into ranked results.
+///
+/// The two differ in which rows are *considered*, never in the distances that
+/// come back. An approximate index is allowed to miss a neighbour and nothing
+/// else, so every row reported here is scored by the metric on the stored f64.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchMode {
+    /// Every row is a candidate. No row can be missed.
+    #[default]
+    Exact,
+    /// HNSW proposes a pool of candidates, which are then rescored exactly.
+    ///
+    /// `ef` is the pool size and therefore the recall knob. It is clamped to at
+    /// least `k`, so a query cannot ask for a pool smaller than the answer it
+    /// wants. Larger buys recall and costs search time, and it is paid once per
+    /// query rather than once per row.
+    Ann { ef: usize },
 }
 
 impl Vec0Table {
@@ -294,13 +345,18 @@ impl Vec0Table {
         Vec0Table {
             schema,
             store: MemoryRowStore::new(),
+            index: RefCell::new(None),
         }
     }
 
     /// A table already holding `rows`.
     pub fn with_rows(schema: Schema, rows: Vec<StoredRow>) -> Result<Self, StoreError> {
         let store = MemoryRowStore::from_rows(&schema, rows)?;
-        Ok(Vec0Table { schema, store })
+        Ok(Vec0Table {
+            schema,
+            store,
+            index: RefCell::new(None),
+        })
     }
 
     /// The table's declaration.
@@ -336,6 +392,7 @@ impl Vec0Table {
         };
         check_row(&self.schema, &row)?;
         self.store.upsert(&row)?;
+        self.index.borrow_mut().take();
         Ok(rowid)
     }
 
@@ -347,12 +404,17 @@ impl Vec0Table {
         row.vector = vector;
         check_row(&self.schema, &row)?;
         self.store.upsert(&row)?;
+        self.index.borrow_mut().take();
         Ok(())
     }
 
     /// Deletes a row.
     pub fn delete(&mut self, rowid: i64) -> Result<bool, StoreError> {
-        self.store.remove(rowid)
+        let removed = self.store.remove(rowid)?;
+        if removed {
+            self.index.borrow_mut().take();
+        }
+        Ok(removed)
     }
 
     /// One row by rowid.
@@ -370,21 +432,51 @@ impl Vec0Table {
         Ok(self.store.count()? == 0)
     }
 
-    /// Builds the search index over every row.
+    /// The search index over every row, built on first use and kept until a
+    /// write drops it.
     ///
-    /// The index is built per query, not cached. That is the honest cost of
-    /// exact search and it is stated here rather than hidden: `FlatIndex` is
-    /// brute force, so the work is `O(n * dim)` for the build plus
-    /// `O(n * dim * log k)` for the search, every time. The row order is
-    /// rowid order, which is what makes the tie-break reproducible.
+    /// This used to be rebuilt per query, with the cost stated rather than
+    /// fixed: `O(n * dim)` to build plus `O(n * dim * log k)` to search, every
+    /// time. The row order is rowid order, which is what makes the tie-break
+    /// reproducible, and a cached index is only that useful if the order is the
+    /// same each time it is built.
     pub fn build_index(&self) -> Result<FlatIndex, StoreError> {
+        Ok(self.index_for(false)?.exact.clone())
+    }
+
+    /// The index, built once and reused, and carrying an HNSW when `mode` has
+    /// asked for one.
+    ///
+    /// The cache is a `RefCell` rather than a plain field so that `search` can
+    /// stay `&self`. It is not a thread-safety compromise: the engine takes
+    /// `&mut Connection` everywhere, so there is nothing shared to be safe
+    /// about, and a `Mutex` here would promise a guarantee nothing relies on.
+    ///
+    /// An empty table is answered by the caller before this is reached -- an
+    /// empty `build_index` falls through and is refused by `FlatIndex::new`, as
+    /// it was before the cache existed -- so the return is the borrow rather
+    /// than an option over it.
+    fn index_for(&self, want_ann: bool) -> Result<Ref<'_, CachedIndex>, StoreError> {
+        {
+            let cache = self.index.borrow();
+            let usable = cache
+                .as_ref()
+                .is_some_and(|c| c.ann.is_some() || !want_ann);
+            if usable {
+                return Ok(Ref::map(cache, held));
+            }
+        }
         let vectors: Vec<Vec<f64>> = self
             .store
             .scan()?
             .into_iter()
             .map(|row| row.vector)
             .collect();
-        FlatIndex::new(vectors, self.schema.metric).map_err(StoreError::from)
+        // Building an HNSW costs more than the brute-force index it accelerates,
+        // so a table only ever searched exactly never pays for one.
+        let built = CachedIndex::build(vectors, self.schema.metric, want_ann)?;
+        *self.index.borrow_mut() = Some(built);
+        Ok(Ref::map(self.index.borrow(), held))
     }
 
     /// The `k` nearest rows to `query`, nearest first.
@@ -394,11 +486,30 @@ impl Vec0Table {
     /// rows is a question with the answer "none", not a fault. This is the one
     /// place the empty case is special-cased, and it is a deliberate departure
     /// from the index constructor's rule.
+    ///
+    /// Exact. See `search_with` for the approximate one.
     pub fn search(&self, query: &[f64], k: usize) -> Result<Vec<Neighbor>, StoreError> {
-        if self.store.count()? == 0 || k == 0 {
+        self.search_with(query, k, SearchMode::Exact)
+    }
+
+    /// The `k` nearest rows under `mode`.
+    ///
+    /// Under `SearchMode::Ann` the candidate *set* is approximate and the
+    /// *distances* are not: HNSW proposes a pool, and every row in it is
+    /// rescored with `FlatIndex::distance_to` before the ranking is cut to `k`.
+    /// A row reported here is therefore at its true distance, and the only way
+    /// the answer differs from the exact one is that a true neighbour was not
+    /// in the pool.
+    pub fn search_with(
+        &self,
+        query: &[f64],
+        k: usize,
+        mode: SearchMode,
+    ) -> Result<Vec<Neighbor>, StoreError> {
+        if k == 0 || self.store.count()? == 0 {
             return Ok(Vec::new());
         }
-        let index = self.build_index()?;
+        let index = self.index_for(matches!(mode, SearchMode::Ann { .. }))?;
         // The id the index returns is a position in the rowid-ordered scan,
         // which is exactly the position of the row in `self.store.scan()`.
         // Reading the rowid back out of the same scan is what keeps the two in
@@ -409,7 +520,37 @@ impl Vec0Table {
             .into_iter()
             .map(|row| row.rowid)
             .collect();
-        let hits = index.search(query, k).map_err(StoreError::from)?;
+        let hits = match mode {
+            SearchMode::Exact => index.exact.search(query, k).map_err(StoreError::from)?,
+            SearchMode::Ann { ef } => {
+                // A pool smaller than the answer asked for is a pool that
+                // cannot contain it.
+                let pool = ef.max(k);
+                let ann = index.ann.as_ref().expect("an Ann query asked for an HNSW");
+                let candidates = ann.search(query, pool, pool).map_err(StoreError::from)?;
+                // Rescore exactly, and drop a row the HNSW reported twice.
+                let mut rescored: Vec<Neighbor> = Vec::with_capacity(candidates.len());
+                for c in candidates {
+                    if rescored.iter().any(|r| r.id == c.id) {
+                        continue;
+                    }
+                    let distance = index
+                        .exact
+                        .distance_to(query, c.id)
+                        .map_err(StoreError::from)?;
+                    rescored.push(Neighbor { id: c.id, distance });
+                }
+                // The same order §FlatIndex§ returns: distance, then id, so
+                // a tie is broken the same way whichever mode produced it.
+                rescored.sort_by(|a, b| {
+                    a.distance
+                        .total_cmp(&b.distance)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                rescored.truncate(k);
+                rescored
+            }
+        };
         Ok(hits
             .into_iter()
             .map(|hit| Neighbor {
