@@ -40,8 +40,12 @@ fn table(name: &str, columns: &[&str]) -> Table {
             })
             .collect(),
         rowid_alias: None,
+        // These explain tests only ever build a plain table: no constraint
+        // and no virtual module, which is what the catalog records for one.
+        unique_sets: Vec::new(),
         without_rowid: false,
         root_page: 0,
+        virtual_module: None,
     }
 }
 
