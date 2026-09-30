@@ -254,7 +254,16 @@ pub fn split_leaf(
             let right = LeafPage {
                 page_no: right_no,
                 cells: right_cells.to_vec(),
-                ..page_ref(page)
+                page_size: page.page_size,
+                // Not `..page_ref(page)`: a freshly allocated page is never
+                // page 1, so it has no 100-byte file header to step over.
+                // Inheriting the source page's offset wrote the right half with
+                // its b-tree header at 100, and `LeafPage::read` then read that
+                // same page at offset 0, where the bytes are still zero -- which
+                // `PageHeader::parse` reports as a freelist trunk. Only a page
+                // 1 ever carries the offset, so only splitting `sqlite_schema`
+                // reached this, and only once its root was pinned in place.
+                header_offset: 0,
             };
             if left.fits_cells(usable) && right.fits_cells(usable) {
                 let separator = left_cells[left_cells.len() - 1].rowid;

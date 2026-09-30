@@ -38,6 +38,9 @@ pub struct TableTree {
     /// How a row's columns map onto the record, in particular which column is
     /// the rowid alias and must be stored as NULL.
     rowid_alias: Option<usize>,
+    /// Whether `root` is fixed and a split has to grow the tree *under* it
+    /// rather than move it. See [`TableTree::pinned_root`].
+    pinned_root: bool,
 }
 
 impl TableTree {
@@ -51,6 +54,8 @@ impl TableTree {
             page_size,
             usable,
             rowid_alias: None,
+            // Page 1 is the schema's root and the file format fixes it there.
+            pinned_root: root == 1,
         };
         let blank = pager.read_page(root)?.iter().all(|&b| b == 0);
         if blank {
@@ -64,6 +69,27 @@ impl TableTree {
     /// Sets which column is the rowid alias, so it is stored as NULL.
     pub fn with_rowid_alias(mut self, column: Option<usize>) -> TableTree {
         self.rowid_alias = column;
+        self
+    }
+
+    /// Pins the root, or unpins it.
+    ///
+    /// A root that is free to move is the ordinary case: when the root leaf
+    /// splits, a fresh page becomes the root and the caller is expected to record
+    /// it, which is what `Connection::update_schema_root` does for a table.
+    ///
+    /// `sqlite_schema` has no such caller. Its root is page 1 by the file
+    /// format -- page 1 *is* the schema, the first 100 bytes of it are the
+    /// database header, and there is no row anywhere that could name a
+    /// different one. So a schema whose root leaf splits must grow under itself:
+    /// the left half moves to a fresh page and page 1 is rewritten in place as
+    /// the interior node above it.
+    ///
+    /// It did move, and the schema silently lost every object past the one-page
+    /// capacity -- sixty tables left thirty-nine, with no error and exit code 0.
+    /// A test in this module pins the behaviour down.
+    pub fn with_pinned_root(mut self, pinned: bool) -> TableTree {
+        self.pinned_root = pinned;
         self
     }
 
@@ -166,8 +192,47 @@ impl TableTree {
         let left_child = split_page;
         let new_rightmost = new_page;
         let Some(&parent) = path.last() else {
+            if self.pinned_root {
+                // The root cannot move, so the tree grows underneath it: the
+                // left half lifts onto a fresh page and the root page itself is
+                // rewritten in place as the interior node above the two halves.
+                //
+                // The alternative -- allocate a new root, as the branch below
+                // does -- records the new root nowhere. `self.root` below is a
+                // field on a temporary TableTree that the next
+                // `TableTree::open` throws away, and the next open reads the
+                // page number the file format fixed. For `sqlite_schema` that
+                // is page 1, which at this point holds only the left half, so
+                // every object that did not fit on it became unreadable and
+                // `PRAGMA integrity_check` called the rest orphan pages.
+                let new_left = pager.allocate()?;
+                relocate_page(pager, left_child, new_left)?;
+
+                let interior = InteriorPage {
+                    page_no: left_child,
+                    cells: vec![InteriorCell {
+                        left_child: new_left,
+                        key: separator,
+                    }],
+                    rightmost: new_rightmost,
+                    page_size: self.page_size,
+                    // `left_child` is the pinned root, which is page 1, and
+                    // page 1's b-tree header starts after the file header.
+                    header_offset: if left_child == 1 { 100 } else { 0 },
+                };
+                write_interior(pager, &interior)?;
+                debug_assert_eq!(
+                    self.root, left_child,
+                    "a pinned root split must keep the root it was opened on"
+                );
+                return Ok(());
+            }
             // The root was a leaf. It becomes the left child of a brand new
             // root, and the split-off page becomes that root's rightmost child.
+            //
+            // The caller is expected to record the new root. `insert_schema_row`
+            // cannot, and does not need to: it is writing the schema, whose root
+            // is pinned above.
             let new_root = pager.allocate()?;
             let interior = InteriorPage {
                 page_no: new_root,
@@ -428,6 +493,39 @@ fn interior_ref(page: &InteriorPage) -> InteriorPage {
         page_size: page.page_size,
         header_offset: page.header_offset,
     }
+}
+
+/// Moves whatever page `from` holds onto the freshly allocated page `to`.
+///
+/// A pinned root needs this. When the root itself splits, the left half has to
+/// leave the root page so that the root page can be rewritten as the interior
+/// node above both halves -- and the half it holds is a leaf the first time and
+/// an interior page every time after, because by then the tree is tall enough
+/// for the root to have grown children of its own. The page number moves and
+/// nothing else does: the b-tree header loses the 100-byte file header that page
+/// 1 carries, and a leaf's overflow chains are unaffected, because those pages
+/// are named by the cells rather than by where the cell lives.
+fn relocate_page(pager: &mut Pager, from: u32, to: u32) -> Result<()> {
+    let offset = if from == 1 { 100 } else { 0 };
+    let kind = {
+        let page = pager.read_page(from)?;
+        PageKind::of(&page, offset)?
+    };
+    match kind {
+        PageKind::Leaf => {
+            let mut leaf = LeafPage::read(pager, from)?;
+            leaf.page_no = to;
+            leaf.header_offset = 0;
+            write_leaf(pager, &leaf)?;
+        }
+        PageKind::Interior => {
+            let mut interior = InteriorPage::read(pager, from)?;
+            interior.page_no = to;
+            interior.header_offset = 0;
+            write_interior(pager, &interior)?;
+        }
+    }
+    Ok(())
 }
 
 fn write_leaf(pager: &mut Pager, leaf: &LeafPage) -> Result<()> {
@@ -721,6 +819,100 @@ mod tests {
             serial_types_on_disk(&mut pager, root),
             vec![0, 0, 0],
             "an all-NULL row still names every column"
+        );
+    }
+
+    // A tree rooted on page 1 is `sqlite_schema`, whose root the file format
+    // pins: page 1 *is* the schema, and there is no catalog row to record a new
+    // root in. So unlike every other tree its root must not move when the root
+    // leaf splits -- page 1 turns into an interior node in place instead.
+    //
+    // When it did move, `CREATE TABLE` silently truncated the schema: the fresh
+    // root page was recorded nowhere, so the next `TableTree::open(., 1)` read
+    // page 1 as a left leaf holding only the rows that fit on one page, and
+    // every table after about the twenty-first vanished. No error, no non-zero
+    // exit, and `integrity_check` afterwards reported orphan pages.
+    fn schema_db(tag: &str) -> (std::path::PathBuf, Pager) {
+        let path = temp(tag);
+        let mut pager = Pager::open(&path).unwrap();
+        // Page 1 is the schema, and it is the one page that is not blank in a
+        // fresh database: it carries the 100-byte file header, so
+        // `TableTree::open` will not lay an empty leaf over it by itself.
+        // `Connection`'s initialisation writes that leaf explicitly, and so
+        // does this, or the first read of page 1 takes the file header's
+        // trailing zero as a page type and reports a freelist trunk.
+        let leaf = LeafPage::empty(1, pager.page_size());
+        write_leaf(&mut pager, &leaf).unwrap();
+        pager.claim_page(1).unwrap();
+        (path, pager)
+    }
+
+    #[test]
+    fn a_pinned_root_stays_on_page_one_when_the_root_leaf_splits() {
+        let (_path, mut pager) = schema_db("pinned");
+        let mut tree = TableTree::open(&mut pager, 1).unwrap();
+        for i in 1..=400i64 {
+            tree.insert(&mut pager, &row(i, 40)).expect("insert");
+        }
+        assert_eq!(
+            tree.root(),
+            1,
+            "a tree rooted on page 1 must keep page 1 as its root"
+        );
+        assert_eq!(
+            tree.count(&mut pager).unwrap(),
+            400,
+            "every row must still be reachable from page 1"
+        );
+        assert_eq!(
+            pager.read_page(1).unwrap()[100],
+            0x05,
+            "page 1 must be a table interior page, not a leaf"
+        );
+    }
+
+    #[test]
+    fn a_pinned_root_tree_reopens_with_every_row() {
+        let (path, mut pager) = schema_db("pinned-reopen");
+        {
+            let mut tree = TableTree::open(&mut pager, 1).unwrap();
+            for i in 1..=400i64 {
+                tree.insert(&mut pager, &row(i, 40)).expect("insert");
+            }
+        }
+        pager.flush().unwrap();
+        drop(pager);
+
+        let mut pager = Pager::open(&path).unwrap();
+        let mut tree = TableTree::open(&mut pager, 1).unwrap();
+        assert_eq!(tree.root(), 1);
+        assert_eq!(
+            tree.count(&mut pager).unwrap(),
+            400,
+            "a reopened schema must still hold every row"
+        );
+    }
+
+    /// The other half of the change: a tree whose root is free to move still
+    /// does, because that is how an ordinary table's new root reaches the
+    /// catalog through `update_schema_root`.
+    #[test]
+    fn an_unpinned_root_still_moves() {
+        let (_path, mut pager) = schema_db("unpinned");
+        let root = pager.allocate().unwrap();
+        let mut tree = TableTree::open(&mut pager, root).unwrap();
+        for i in 1..=400i64 {
+            tree.insert(&mut pager, &row(i, 40)).expect("insert");
+        }
+        assert_eq!(
+            tree.count(&mut pager).unwrap(),
+            400,
+            "a moved root must still hold every row"
+        );
+        assert_ne!(
+            tree.root(),
+            root,
+            "an ordinary table's root is free to move; pinning it would break"
         );
     }
 }
