@@ -169,6 +169,18 @@ impl InsertTarget for Recorder {
         Ok(())
     }
 
+    /// Nothing fails, because every table this fake declares is built by hand
+    /// in this file and none of them carries a CHECK.
+    ///
+    /// That is a property of the fixtures rather than a claim that CHECKs are
+    /// unfalsifiable: a test that wanted one would have to add it to the
+    /// fixture, and this is where the verdict would come from. A stub that
+    /// answered `None` for a table that *did* declare a CHECK would be a lie,
+    /// so the assertion above is the thing to keep honest if that ever changes.
+    fn failing_check_text(&mut self, _table: &Table, _values: &[Value]) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     fn finish(&mut self, changed: usize, last_rowid: Option<i64>) -> Result<()> {
         self.finished = Some((changed, last_rowid));
         Ok(())

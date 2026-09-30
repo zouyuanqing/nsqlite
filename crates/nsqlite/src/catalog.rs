@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use crate::affinity::{affinity_of, Affinity};
-use crate::parser::{ColumnDef, Constraint, Stmt};
+use crate::parser::{ColumnDef, Constraint, Expr, Stmt};
 
 /// One column of a table.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +66,23 @@ pub struct Table {
     /// resolves a name through that one map and a table in a second map would
     /// answer `no such table` to a query that should have worked.
     pub virtual_module: Option<String>,
+    /// Every CHECK on the table, column-level and table-level, in the order the
+    /// statement wrote them.
+    ///
+    /// Each carries the source text beside the tree, because the refusal quotes
+    /// the text -- `CHECK constraint failed: length(c) <= 5` -- and the first one
+    /// to fail is the one named, so the order is part of the behaviour and not
+    /// an incidental detail of how the DDL was spelled.
+    pub checks: Vec<CheckConstraint>,
+}
+
+/// One CHECK constraint: what to evaluate, and what to call it in the refusal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckConstraint {
+    /// The predicate, evaluated against the row about to be written.
+    pub expr: Expr,
+    /// The expression's source text, exactly as the statement wrote it.
+    pub text: String,
 }
 
 impl Table {
@@ -296,6 +313,29 @@ impl Catalog {
             })
             .collect();
 
+        // Every CHECK, in the order the statement wrote them: the column-level
+        // ones as each column is read, then the table-level ones. A failing
+        // statement names the first one to fail, so the order is observable.
+        let mut checks: Vec<CheckConstraint> = Vec::new();
+        for c in columns {
+            for k in &c.constraints {
+                if let Constraint::Check { expr, text } = k {
+                    checks.push(CheckConstraint {
+                        expr: expr.clone(),
+                        text: text.clone(),
+                    });
+                }
+            }
+        }
+        for k in table_constraints {
+            if let Constraint::Check { expr, text } = k {
+                checks.push(CheckConstraint {
+                    expr: expr.clone(),
+                    text: text.clone(),
+                });
+            }
+        }
+
         // Every uniqueness constraint, from the three places one can be written,
         // resolved to column positions. The rowid alias is dropped at the end,
         // not here: it is a uniqueness constraint like any other until the
@@ -385,6 +425,7 @@ impl Catalog {
             // `CREATE VIRTUAL TABLE` does, and that path builds the entry
             // itself rather than coming through here.
             virtual_module: None,
+            checks,
         };
         // The alias is enforced by the b-tree, which refuses a duplicate key
         // before this table's `unique_sets` is ever consulted, so a key that is

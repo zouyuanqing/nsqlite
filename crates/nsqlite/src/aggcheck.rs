@@ -1034,8 +1034,8 @@ impl<'a> Ctx<'a> {
     /// a constant-folding rule rather than an aggregate rule, so it belongs to
     /// the parser and is not checked here.
     fn check_constraint(&mut self, c: &Constraint) {
-        if let Constraint::Check(e) = c {
-            self.walk(e, Scope::NoGroup, &[]);
+        if let Constraint::Check { expr, .. } = c {
+            self.walk(expr, Scope::NoGroup, &[]);
         }
     }
 

@@ -79,25 +79,42 @@ so no caller can supply a stale one.
 the schema could no longer hold on one page. Sixty tables left thirty-nine.
 The same shape as the defect above and fixed in the same area.
 
+### `CHECK` constraints parsed and never evaluated -- FIXED
+
+The DDL was always right and the constraint always round-tripped; the
+predicate was simply never evaluated, so a row the schema forbade went in
+and the statement reported success. `UPDATE` was equally unchecked.
+
+`Constraint::Check` now carries the expression's **source text** beside the
+tree, because the refusal quotes the schema rather than re-printing the
+tree: `CHECK constraint failed: length(c) <= 5` keeps the whitespace and the
+capitalisation the `CREATE` used. The catalog carries the constraints and
+every write path evaluates them — `VALUES`, `SELECT` and `UPDATE` — each in
+the pre-pass that already exists, which is what makes a refusal leave
+nothing behind. A NULL result passes, because a CHECK is satisfied unless
+it is false and unknown is not false; `OR IGNORE` skips the row while
+`OR REPLACE` refuses, since there is no existing row to conflict with.
+
+### A stale test that asserted the reference's absence
+
+`tests/insert_select.rs` carried a test named
+`a_unique_column_that_is_not_the_rowid_alias_is_not_enforced_by_this_engine`,
+which asserted that the engine **accepted** a duplicate against a non-alias
+UNIQUE. That was true when written. It stopped being true, and the test was
+left pinning the wrong answer — it failed at `HEAD` for exactly that
+reason. It now asserts what both engines do, which is refuse and leave 0
+rows. The observation is the one `6b04302` made about three others: a test
+that pins the opposite of the reference reads as protection and is not.
+
 ## Known defects
 
-Everything below was measured on **2026-09-30** against SQLite 3.53.4. Each
-entry gives the reproduction.
+**None open.** Every defect this file recorded on 2026-09-30 has been
+fixed, and the three above are what was found by writing it down. A new one
+found by a differential corpus or by `tests/dst.rs` belongs here, with the
+statement that reproduces it and the engine's answer beside the reference's.
 
-### `CHECK` constraints are parsed, stored, and never evaluated
-
-The DDL is correct and the constraint survives a round trip — reading
-`sqlite_schema` back gives the `CREATE TABLE` text verbatim — but no statement
-ever tests it.
-
-```sql
-CREATE TABLE t(a INT, b TEXT, c INT CHECK(length(c) <= 5));
-INSERT INTO t(a,b,c) VALUES(1,'x',999);   -- sqlite3: CHECK constraint failed
-SELECT count(*) FROM t;                   -- nsqlited: 1.  sqlite3: 0.
-```
-
-`UPDATE` is equally unchecked. This is the first disagreement the fifth
-differential corpus reports.
+What is left is under *Where this engine is behind* — the gaps that cost
+correctness are closed, and what remains costs performance or reach.
 
 ## Deliberate divergences
 

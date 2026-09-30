@@ -93,6 +93,10 @@ impl InsertTarget for Connection {
         self.insert_row(table, rowid, values)
     }
 
+    fn failing_check_text(&mut self, table: &Table, values: &[Value]) -> Result<Option<String>> {
+        Ok(Connection::failing_check(self, table, values)?.map(|c| c.text.clone()))
+    }
+
     /// Enforces a UNIQUE constraint for one row of an `INSERT ... SELECT`, and
     /// performs the OR IGNORE and OR REPLACE actions.
     ///

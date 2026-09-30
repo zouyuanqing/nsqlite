@@ -390,35 +390,39 @@ fn a_duplicate_rowid_alias_is_a_unique_failure() {
 }
 
 #[test]
-fn a_unique_column_that_is_not_the_rowid_alias_is_not_enforced_by_this_engine() {
-    // A divergence from sqlite3, asserted rather than hidden, and it is not
-    // this module's to fix.
+fn a_unique_column_that_is_not_the_rowid_alias_is_enforced() {
+    // This test used to assert the opposite, and it was right to. When it was
+    // written, a `Table` recorded which column was the rowid alias and
+    // nothing else about uniqueness, so a UNIQUE on any other column had no
+    // index behind it and the insert path only enforced what the b-tree
+    // reported for a duplicate rowid. The engine accepted both rows and
+    // sqlite3 refused.
+    //
+    // That gap is closed: the catalog now carries the column positions of
+    // every uniqueness constraint and the insert path checks them, so this
+    // engine and sqlite3 now agree -- both refuse, both leave 0 rows. A test
+    // that pins the opposite of the reference reads as protection and is not,
+    // which is the same observation 6b04302 made about three others.
     //
     // sqlite3 3.53.4:
     //   CREATE TABLE t(a UNIQUE); INSERT INTO t SELECT x FROM s;  (s = 1,1)
     //   Error: UNIQUE constraint failed: t.a
     //   SELECT count(*) FROM t;  --> 0
-    //
-    // this engine: no error, and the row count is 2.
-    //
-    // The cause is in the catalog, not here: a `Table` records which column is
-    // the rowid alias and nothing else about uniqueness, and the insert path
-    // only enforces what the b-tree reports for a duplicate rowid key. A
-    // UNIQUE on any other column has no index behind it here. The same is true
-    // of `INSERT ... VALUES` -- the two forms agree with each other and both
-    // differ from sqlite3 -- so this is a pre-existing engine-wide gap, tracked
-    // in the catalog and index tracks. It is pinned here because
-    // [`nsqlite::insert_select::ATOMICITY`] used to promise that a UNIQUE
-    // failure mid-statement was undone, which named a failure this engine does
-    // not raise.
     let mut c = fixture(&["CREATE TABLE t(a UNIQUE)", "CREATE TABLE s(x)"]);
     run(&mut c, "INSERT INTO s VALUES(1),(1)");
-    let out = c.execute(&parse_one("INSERT INTO t SELECT x FROM s").unwrap());
-    assert!(
-        out.is_ok(),
-        "this engine does not enforce a non-alias UNIQUE; sqlite3 errors here"
+    let e = c
+        .execute(&parse_one("INSERT INTO t SELECT x FROM s").unwrap())
+        .expect_err("a non-alias UNIQUE is enforced");
+    assert_eq!(
+        e.message,
+        "UNIQUE constraint failed: t.a",
+        "sqlite3 names the column, and so does this"
     );
-    assert_eq!(count(&mut c, "t"), 2, "both rows went in");
+    assert_eq!(
+        count(&mut c, "t"),
+        0,
+        "nothing is written, because the refusal is before the first row"
+    );
 }
 
 #[test]

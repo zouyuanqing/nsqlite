@@ -103,6 +103,16 @@ pub trait InsertTarget {
     /// Writes one row at a given rowid.
     fn write_row(&mut self, table: &Table, rowid: i64, values: Vec<Value>) -> Result<()>;
 
+    /// The text of the first CHECK on `table` that `values` fails, or `None`.
+    ///
+    /// A trait method rather than a check here because this module is generic
+    /// over its target and does not evaluate expressions: the engine has to
+    /// hand in the answer, or the predicate and its evaluation would have to be
+    /// built twice. `None` means every CHECK passed, which includes a NULL
+    /// result -- a CHECK is satisfied unless it is false, and unknown is not
+    /// false.
+    fn failing_check_text(&mut self, table: &Table, values: &[Value]) -> Result<Option<String>>;
+
     /// Decides what a UNIQUE conflict on `values` means for this statement, and
     /// carries out the part of the action that touches storage.
     ///
@@ -357,6 +367,24 @@ fn insert_prepared<T: InsertTarget>(
         check_rowid_value(&table, full)?;
     }
 
+    // CHECK, in the same pre-pass and for the same reason: resolved in the
+    // write loop it would leave the rows ahead of the failing one in the
+    // b-tree, which this engine cannot undo.
+    let mut check_failed: Vec<bool> = Vec::new();
+    if !table.checks.is_empty() {
+        for (full, _) in &built {
+            let failed = target.failing_check_text(&table, full)?;
+            if let Some(text) = failed {
+                if !matches!(conflict, ConflictAction::Ignore) {
+                    return Err(crate::msg::check_constraint(&text));
+                }
+                check_failed.push(true);
+                continue;
+            }
+            check_failed.push(false);
+        }
+    }
+
     // The uniqueness check is pure in the same way, and needs the same pre-pass
     // for the same reason. Resolved in the write loop it would leave the rows
     // ahead of the failing one in the b-tree, because this engine has no way to
@@ -413,7 +441,14 @@ fn insert_prepared<T: InsertTarget>(
     // s holding (1),(2),(1) leaves 0 rows in the reference, not 1, and this is
     // what makes it 0 here.
     let mut pending: Vec<(Vec<usize>, Vec<Value>)> = Vec::new();
-    for (full, explicit) in built {
+    for (index, (full, explicit)) in built.into_iter().enumerate() {
+        // A row OR IGNORE skipped for failing a CHECK, decided in the pass
+        // above. Like the UNIQUE skip below, it has to be acted on here: the
+        // pass only records the verdict, because a `continue` in the pass
+        // would skip the check rather than the write.
+        if check_failed.get(index).copied().unwrap_or(false) {
+            continue;
+        }
         // A key the statement named wins over the one this engine would hand
         // out, and a key it named as NULL is the same as not naming it at all.
         let rowid = match explicit {

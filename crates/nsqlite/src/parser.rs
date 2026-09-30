@@ -325,7 +325,18 @@ pub enum Constraint {
         expr: Expr,
         parenthesized: bool,
     },
-    Check(Expr),
+    Check {
+        expr: Expr,
+        /// The expression's source text, exactly as the statement wrote it.
+        ///
+        /// SQLite's refusal is `CHECK constraint failed: <that text>`, so the
+        /// message is a quotation of the schema rather than a rendering of the
+        /// tree. Re-printing the tree would spell it differently: `a > 0 AND a
+        /// < 10` written with no spaces comes back with them, and a column
+        /// quoted one way in the DDL would come back quoted another. The spans
+        /// of the tokens the expression consumed are the only faithful source.
+        text: String,
+    },
     ForeignKey {
         table: String,
         columns: Vec<String>,
@@ -909,6 +920,24 @@ impl<'a> Parser<'a> {
     /// The token `ahead` places past the cursor, without moving it.
     fn peek_at(&self, ahead: usize) -> Option<&Token> {
         self.tokens.get(self.index + ahead).map(|(t, _)| t)
+    }
+
+    /// The source text the tokens in `start..end` came from.
+    ///
+    /// Empty when the range is empty or its spans do not fall inside the
+    /// statement. It never guesses, because the result is quoted verbatim in an
+    /// error message and a wrong quotation is worse than none.
+    fn text_between(&self, start: usize, end: usize) -> String {
+        let Some((_, first)) = self.tokens.get(start) else {
+            return String::new();
+        };
+        let Some((_, last)) = self.tokens.get(end.saturating_sub(1)) else {
+            return String::new();
+        };
+        self.sql
+            .get(first.start..last.end)
+            .unwrap_or_default()
+            .to_string()
     }
 
     fn peek_token(&self) -> Result<Option<&Token>> {
@@ -3513,9 +3542,12 @@ impl<'a> Parser<'a> {
         }
         if self.eat_keyword(Keyword::Check)? {
             self.expect_punct(Punct::LParen, "after CHECK")?;
+            let start = self.index;
             let e = self.expr()?;
+            let text = self.text_between(start, self.index);
             self.expect_punct(Punct::RParen, "closing CHECK")?;
-            return Ok(Some(Constraint::Check(e)));
+            let checked = Constraint::Check { expr: e, text };
+            return Ok(Some(checked));
         }
         if self.eat_keyword(Keyword::Default)? {
             // A parenthesised default is SQLite's expression form, and it is
@@ -3654,9 +3686,12 @@ impl<'a> Parser<'a> {
         }
         if self.eat_keyword(Keyword::Check)? {
             self.expect_punct(Punct::LParen, "after CHECK")?;
+            let start = self.index;
             let e = self.expr()?;
+            let text = self.text_between(start, self.index);
             self.expect_punct(Punct::RParen, "closing CHECK")?;
-            return Ok(Constraint::Check(e));
+            let checked = Constraint::Check { expr: e, text };
+            return Ok(checked);
         }
         if self.eat_keyword(Keyword::Foreign)? {
             self.expect_keyword(Keyword::Key, "after FOREIGN")?;

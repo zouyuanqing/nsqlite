@@ -88,7 +88,7 @@ fn check_expr(sql: &str) -> Result<(), String> {
     let mut found: Option<&Expr> = None;
     for c in columns {
         for k in &c.constraints {
-            if let crate::parser::Constraint::Check(e) = k {
+            if let crate::parser::Constraint::Check { expr: e, .. } = k {
                 found = Some(e);
             }
         }

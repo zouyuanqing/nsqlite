@@ -409,6 +409,7 @@ fn schema_table() -> Table {
         unique_sets: Vec::new(),
         without_rowid: false,
         root_page: SCHEMA_ROOT,
+        checks: Vec::new(),
         // The schema table is a real b-tree on page 1, not a module.
         virtual_module: None,
     }
@@ -1853,6 +1854,37 @@ impl Connection {
         //
         // Only the refusal is hoisted. OR IGNORE skips a row and OR REPLACE
         // deletes one, and neither is a refusal, so both stay in the write loop
+        // CHECK is decided over every row before the first one is written, for
+        // the same reason UNIQUE is: a statement that refuses at its second row
+        // has to leave the table as it was, not with the first row in it.
+        // Measured on sqlite3 3.53.4, `INSERT INTO t VALUES(4,'w',1),
+        // (5,'v',-9223372036854775808)` against `CHECK(length(c) <= 5)`
+        // refuses and the table still holds only the row from before.
+        //
+        // OR IGNORE skips the row instead, as it does for a UNIQUE conflict;
+        // OR REPLACE does not apply, because there is no existing row a CHECK
+        // could be conflicting *with* -- measured, OR REPLACE refuses here
+        // rather than replacing.
+        // The verdict is recorded rather than acted on here, because OR IGNORE
+        // has to skip the *write*, and a `continue` in this pass would skip
+        // only the check: the row would go in anyway, failing the very
+        // constraint it was skipped for. Measured on sqlite3 3.53.4,
+        // `INSERT OR IGNORE INTO t VALUES(2,'y',-9223372036854775808)`
+        // against `CHECK(length(c) <= 5)` leaves one row, not two.
+        let mut check_failed: Vec<bool> = Vec::new();
+        if !table.checks.is_empty() {
+            for (full, _) in &built {
+                let Some(failed) = self.failing_check(&table, full)? else {
+                    check_failed.push(false);
+                    continue;
+                };
+                if !matches!(conflict, ConflictAction::Ignore) {
+                    return Err(Self::check_violation(&failed.text));
+                }
+                check_failed.push(true);
+            }
+        }
+
         // where they can act on the table.
         if !keys.is_empty() {
             let refusing =
@@ -1887,7 +1919,10 @@ impl Connection {
         // The rows this statement has already written, so that a duplicate
         // *within* one statement is caught as readily as one against the table.
         let mut pending: Vec<(Vec<usize>, Vec<Value>)> = Vec::new();
-        for (full, explicit) in built {
+        for (index, (full, explicit)) in built.into_iter().enumerate() {
+            if check_failed.get(index).copied().unwrap_or(false) {
+                continue;
+            }
             // A key the statement named in its column list wins over the one
             // this engine would hand out, and a key it named as NULL is the
             // same as not naming it at all -- measured against sqlite3 3.53.4
@@ -1976,6 +2011,62 @@ impl Connection {
         // first key.
         let next = if max >= 0 { max + 1 } else { 1 };
         Ok(next)
+    }
+
+    /// The first CHECK on `table` that `values` fails, or `None`.
+    ///
+    /// **A NULL result passes.** That is the SQL rule rather than a leniency:
+    /// a CHECK is satisfied unless it evaluates to false, and unknown is not
+    /// false. Measured on sqlite3 3.53.4, `INSERT INTO t VALUES(6,'u',NULL)`
+    /// into a table whose only CHECK is `length(c) <= 5` writes the row.
+    ///
+    /// The predicate is evaluated against the row *after* affinity has been
+    /// applied, so `'1'` compared to an integer column compares as an integer,
+    /// which is what SQLite does and what makes a CHECK on a converted value
+    /// behave the way a reader expects.
+    ///
+    /// The first failure is returned rather than the last, because SQLite names
+    /// the first: `CREATE TABLE u(b INT CHECK(b > 0), c INT CHECK(c < 100))`
+    /// with `(1,-5,500)` reports `b > 0`.
+    fn failing_check<'t>(
+        &self,
+        table: &'t Table,
+        values: &[Value],
+    ) -> Result<Option<&'t crate::catalog::CheckConstraint>> {
+        if table.checks.is_empty() {
+            return Ok(None);
+        }
+        let row: Vec<(String, Value)> = table
+            .columns
+            .iter()
+            .zip(values)
+            .map(|(c, v)| (c.name.to_lowercase(), v.clone()))
+            .collect();
+        let mut ctx = EvalCtx::empty(&[]);
+        ctx.row = row.clone();
+        ctx.columns = &row;
+        ctx.encoding = self.encoding();
+        for check in &table.checks {
+            let value = eval(&check.expr, &ctx)?;
+            let fails = match value {
+                Value::Null => false,
+                Value::Integer(n) => n == 0,
+                Value::Real(f) => f == 0.0,
+                _ => false,
+            };
+            if fails {
+                return Ok(Some(check));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The refusal SQLite raises for a row that fails a CHECK.
+    ///
+    /// The wording and the code live in `msg`, which already had them measured
+    /// against sqlite3; what was missing was anything that ever raised this one.
+    fn check_violation(text: &str) -> Error {
+        msg::check_constraint(text)
     }
 
     fn check_not_null(&self, table: &Table, values: &[Value]) -> Result<()> {
@@ -2783,6 +2874,10 @@ impl Connection {
             // an `Option<String>` is not `Copy`. The schema table is never a
             // module's, so this is always `None` in practice.
             virtual_module: schema.virtual_module.clone(),
+            // The schema table is described, not declared, so there is no DDL
+            // to carry CHECKs. It is empty rather than unreachable for that
+            // reason: a query can join against this table like any other.
+            checks: schema.checks.clone(),
         };
         tables.push(aliased("sqlite_master"));
         tables.push(aliased("sqlite_schema"));
@@ -3714,6 +3809,21 @@ fn rebuild_virtual_table(&mut self, name: &str, sql_text: &str) -> Result<Option
                     }
                     _ => return Err(e),
                 }
+            }
+            // CHECK, on the row as it will be. It goes before the remove below
+            // because the remove is the destructive half: once the old row is
+            // gone a refusal has to put it back, and the statement has already
+            // left the b-tree mid-edit. Measured on sqlite3 3.53.4, an UPDATE
+            // that fails a CHECK leaves the row exactly as it was.
+            //
+            // OR IGNORE skips the row here for the same reason it skips one on
+            // the INSERT path; OR REPLACE has nothing to replace, so it refuses
+            // like the default does.
+            if let Some(failed) = self.failing_check(&table, &new)? {
+                if matches!(conflict, ConflictAction::Ignore) {
+                    continue;
+                }
+                return Err(Self::check_violation(&failed.text));
             }
             // An UPDATE that changes the alias column changes the rowid, which
             // is a move rather than an in-place edit.

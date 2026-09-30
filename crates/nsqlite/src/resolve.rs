@@ -659,6 +659,8 @@ mod tests {
             root_page: 0,
         // An ordinary table: no module hosts it.
         virtual_module: None,
+        // Declared by hand here, so there is no DDL and no CHECKs to carry.
+        checks: Vec::new(),
         };
         vec![
             make("t", &["a", "b"]),

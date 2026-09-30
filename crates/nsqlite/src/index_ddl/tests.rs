@@ -66,6 +66,8 @@ fn table(name: &str, columns: &[&str], root: u32) -> Table {
         root_page: root,
     // An ordinary table: no module hosts it.
     virtual_module: None,
+    // Declared by hand here, so there is no DDL and no CHECKs to carry.
+    checks: Vec::new(),
     }
 }
 
