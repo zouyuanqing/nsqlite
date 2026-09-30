@@ -41,45 +41,48 @@ The differential test refuses to run against a `nsqlited` older than the
 sources that built it, and says so rather than reporting on a stale build. See
 `crates/nsqlite/tests/differential.rs`.
 
+One environment caveat that has bitten every measurement here: a statement above
+roughly 32,000 characters never reaches either program on Windows, because that
+is the command line length limit. Both shells insert nothing, print nothing and
+exit zero. A `VALUES` list long enough to look like a lost-row bug is often just
+a statement that was never delivered, so the tuples are kept short enough to fit
+and the row count is raised instead.
+
+## Fixed since this file was first written
+
+Both were measured defects on 2026-09-30 and are closed. They are kept here
+rather than deleted, because a compatibility document that silently forgets
+what it used to get wrong is one that cannot be trusted about what it still
+gets wrong.
+
+### Silent row loss in a multi-row `VALUES` insert -- FIXED (`288bec3`)
+
+A single `INSERT` whose value list was long enough to force a leaf page split
+wrote only part of its rows **and reported the full count it was given**. 800
+tuples reported 800 and left 323, and `sqlite3` counting the same file also
+said 323, so the rows were absent rather than unreadable. `integrity_check`
+reported `Rowid 164 out of order` and three pages never used. The surviving
+keys were 1..158 and 637..800: a contiguous block from the middle had gone,
+whole leaf pages with it.
+
+`insert` takes its `Table` once at the top of the statement and hands that same
+copy to every row. When a row grows the tree past its first leaf, the root
+moves mid-statement; `insert_row` noticed and updated the catalog and
+`sqlite_schema`, but the loop's own copy never followed, so every remaining
+row of that statement went to the page the tree had just left behind. The fix
+reads the root from the catalog, which is the one copy that is kept current,
+so no caller can supply a stale one.
+
+### `sqlite_schema` losing every table past the twenty-first -- FIXED (`b8b7210`)
+
+`CREATE TABLE` succeeded, printed nothing, exited 0, and dropped every table
+the schema could no longer hold on one page. Sixty tables left thirty-nine.
+The same shape as the defect above and fixed in the same area.
+
 ## Known defects
 
-Everything in this section was measured on **2026-09-30** against SQLite
-3.53.4. Each entry gives the reproduction.
-
-### Silent row loss in a multi-row `VALUES` insert
-
-The most serious thing in this file. A single `INSERT` whose value list is long
-enough to force a leaf page split writes only part of its rows, **and reports
-the full count it was given**. Nothing is printed but the count, the exit code
-is zero, and the rows are absent from the file.
-
-```sh
-nsqlited x.db "CREATE TABLE t(a INTEGER, b TEXT);"
-nsqlited x.db "INSERT INTO t VALUES (1,'r1'),(2,'r2'),...;"   # 800 tuples
-nsqlited x.db "SELECT count(*) FROM t;"                        # -> 323, not 800
-sqlite3  x.db "SELECT count(*) FROM t;"                        # -> 323. The rows are gone.
-```
-
-| tuples | the engine reports | rows actually in the table |
-|--------:|-------------------:|---------------------------:|
-| 470 | 470 | 470 |
-| **480** | 480 | **321** |
-| 500 | 500 | 341 |
-| 600 | 600 | 441 |
-| 800 | 800 | 323 |
-
-The cliff is where the write crosses a page boundary, so the loss is in the
-split path rather than in the value list itself, which is consistent with the
-schema defect fixed in b8b7210. What is *not* consistent, and is still open:
-separate statements are correct — 500 of them insert 500 rows, and five
-statements of 100 tuples insert 500 rows — so the loss is specific to one
-statement's value list.
-
-Real SQLite is unaffected. It is worth knowing that a statement above roughly
-32,000 characters never reaches either program at all on Windows, because that
-is the command line length limit; both shells insert nothing and say nothing.
-That is the environment, not a defect, and it is why the threshold above is
-reached with short column names.
+Everything below was measured on **2026-09-30** against SQLite 3.53.4. Each
+entry gives the reproduction.
 
 ### `CHECK` constraints are parsed, stored, and never evaluated
 
