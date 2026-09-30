@@ -803,14 +803,121 @@ fn windows_path_to_shell(p: &Path) -> String {
     raw
 }
 
-/// The nsqlite CLI to test. The default is the workspace debug build.
+/// The nsqlite CLI to test.
+///
+/// `NSQLITED` wins, then `CARGO_TARGET_DIR` -- which cargo exports to test
+/// processes, and which is the one a caller who built anywhere but `target/`
+/// has set. Only when neither is present does this fall back to the workspace
+/// default.
+///
+/// It used to go straight to `target/debug`, so a test run under any other
+/// `CARGO_TARGET_DIR` silently measured a build that was as old as the last one
+/// somebody happened to leave there. That is not a hypothetical: it is how the
+/// 19 disagreements this test reported for half a day were 22 against a binary
+/// seventeen hours older than the sources it was being blamed on.
 fn nsqlited() -> PathBuf {
     if let Ok(p) = std::env::var("NSQLITED") {
         return PathBuf::from(p);
     }
+    let exe = if cfg!(windows) { "nsqlited.exe" } else { "nsqlited" };
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(dir).join("debug").join(exe);
+    }
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/nsqlited.exe")
-        .to_path_buf()
+        .join("../../target/debug")
+        .join(exe)
+}
+
+/// The most recently modified file that actually goes into the CLI.
+///
+/// `crates/*/src/**` and the manifests, and nothing else. A `tests/` or
+/// `examples/` file is not linked into `nsqlited`, so counting it would make
+/// the check fire every time a test was edited, which is the same as not
+/// having it: the build would have to be repeated for no reason, and the
+/// guard would be ignored the first time it got in the way.
+fn newest_source() -> Option<std::time::SystemTime> {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut note = |m: std::time::SystemTime| {
+        if newest.is_none_or(|n| m > n) {
+            newest = Some(m);
+        }
+    };
+    let mut stack = vec![crates];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if matches!(name.as_ref(), "tests" | "examples" | "benches" | "target") {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            let wanted = match path.extension().and_then(|e| e.to_str()) {
+                Some("rs") => true,
+                Some("toml") => true,
+                _ => false,
+            };
+            if wanted {
+                if let Ok(m) = entry.metadata().and_then(|m| m.modified()) {
+                    note(m);
+                }
+            }
+        }
+    }
+    newest
+}
+
+/// Panics when the CLI predates the sources, which makes the comparison below
+/// meaningless rather than merely inaccurate.
+///
+/// `nsqlite-capi` already refuses a cdylib older than its source
+/// (`every_advertised_symbol_is_linkable`), and this is the same rule for the
+/// same reason: a stale build turns every finding into noise, in both
+/// directions. Measured once -- a seventeen-hour-old binary reported three
+/// disagreements the current one does not have, and hid none.
+fn assert_not_stale(cli: &Path) {
+    let Ok(meta) = std::fs::metadata(cli) else { return };
+    let Ok(built) = meta.modified() else { return };
+    let Some(newest) = newest_source() else { return };
+    if built < newest {
+        let behind = newest
+            .duration_since(built)
+            .unwrap_or_default()
+            .as_secs();
+        let plural = |n: u64, unit: &str| {
+            if n == 1 {
+                format!("1 {unit}")
+            } else {
+                format!("{n} {unit}s")
+            }
+        };
+        let age = if behind >= 86_400 {
+            plural(behind / 86_400, "day")
+        } else if behind >= 3_600 {
+            plural(behind / 3_600, "hour")
+        } else if behind >= 60 {
+            plural(behind / 60, "minute")
+        } else {
+            plural(behind, "second")
+        };
+        panic!(
+            "the nsqlite CLI is {age} older than the newest source under crates/, so this\n\
+             comparison would run against a stale build rather than the current one.\n\
+             \n  cli:    {}\n\
+             \n  fix:    cargo build -p nsqlited, or point NSQLITED at the build you meant to test.\n\
+             \n  Measured once: a binary seventeen hours behind reported three\n\
+             disagreements the current build does not have, and hid none.",
+            cli.display(),
+        );
+    }
 }
 
 /// The real sqlite3, if it is on PATH.
@@ -873,6 +980,10 @@ fn generated_cases_agree_with_real_sqlite() {
         );
         return;
     }
+    // A CLI that exists but is older than the sources is worse than one that is
+    // missing: it runs, and reports disagreements the current build does not
+    // have. Hard-fail rather than skip.
+    assert_not_stale(&cli);
     if !bin.exists() {
         eprintln!("skipping: {} does not exist", bin.display());
         return;
